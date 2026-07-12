@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
@@ -10,6 +11,39 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
+
+namespace {
+
+struct PushConstantCache {
+    bool initialized{};
+    vk::CommandBuffer command_buffer{};
+    vk::PipelineLayout pipeline_layout{};
+    u64 scheduler_tick{};
+    Shader::PushData push_data{};
+};
+
+PushConstantCache& GetPushConstantCache(const bool is_compute) {
+    static thread_local PushConstantCache caches[2]{};
+    return caches[is_compute ? 1U : 0U];
+}
+
+bool ShouldPushConstants(PushConstantCache& cache, const vk::CommandBuffer command_buffer,
+                         const vk::PipelineLayout pipeline_layout, const u64 scheduler_tick,
+                         const Shader::PushData& push_data) {
+    if (!cache.initialized || cache.command_buffer != command_buffer ||
+        cache.pipeline_layout != pipeline_layout || cache.scheduler_tick != scheduler_tick ||
+        std::memcmp(&cache.push_data, &push_data, sizeof(push_data)) != 0) {
+        cache.initialized = true;
+        cache.command_buffer = command_buffer;
+        cache.pipeline_layout = pipeline_layout;
+        cache.scheduler_tick = scheduler_tick;
+        std::memcpy(&cache.push_data, &push_data, sizeof(push_data));
+        return true;
+    }
+    return false;
+}
+
+} // namespace
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
@@ -36,7 +70,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    if (!scheduler.IsHighDrawCallOptimization() ||
+        ShouldPushConstants(GetPushConstantCache(IsCompute()), cmdbuf, *pipeline_layout,
+                            scheduler.CurrentTick(), push_data)) {
+        cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    }
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -45,6 +83,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        if (bind_point == vk::PipelineBindPoint::eGraphics) {
+            scheduler.NotifyGraphicsPushDescriptorSet();
+        }
         return;
     }
 

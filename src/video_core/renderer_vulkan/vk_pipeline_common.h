@@ -57,6 +57,10 @@ public:
         return is_compute;
     }
 
+    bool UsesPushDescriptors() const {
+        return uses_push_descriptors;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 

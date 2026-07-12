@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/hash.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -25,8 +26,10 @@ static constexpr u64 NumFramesBeforeRemoval = 32;
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
+    : instance{instance_}, scheduler{scheduler_},
+      high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()},
+      liverpool{liverpool_}, buffer_cache{buffer_cache_}, tracker{tracker_},
+      blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
@@ -507,6 +510,38 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ASSERT(info.guest_address != 0);
 
     std::scoped_lock lock{mutex};
+
+    // Conservative L1: shortcut only requests that would take the pre-existing perfect-match
+    // branch below. Overlap resolution, subresource remapping, UpdateImage(), FindView(), and
+    // layout transitions remain untouched. Entries are validated against the slot vector so an
+    // evicted or recreated image cannot be reused accidentally.
+    if (high_draw_call_optimization) {
+        for (const auto& entry : find_image_fast_cache) {
+            if (!entry.valid || entry.exact_fmt != exact_fmt ||
+                entry.guest_address != info.guest_address || entry.guest_size != info.guest_size ||
+                entry.width != info.size.width || entry.height != info.size.height ||
+                entry.depth != info.size.depth || entry.pixel_format != info.pixel_format ||
+                entry.type != info.type || !slot_images.is_allocated(entry.image_id)) {
+                continue;
+            }
+
+            Image& cache_image = slot_images[entry.image_id];
+            if (False(cache_image.flags & ImageFlagBits::Registered) ||
+                cache_image.info.guest_address != info.guest_address ||
+                cache_image.info.guest_size != info.guest_size ||
+                cache_image.info.size != info.size ||
+                !IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+                (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) ||
+                (exact_fmt && info.pixel_format != cache_image.info.pixel_format)) {
+                continue;
+            }
+
+            cache_image.tick_accessed_last = scheduler.CurrentTick();
+            TouchImage(cache_image);
+            return entry.image_id;
+        }
+    }
+
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -576,6 +611,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
+    // Cache only the exact-match shape. Subresource requests may modify desc.view_info and must
+    // continue through overlap resolution on every lookup.
+    if (high_draw_call_optimization && view_mip <= 0 && view_slice <= 0 &&
+        image.info.guest_address == info.guest_address &&
+        image.info.guest_size == info.guest_size && image.info.size == info.size &&
+        IsVulkanFormatCompatible(image.info.pixel_format, info.pixel_format) &&
+        (image.info.type == info.type || info.size == Extent3D{1, 1, 1}) &&
+        (!exact_fmt || info.pixel_format == image.info.pixel_format)) {
+        auto& entry = find_image_fast_cache[find_image_fast_next];
+        entry.image_id = image_id;
+        entry.guest_address = info.guest_address;
+        entry.guest_size = info.guest_size;
+        entry.width = info.size.width;
+        entry.height = info.size.height;
+        entry.depth = info.size.depth;
+        entry.pixel_format = info.pixel_format;
+        entry.type = info.type;
+        entry.exact_fmt = exact_fmt;
+        entry.valid = true;
+        find_image_fast_next = (find_image_fast_next + 1) % FindImageFastCacheSize;
+    }
+
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
         desc.view_info.range.base.level = view_mip;
@@ -617,7 +674,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+void TextureCache::PrepareTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
@@ -626,10 +683,14 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
-    return image.FindView(desc.view_info);
 }
 
-ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    PrepareTexture(image_id, desc);
+    return slot_images[image_id].FindView(desc.view_info);
+}
+
+void TextureCache::PrepareRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && !image.info.props.is_tiled) {
@@ -638,7 +699,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     image.usage.render_target = 1u;
     UpdateImage(image_id);
 
-    // Register meta data for this color buffer
+    // Register meta data for this color buffer.
     if (desc.info.meta_info.cmask_addr) {
         surface_metas.emplace(desc.info.meta_info.cmask_addr,
                               MetaDataInfo{.type = MetaDataInfo::Type::CMask});
@@ -650,17 +711,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
                               MetaDataInfo{.type = MetaDataInfo::Type::FMask});
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
-
-    return image.FindView(desc.view_info, false);
 }
 
-ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    PrepareRenderTarget(image_id, desc);
+    return slot_images[image_id].FindView(desc.view_info, false);
+}
+
+void TextureCache::PrepareDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
-    // Register meta data for this depth buffer
+    // Register meta data for this depth buffer.
     if (desc.info.meta_info.htile_addr) {
         surface_metas.emplace(desc.info.meta_info.htile_addr,
                               MetaDataInfo{.type = MetaDataInfo::Type::HTile,
@@ -690,8 +754,11 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         TouchImage(stencil_image);
         stencil_image.AssociateDepth(image_id, image.image_uid);
     }
+}
 
-    return image.FindView(desc.view_info, false);
+ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    PrepareDepthTarget(image_id, desc);
+    return slot_images[image_id].FindView(desc.view_info, false);
 }
 
 void TextureCache::RefreshImage(Image& image) {
@@ -791,9 +858,14 @@ void TextureCache::RefreshImage(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base) {
-    const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
+    const u64 hash =
+        HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), border_color_base.Address());
 
     std::scoped_lock lock{samplers_mutex};
+    if (high_draw_call_optimization && sampler_fast_valid && sampler_fast_hash == hash) {
+        return sampler_fast_handle;
+    }
+
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
@@ -801,10 +873,20 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
 
-    return it->second.Handle();
+    if (!high_draw_call_optimization) {
+        return it->second.Handle();
+    }
+
+    sampler_fast_hash = hash;
+    sampler_fast_handle = it->second.Handle();
+    sampler_fast_valid = true;
+    return sampler_fast_handle;
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
+    if (high_draw_call_optimization) {
+        ++binding_generation;
+    }
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -816,6 +898,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    if (high_draw_call_optimization) {
+        ++binding_generation;
+    }
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
@@ -1064,6 +1149,9 @@ void TextureCache::TouchImage(const Image& image) {
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
+    if (high_draw_call_optimization) {
+        ++binding_generation;
+    }
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");

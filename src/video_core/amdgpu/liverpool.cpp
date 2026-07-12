@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -19,6 +20,87 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+namespace {
+
+constexpr bool RegisterRangesOverlap(const u32 first, const u32 count, const u32 field_first,
+                                     const u32 field_count) {
+    return count != 0 && field_count != 0 && first < field_first + field_count &&
+           field_first < first + count;
+}
+
+constexpr bool OverlapsField(const u32 first, const u32 count, const u32 field_first,
+                             const u32 field_size_bytes) {
+    return RegisterRangesOverlap(
+        first, count, field_first,
+        static_cast<u32>((field_size_bytes + sizeof(u32) - 1) / sizeof(u32)));
+}
+
+bool ContextRegistersAffectGraphicsPipeline(const u32 first, const u32 count) {
+#define OVERLAPS_FIELD(field)                                                                      \
+    OverlapsField(first, count, static_cast<u32>(offsetof(AmdGpu::Regs, field) / sizeof(u32)),     \
+                  sizeof(AmdGpu::Regs::field))
+    return OVERLAPS_FIELD(depth_render_override) || OVERLAPS_FIELD(depth_buffer) ||
+           OVERLAPS_FIELD(color_target_mask) || OVERLAPS_FIELD(color_shader_mask) ||
+           OVERLAPS_FIELD(ps_inputs) || OVERLAPS_FIELD(vs_output_config) ||
+           OVERLAPS_FIELD(ps_input_ena) || OVERLAPS_FIELD(ps_input_addr) ||
+           RegisterRangesOverlap(first, count, Regs::ContextRegWordOffset + 0x1B6, 1) ||
+           OVERLAPS_FIELD(shader_pos_format) || OVERLAPS_FIELD(z_export_format) ||
+           OVERLAPS_FIELD(color_export_format) || OVERLAPS_FIELD(blend_control) ||
+           OVERLAPS_FIELD(depth_control) || OVERLAPS_FIELD(color_control) ||
+           OVERLAPS_FIELD(depth_shader_control) || OVERLAPS_FIELD(clipper_control) ||
+           OVERLAPS_FIELD(polygon_control) || OVERLAPS_FIELD(vs_output_control) ||
+           OVERLAPS_FIELD(vgt_gs_mode) || OVERLAPS_FIELD(vgt_gs_out_prim_type) ||
+           OVERLAPS_FIELD(vgt_esgs_ring_itemsize) || OVERLAPS_FIELD(vgt_gsvs_ring_itemsize) ||
+           RegisterRangesOverlap(first, count, Regs::ContextRegWordOffset + 0x2CE, 1) ||
+           OVERLAPS_FIELD(vgt_instance_step_rate_0) || OVERLAPS_FIELD(vgt_instance_step_rate_1) ||
+           OVERLAPS_FIELD(stage_enable) || OVERLAPS_FIELD(ls_hs_config) ||
+           OVERLAPS_FIELD(vgt_gs_vert_itemsize) || OVERLAPS_FIELD(tess_config) ||
+           OVERLAPS_FIELD(vgt_gs_instance_cnt) || OVERLAPS_FIELD(vgt_strmout_config) ||
+           OVERLAPS_FIELD(aa_config) || OVERLAPS_FIELD(color_buffers);
+#undef OVERLAPS_FIELD
+}
+
+Liverpool::GraphicsPipelineRevisionClass ShaderRegistersRevisionClass(const u32 first,
+                                                                      const u32 count) {
+    // Shader user data changes frequently because it contains dynamic resource addresses. Keep
+    // those writes separate from structural changes: the pipeline cache revalidates specialization
+    // before reusing a graphics program when only user data changed.
+#define PROGRAM_FIRST(field) static_cast<u32>(offsetof(AmdGpu::Regs, field) / sizeof(u32))
+#define PROGRAM_USER_DATA_FIRST(field)                                                             \
+    static_cast<u32>(                                                                              \
+        (offsetof(AmdGpu::Regs, field) + offsetof(AmdGpu::ShaderProgram, user_data)) /             \
+        sizeof(u32))
+#define OVERLAPS_STRUCTURAL(field)                                                                 \
+    RegisterRangesOverlap(                                                                         \
+        first, count, PROGRAM_FIRST(field),                                                        \
+        static_cast<u32>(offsetof(AmdGpu::ShaderProgram, user_data) / sizeof(u32)))
+#define OVERLAPS_USER_DATA(field)                                                                  \
+    RegisterRangesOverlap(first, count, PROGRAM_USER_DATA_FIRST(field),                            \
+                          static_cast<u32>(sizeof(AmdGpu::UserData) / sizeof(u32)))
+    if (OVERLAPS_STRUCTURAL(ps_program) || OVERLAPS_STRUCTURAL(vs_program) ||
+        OVERLAPS_STRUCTURAL(gs_program) || OVERLAPS_STRUCTURAL(es_program) ||
+        OVERLAPS_STRUCTURAL(hs_program) || OVERLAPS_STRUCTURAL(ls_program)) {
+        return Liverpool::GraphicsPipelineRevisionClass::ShaderStructural;
+    }
+    if (OVERLAPS_USER_DATA(ps_program) || OVERLAPS_USER_DATA(vs_program) ||
+        OVERLAPS_USER_DATA(gs_program) || OVERLAPS_USER_DATA(es_program) ||
+        OVERLAPS_USER_DATA(hs_program) || OVERLAPS_USER_DATA(ls_program)) {
+        return Liverpool::GraphicsPipelineRevisionClass::ShaderUserData;
+    }
+    return Liverpool::GraphicsPipelineRevisionClass::None;
+#undef OVERLAPS_USER_DATA
+#undef OVERLAPS_STRUCTURAL
+#undef PROGRAM_USER_DATA_FIRST
+#undef PROGRAM_FIRST
+}
+
+bool UconfigRegistersAffectGraphicsPipeline(const u32 first, const u32 count) {
+    return RegisterRangesOverlap(
+        first, count, static_cast<u32>(offsetof(AmdGpu::Regs, primitive_type) / sizeof(u32)), 1);
+}
+
+} // namespace
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -74,7 +156,8 @@ void Liverpool::RestorePredicatedIndexBase() {
     saved_index_base.reset();
 }
 
-Liverpool::Liverpool() {
+Liverpool::Liverpool()
+    : high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -186,6 +269,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            InvalidateGraphicsPipelineRevision();
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             break;
@@ -327,13 +411,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                InvalidateGraphicsPipelineRevision();
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                UpdateGraphicsRegisters(&regs.reg_array[reg_addr], payload,
+                                        (count - 1) * sizeof(u32),
+                                        GraphicsPipelineRevisionClass::Config);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -341,7 +428,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                UpdateGraphicsRegisters(&regs.reg_array[reg_addr], payload,
+                                        (count - 1) * sizeof(u32),
+                                        ContextRegistersAffectGraphicsPipeline(reg_addr, count - 1)
+                                            ? GraphicsPipelineRevisionClass::Context
+                                            : GraphicsPipelineRevisionClass::None);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -420,15 +511,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
                 } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
+                    const u32 reg_addr = Regs::ShRegWordOffset + set_data->reg_offset;
+                    UpdateGraphicsRegisters(
+                        &regs.reg_array[reg_addr], header + 2, set_size,
+                        ShaderRegistersRevisionClass(reg_addr, set_size / sizeof(u32)));
                 }
                 break;
             }
             case PM4ItOpcode::SetUconfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
+                const u32 reg_addr = Regs::UconfigRegWordOffset + set_data->reg_offset;
+                UpdateGraphicsRegisters(&regs.reg_array[reg_addr], header + 2,
+                                        (count - 1) * sizeof(u32),
+                                        UconfigRegistersAffectGraphicsPipeline(reg_addr, count - 1)
+                                            ? GraphicsPipelineRevisionClass::Uconfig
+                                            : GraphicsPipelineRevisionClass::None);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -751,6 +848,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone &&
                            event->event_type.Value() == EventType::PixelPipeStatDump) {
                     const VAddr address = event->Address<VAddr>();
+                    InvalidateGraphicsPipelineRevision();
                     if (rasterizer) {
                         rasterizer->DumpPixelPipeStats(address, num_counter_pairs);
                     } else {
@@ -779,6 +877,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
+                InvalidateGraphicsPipelineRevision();
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
@@ -800,6 +899,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
+                InvalidateGraphicsPipelineRevision();
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
@@ -852,6 +952,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
+                    InvalidateGraphicsPipelineRevision();
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -1156,8 +1257,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
+                const u32 reg_addr = Regs::ShRegWordOffset + set_data->reg_offset;
+                UpdateGraphicsRegisters(
+                    &regs.reg_array[reg_addr], header + 2, set_size,
+                    ShaderRegistersRevisionClass(reg_addr, set_size / sizeof(u32)));
             }
             break;
         }
@@ -1249,6 +1352,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                InvalidateGraphicsPipelineRevision();
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1280,6 +1384,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
+            InvalidateGraphicsPipelineRevision();
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -31,8 +33,9 @@ using LockType = Common::SpinLock;
  */
 class RegionManager {
 public:
-    explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
-        : tracker{tracker_}, cpu_addr{cpu_addr_} {
+    explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_, bool track_gpu_dirty_summary_)
+        : tracker{tracker_}, cpu_addr{cpu_addr_},
+          track_gpu_dirty_summary{track_gpu_dirty_summary_} {
         cpu.Fill();
         gpu.Clear();
         writeable.Fill();
@@ -46,6 +49,10 @@ public:
 
     VAddr GetCpuAddr() const {
         return cpu_addr;
+    }
+
+    [[nodiscard]] bool HasAnyGpuModifiedPages() const noexcept {
+        return gpu_any_modified.load(std::memory_order_acquire);
     }
 
     static constexpr size_t SanitizeAddress(size_t address) {
@@ -88,10 +95,24 @@ public:
         }
 
         RegionBits& bits = GetRegionBits<type>();
+        if constexpr (type == Type::GPU && enable) {
+            // Publish the conservative aggregate before mutating the bitset. A lock-free negative
+            // query must never observe a stale false value after an update starts.
+            if (track_gpu_dirty_summary) {
+                gpu_any_modified.store(true, std::memory_order_release);
+            }
+        }
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
+            if constexpr (type == Type::GPU) {
+                // Clearing may publish false only after the bitset proves that no GPU-dirty page
+                // remains in this manager.
+                if (track_gpu_dirty_summary) {
+                    gpu_any_modified.store(bits.Any(), std::memory_order_release);
+                }
+            }
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
@@ -126,8 +147,13 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                if (track_gpu_dirty_summary) {
+                    gpu_any_modified.store(bits.Any(), std::memory_order_release);
+                }
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                    UpdateProtection<false, true>();
+                }
             }
         }
 
@@ -188,6 +214,8 @@ private:
     VAddr cpu_addr = 0;
     RegionBits cpu;
     RegionBits gpu;
+    bool track_gpu_dirty_summary{};
+    std::atomic_bool gpu_any_modified{false};
     RegionBits writeable;
     RegionBits readable;
 };
