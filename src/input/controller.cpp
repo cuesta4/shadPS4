@@ -103,24 +103,26 @@ void GameController::ReadState(State* state, bool* isConnected, int* connectedCo
 
 int GameController::ReadStates(State* states, int states_num) {
     std::lock_guard lg(m_state_mutex);
-    if (states_num <= 0 || m_states_queue.Size() == 0) {
+    if (states_num <= 0) {
         return 0;
     }
 
-    // scePadRead commonly asks for one sample. Consume the newest queued snapshot directly
-    // instead of popping the stale backlog one element at a time.
+    // The system implementation uses a one-sample read for the current-state API. Return the
+    // live state without consuming history so latency does not depend on the queue backlog.
     if (states_num == 1) {
-        states[0] = *m_states_queue.PopLatest();
+        states[0] = m_state;
         return 1;
     }
 
-    // The poll timer enqueues a controller snapshot every few milliseconds, far faster than
-    // most games drain the queue. A caller requesting fewer samples than have accumulated only
-    // cares about the most recent ones, so drop the stale backlog and keep at most states_num
-    // of the newest samples. This bounds input latency to the sampling interval without an
-    // arbitrary age limit, while preserving the chronological order multi-sample readers expect.
-    return static_cast<int>(
-        m_states_queue.PopNewest(std::span{states, static_cast<size_t>(states_num)}));
+    int read_count = 0;
+    while (read_count < states_num) {
+        auto state = m_states_queue.Pop();
+        if (!state) {
+            break;
+        }
+        states[read_count++] = std::move(*state);
+    }
+    return read_count;
 }
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {

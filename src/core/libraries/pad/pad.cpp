@@ -471,20 +471,8 @@ int PS4_SYSV_ABI scePadReadHistory() {
 
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
-    if (pData == nullptr) {
-        return ORBIS_PAD_ERROR_INVALID_ARG;
-    }
-    auto it = handle_to_controller_map.find(handle);
-    if (it == handle_to_controller_map.end()) {
-        return ORBIS_PAD_ERROR_INVALID_HANDLE;
-    }
-    auto& controller = *it->second;
-    int connected_count = 0;
-    bool connected = false;
-    Input::State state;
-    controller.ReadState(&state, &connected, &connected_count);
-    ProcessStates(pData, &state, 1);
-    return ORBIS_OK;
+    const int result = scePadRead(handle, pData, 1);
+    return result < 0 ? result : ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadStateExt() {
