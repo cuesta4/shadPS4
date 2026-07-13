@@ -164,6 +164,7 @@ private:
     bool connectedNetworkSetting;
     bool pipelineCacheEnabledSetting;
     bool pipelineCacheArchiveSetting;
+    bool highDrawCallOptimizationSetting;
     int extraDmemSetting;
     int app0ReadBandwidthSetting;
     int vblankFrequencySetting;

@@ -301,7 +301,9 @@ struct StageSpecialization {
                     current.element_size = sharp.element_size;
                 }
             }
-            if (bitset[binding] && current != buffers[i]) {
+            // Mirror operator==(): the newly observed resource controls whether its
+            // specialization fields participate in the comparison.
+            if (current_bitset[binding] && current != buffers[i]) {
                 return false;
             }
             ++binding;
@@ -325,7 +327,7 @@ struct StageSpecialization {
                 current.num_conversion = sharp.GetNumberConversion();
                 current.num_bindings = desc.NumBindings(info_);
             }
-            if (bitset[binding] && current != images[i]) {
+            if (current_bitset[binding] && current != images[i]) {
                 return false;
             }
             ++binding;
