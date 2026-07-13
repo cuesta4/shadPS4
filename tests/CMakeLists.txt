@@ -31,6 +31,7 @@ set(SETTINGS_TEST_SOURCES
 
     # Tests
     test_emulator_settings.cpp
+    test_ring_buffer_queue.cpp
 )
 
 set(GCN_TEST_SOURCES

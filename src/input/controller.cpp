@@ -1,6 +1,7 @@
 ﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <sstream>
 #include <unordered_set>
 #include <SDL3/SDL.h>
@@ -27,12 +28,12 @@ void State::OnButton(OrbisPadButtonDataOffset button, bool isPressed) {
     }
 }
 
-void State::OnAxis(Axis axis, int value, bool smooth) {
+void State::OnAxis(Axis axis, int value, u64 timestamp, bool smooth) {
     auto const i = std::to_underlying(axis);
     // forcibly finish the previous smoothing task by jumping to the end
     axes[i] = axis_smoothing_end_values[i];
 
-    axis_smoothing_start_times[i] = time;
+    axis_smoothing_start_times[i] = timestamp;
     axis_smoothing_start_values[i] = axes[i];
     axis_smoothing_end_values[i] = value;
     axis_smoothing_flags[i] = smooth;
@@ -73,7 +74,7 @@ void State::OnAccel(const float accel[3]) {
     acceleration.z = accel[2];
 }
 
-void State::UpdateAxisSmoothing() {
+void State::UpdateAxisSmoothing(u64 timestamp) {
     for (int i = 0; i < std::to_underlying(Axis::AxisMax); i++) {
         // if it's not to be smoothed or close enough, just jump to the end
         if (!axis_smoothing_flags[i] || std::abs(axes[i] - axis_smoothing_end_values[i]) < 16) {
@@ -82,72 +83,83 @@ void State::UpdateAxisSmoothing() {
             }
             continue;
         }
-        auto now = Libraries::Kernel::sceKernelGetProcessTime();
-        f32 t =
-            std::clamp((now - axis_smoothing_start_times[i]) / f32{axis_smoothing_time}, 0.f, 1.f);
+        const f32 t = std::clamp(
+            (timestamp - axis_smoothing_start_times[i]) / f32{axis_smoothing_time}, 0.f, 1.f);
         axes[i] = s32(axis_smoothing_start_values[i] * (1 - t) + axis_smoothing_end_values[i] * t);
     }
 }
 
-GameController::GameController() : m_states_queue(64) {}
+GameController::GameController(bool initially_connected) : m_states_queue(64) {
+    m_state.connected = initially_connected;
+    m_state.connected_count = initially_connected ? 1 : 0;
+}
 
 void GameController::ReadState(State* state, bool* isConnected, int* connectedCount) {
-    *isConnected = m_connected;
-    *connectedCount = m_connected_count;
+    std::lock_guard lg(m_state_mutex);
+    *isConnected = m_state.connected;
+    *connectedCount = m_state.connected_count;
     *state = m_state;
 }
 
-int GameController::ReadStates(State* states, int states_num, bool* isConnected,
-                               int* connectedCount) {
-    *isConnected = m_connected;
-    *connectedCount = m_connected_count;
-
-    int ret_num = 0;
-    if (m_connected) {
-        std::lock_guard lg(m_states_queue_mutex);
-        for (int i = 0; i < states_num; i++) {
-            auto o_state = m_states_queue.Pop();
-            if (!o_state) {
-                break;
-            }
-            states[ret_num++] = *o_state;
-        }
+int GameController::ReadStates(State* states, int states_num) {
+    std::lock_guard lg(m_state_mutex);
+    if (states_num <= 0 || m_states_queue.Size() == 0) {
+        return 0;
     }
-    return ret_num;
+
+    // scePadRead commonly asks for one sample. Consume the newest queued snapshot directly
+    // instead of popping the stale backlog one element at a time.
+    if (states_num == 1) {
+        states[0] = *m_states_queue.PopLatest();
+        return 1;
+    }
+
+    // The poll timer enqueues a controller snapshot every few milliseconds, far faster than
+    // most games drain the queue. A caller requesting fewer samples than have accumulated only
+    // cares about the most recent ones, so drop the stale backlog and keep at most states_num
+    // of the newest samples. This bounds input latency to the sampling interval without an
+    // arbitrary age limit, while preserving the chronological order multi-sample readers expect.
+    return static_cast<int>(
+        m_states_queue.PopNewest(std::span{states, static_cast<size_t>(states_num)}));
 }
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
+    std::lock_guard lg(m_state_mutex);
     m_state.OnButton(button, is_pressed);
-    PushState();
+    PushStateLocked();
 }
 
 void GameController::Axis(Input::Axis axis, int value, bool smooth) {
-    m_state.OnAxis(axis, value, smooth);
-    PushState();
-}
-
-void GameController::Gyro(int id) {
-    m_state.OnGyro(gyro_buf);
-    PushState();
-}
-
-void GameController::Acceleration(int id) {
-    m_state.OnAccel(accel_buf);
-    PushState();
+    std::lock_guard lg(m_state_mutex);
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    m_state.OnAxis(axis, value, timestamp, smooth);
+    PushStateLocked(timestamp);
 }
 
 void GameController::UpdateGyro(const float gyro[3]) {
-    std::scoped_lock l(m_states_queue_mutex);
+    std::scoped_lock l(m_state_mutex);
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));
 }
 
 void GameController::UpdateAcceleration(const float acceleration[3]) {
-    std::scoped_lock l(m_states_queue_mutex);
+    std::scoped_lock l(m_state_mutex);
     std::memcpy(accel_buf, acceleration, sizeof(accel_buf));
 }
 
-void GameController::UpdateAxisSmoothing() {
-    m_state.UpdateAxisSmoothing();
+void GameController::PollState() {
+    std::lock_guard lg(m_state_mutex);
+    // A disconnect is a single state transition. Do not continuously manufacture identical
+    // disconnected samples: scePadRead returns zero until the state changes again.
+    if (m_state.connected) {
+        PushStateLocked();
+    }
+}
+
+void GameController::ResetOrientation() {
+    std::lock_guard lock{m_state_mutex};
+    m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    m_last_orientation_update = 0;
+    PushStateLocked();
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {
@@ -200,21 +212,28 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 
 void GameController::SetTouchpadState(int touchIndex, bool touchDown, float x, float y) {
     if (touchIndex < 2) {
-        bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
-        m_state.OnTouchpad(touchIndex, touchDown, x, y);
-        PushState();
-        if (!m_state.touchpad[0].state && !m_state.touchpad[1].state && was_pressed) {
-            last_touch_down_timestamp = 0;
-        } else if ((m_state.touchpad[0].state || m_state.touchpad[1].state) && !was_pressed) {
-            last_touch_down_timestamp = m_state.time;
+        std::lock_guard lg(m_state_mutex);
+        const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+        const bool was_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
+        auto& touch = m_state.touchpad[touchIndex];
+        if (touchDown && !touch.state) {
+            touch.ID = m_next_touch_id;
+            m_next_touch_id = m_next_touch_id == 127 ? 1 : m_next_touch_id + 1;
         }
+        m_state.OnTouchpad(touchIndex, touchDown, x, y);
+        const bool is_pressed = m_state.touchpad[0].state || m_state.touchpad[1].state;
+        if (!was_pressed && is_pressed) {
+            m_touch_down_timestamp = timestamp;
+        } else if (was_pressed && !is_pressed) {
+            m_touch_down_timestamp = 0;
+        }
+        PushStateLocked(timestamp);
     }
 }
 
-void GameControllers::CalculateOrientation(Libraries::Pad::OrbisFVector3& acceleration,
-                                           Libraries::Pad::OrbisFVector3& angularVelocity,
+void GameControllers::CalculateOrientation(const Libraries::Pad::OrbisFVector3& angularVelocity,
                                            float deltaTime,
-                                           Libraries::Pad::OrbisFQuaternion& lastOrientation,
+                                           const Libraries::Pad::OrbisFQuaternion& lastOrientation,
                                            Libraries::Pad::OrbisFQuaternion& orientation) {
     // avoid wildly off values coming from elapsed time between two samples
     // being too high, such as on the first time the controller is polled
@@ -248,19 +267,34 @@ void GameControllers::CalculateOrientation(Libraries::Pad::OrbisFVector3& accele
     orientation.y = q.y;
     orientation.z = q.z;
     orientation.w = q.w;
-    LOG_DEBUG(Lib_Pad, "Calculated orientation: {:.2f} {:.2f} {:.2f} {:.2f}", orientation.x,
-              orientation.y, orientation.z, orientation.w);
 }
 
 void GameController::ConnectController(SDL_Gamepad* pad) {
+    std::scoped_lock l(m_state_mutex);
     m_sdl_gamepad = pad;
-    m_connected_count = 1;
-    m_connected = true;
+    const bool was_connected = m_state.connected;
+    if (was_connected) {
+        // Replacing the backing device of an already-connected logical controller should not
+        // expose input captured from the previous device.
+        m_states_queue.Clear();
+    } else {
+        ++m_state.connected_count;
+        if (m_state.connected_count == 0) {
+            m_state.connected_count = 1;
+        }
+    }
+    m_state.connected = true;
+    m_last_orientation_update = 0;
+    PushStateLocked();
 }
+
 void GameController::DisconnectController() {
+    std::scoped_lock l(m_state_mutex);
+    m_states_queue.Clear();
     m_sdl_gamepad = nullptr;
-    m_connected_count = 0;
-    m_connected = false;
+    m_state.connected = false;
+    m_last_orientation_update = 0;
+    PushStateLocked();
 }
 
 bool is_first_check = true;
@@ -291,6 +325,7 @@ void GameControllers::TryOpenSDLControllers() {
             }
             if (!still_connected) {
                 auto u = UserManagement.GetUserByID(controllers[i]->user_id);
+                UserManagement.LogoutUser(u);
                 SDL_CloseGamepad(pad);
                 controllers[i]->DisconnectController();
                 controllers[i]->user_id = -1;
@@ -326,17 +361,17 @@ void GameControllers::TryOpenSDLControllers() {
                 c->ConnectController(pad);
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
-                        c->gyro_poll_rate =
+                        const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
-                        LOG_INFO(Input, "Gyro initialized, poll rate: {}", c->gyro_poll_rate);
+                        LOG_INFO(Input, "Gyro initialized, poll rate: {}", poll_rate);
                     } else {
                         LOG_ERROR(Input, "Failed to initialize gyro controls for gamepad {}",
                                   c->user_id);
                     }
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
-                        c->accel_poll_rate =
+                        const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
-                        LOG_INFO(Input, "Accel initialized, poll rate: {}", c->accel_poll_rate);
+                        LOG_INFO(Input, "Accel initialized, poll rate: {}", poll_rate);
                     } else {
                         LOG_ERROR(Input, "Failed to initialize accel controls for gamepad {}",
                                   c->user_id);
@@ -351,66 +386,38 @@ void GameControllers::TryOpenSDLControllers() {
         if (controller_count - move_count == 0) {
             auto u = UserManagement.GetUserByPlayerIndex(1);
             controllers[0]->user_id = u->user_id;
-            controllers[0]->ConnectController(nullptr);
             UserManagement.LoginUser(u, 1);
         }
     }
     SDL_free(new_joysticks);
 }
-u8 GameController::GetTouchCount() {
-    return m_touch_count;
-}
-
-void GameController::SetTouchCount(u8 touchCount) {
-    m_touch_count = touchCount;
-}
-
-u8 GameController::GetSecondaryTouchCount() {
-    return m_secondary_touch_count;
-}
-
-void GameController::SetSecondaryTouchCount(u8 touchCount) {
-    m_secondary_touch_count = touchCount;
-    if (touchCount == 0) {
-        m_was_secondary_reset = true;
+void GameController::UpdateOrientationLocked(u64 timestamp) {
+    if (m_last_orientation_update == 0 || timestamp <= m_last_orientation_update) {
+        m_last_orientation_update = timestamp;
+        return;
     }
+    const float delta_time =
+        static_cast<float>(timestamp - m_last_orientation_update) / 1'000'000.f;
+    Libraries::Pad::OrbisFQuaternion orientation{};
+    GameControllers::CalculateOrientation(m_state.angularVelocity, delta_time, m_state.orientation,
+                                          orientation);
+    m_state.orientation = orientation;
+    m_last_orientation_update = timestamp;
 }
 
-u8 GameController::GetPreviousTouchNum() {
-    return m_previous_touchnum;
-}
-
-void GameController::SetPreviousTouchNum(u8 touchNum) {
-    m_previous_touchnum = touchNum;
-}
-
-bool GameController::WasSecondaryTouchReset() {
-    return m_was_secondary_reset;
-}
-
-void GameController::UnsetSecondaryTouchResetBool() {
-    m_was_secondary_reset = false;
-}
-
-void GameController::SetLastOrientation(Libraries::Pad::OrbisFQuaternion& orientation) {
-    m_orientation = orientation;
-}
-
-Libraries::Pad::OrbisFQuaternion GameController::GetLastOrientation() {
-    return m_orientation;
-}
-
-std::chrono::steady_clock::time_point GameController::GetLastUpdate() {
-    return m_last_update;
-}
-
-void GameController::SetLastUpdate(std::chrono::steady_clock::time_point lastUpdate) {
-    m_last_update = lastUpdate;
-}
-
-void GameController::PushState() {
-    std::lock_guard lg(m_states_queue_mutex);
-    m_state.time = Libraries::Kernel::sceKernelGetProcessTime();
+void GameController::PushStateLocked(u64 timestamp) {
+    // Capture a complete snapshot (smoothed axes plus the latest motion data) and queue it.
+    // Called from the poll timer and from the input-event handlers; m_state_mutex is held.
+    if (timestamp == 0) {
+        timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    }
+    m_state.UpdateAxisSmoothing(timestamp);
+    m_state.OnGyro(gyro_buf);
+    m_state.OnAccel(accel_buf);
+    UpdateOrientationLocked(timestamp);
+    m_state.time = timestamp;
+    m_state.touch_time_since_held_down =
+        m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
     m_states_queue.Push(m_state);
 }
 
