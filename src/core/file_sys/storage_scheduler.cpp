@@ -613,7 +613,7 @@ StorageScheduler::~StorageScheduler() = default;
 void StorageScheduler::Configure(u32 bandwidth_mibps) {
     const u32 normalized_bandwidth = NormalizeReadBandwidth(bandwidth_mibps);
     if (normalized_bandwidth != bandwidth_mibps) {
-        LOG_WARNING(Config, "Unsupported app0 HDD profile {} MiB/s; clamping to {} MiB/s",
+        LOG_WARNING(Config, "App0 HDD bandwidth {} MiB/s normalized to {} MiB/s",
                     bandwidth_mibps, normalized_bandwidth);
     }
     bandwidth_mibps = normalized_bandwidth;

@@ -1,6 +1,7 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <map>
 #include <ranges>
 #include <ImGuiFileDialog.h>
@@ -20,6 +21,17 @@ constexpr float gameImageSize = 200.f;
 constexpr float settingsIconSize = 125.f;
 
 namespace ImGuiEmuSettings {
+
+namespace {
+
+int NormalizeHddReadBandwidth(int bandwidthMibps) {
+    if (bandwidthMibps <= 0 || bandwidthMibps > 200) {
+        return 0;
+    }
+    return std::max(bandwidthMibps, 50);
+}
+
+} // namespace
 
 int SettingsWindow::GetComboIndex(std::string selection, std::vector<std::string> options) {
     for (int i = 0; i < options.size(); i++) {
@@ -88,6 +100,8 @@ void SettingsWindow::LoadSettings(std::string profile) {
         pipelineCacheEnabledSetting = EmulatorSettings.IsPipelineCacheEnabled();
         pipelineCacheArchiveSetting = EmulatorSettings.IsPipelineCacheArchived();
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
+        app0ReadBandwidthSetting = NormalizeHddReadBandwidth(
+            static_cast<int>(EmulatorSettings.GetApp0ReadBandwidthMiBps()));
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
     }
 }
@@ -143,6 +157,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetPipelineCacheEnabled(pipelineCacheEnabledSetting, true);
         EmulatorSettings.SetPipelineCacheArchived(pipelineCacheArchiveSetting, true);
         EmulatorSettings.SetExtraDmemInMBytes(extraDmemSetting, true);
+        app0ReadBandwidthSetting = NormalizeHddReadBandwidth(app0ReadBandwidthSetting);
+        EmulatorSettings.SetApp0ReadBandwidthMiBps(static_cast<u32>(app0ReadBandwidthSetting), true);
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
     }
 
@@ -740,6 +756,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::TableSetupColumn("Value");
 
             AddSettingSliderInt("Additional DMem Allocation", extraDmemSetting, 0, 20000);
+            AddSettingInputInt(
+                "HDD Read Bandwidth\n0 or above 200: Unlimited; 1-49: 50 MiB/s minimum",
+                app0ReadBandwidthSetting, "MiB/s");
             AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
@@ -771,6 +790,21 @@ void SettingsWindow::AddSettingCheckbox(std::string name, bool& value) {
     ImGui::TextWrapped("%s", name.c_str());
     ImGui::TableNextColumn();
     ImGui::Checkbox(label.c_str(), &value);
+}
+
+void SettingsWindow::AddSettingInputInt(std::string name, int& value, std::string unit) {
+    std::string label = "##" + name;
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", name.c_str());
+
+    ImGui::TableNextColumn();
+    ImGui::SetNextItemWidth(180.0f * uiScale);
+    ImGui::InputInt(label.c_str(), &value, 1, 10);
+    if (!unit.empty()) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(unit.c_str());
+    }
 }
 
 void SettingsWindow::AddSettingSliderInt(std::string name, int& value, int min, int max) {

@@ -8,7 +8,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -20,34 +19,16 @@ namespace Core::FileSys {
 struct File;
 
 [[nodiscard]] constexpr bool IsSupportedReadBandwidth(u32 bandwidth_mibps) {
-    switch (bandwidth_mibps) {
-    case 0:
-    case 75:
-    case 100:
-    case 125:
-        return true;
-    default:
-        return false;
-    }
+    return bandwidth_mibps == 0 || (bandwidth_mibps >= 50 && bandwidth_mibps <= 200);
 }
 
-// Unsupported non-zero values clamp to the nearest public profile so a hand-edited config
-// asking for throttling never silently runs at native speed.
+// Zero and values above 200 select native/unlimited speed. Small non-zero values are clamped to
+// 50 MiB/s so a typo cannot make games appear broken. Every value in [50, 200] is accepted.
 [[nodiscard]] constexpr u32 NormalizeReadBandwidth(u32 bandwidth_mibps) {
-    if (IsSupportedReadBandwidth(bandwidth_mibps)) {
-        return bandwidth_mibps;
+    if (bandwidth_mibps == 0 || bandwidth_mibps > 200) {
+        return 0;
     }
-    u32 nearest = 75;
-    u32 nearest_distance = std::numeric_limits<u32>::max();
-    for (const u32 profile : {75u, 100u, 125u}) {
-        const u32 distance =
-            bandwidth_mibps > profile ? bandwidth_mibps - profile : profile - bandwidth_mibps;
-        if (distance < nearest_distance) {
-            nearest = profile;
-            nearest_distance = distance;
-        }
-    }
-    return nearest;
+    return std::max(bandwidth_mibps, 50u);
 }
 
 [[nodiscard]] constexpr u8 StoragePriorityIndex(s32 priority) {

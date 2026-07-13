@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <array>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -14,33 +13,26 @@ namespace {
 
 using Core::FileSys::StorageTimingModel;
 
-TEST(StorageSchedulerTest, AcceptsAndNormalizesOnlyPublicProfiles) {
-    constexpr std::array supported{0u, 75u, 100u, 125u};
-    for (const u32 profile : supported) {
-        EXPECT_TRUE(Core::FileSys::IsSupportedReadBandwidth(profile));
-        EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(profile), profile);
+TEST(StorageSchedulerTest, AcceptsEveryUserBandwidthInRange) {
+    for (u32 bandwidth = 50; bandwidth <= 200; ++bandwidth) {
+        EXPECT_TRUE(Core::FileSys::IsSupportedReadBandwidth(bandwidth));
+        EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(bandwidth), bandwidth);
     }
-
-    constexpr std::array unsupported{1u, 50u, 74u, 76u, 99u, 101u, 124u, 126u, 1'000u};
-    for (const u32 profile : unsupported) {
-        EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(profile));
-    }
+    EXPECT_TRUE(Core::FileSys::IsSupportedReadBandwidth(0));
+    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(1));
+    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(49));
+    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(201));
 }
 
-TEST(StorageSchedulerTest, UnsupportedValuesClampToNearestProfileNeverToNative) {
-    // A hand-edited config asking for throttling must keep throttling.
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(1), 75u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(74), 75u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(76), 75u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(87), 75u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(88), 100u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(99), 100u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(101), 100u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(112), 100u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(113), 125u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(126), 125u);
-    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(1'000), 125u);
+TEST(StorageSchedulerTest, OutOfRangeValuesNormalizeSafely) {
     EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(0), 0u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(1), 50u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(49), 50u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(50), 50u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(137), 137u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(200), 200u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(201), 0u);
+    EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(1'000), 0u);
 }
 
 TEST(StorageSchedulerTest, DisabledProfileAddsNoTransferDelay) {
@@ -49,7 +41,7 @@ TEST(StorageSchedulerTest, DisabledProfileAddsNoTransferDelay) {
     EXPECT_EQ(model.TransferDuration(1024 * 1024), std::chrono::nanoseconds::zero());
 }
 
-TEST(StorageSchedulerTest, ProfilesProduceExactSequentialCeilings) {
+TEST(StorageSchedulerTest, UserBandwidthsProduceExactSequentialCeilings) {
     constexpr StorageTimingModel model75{75};
     constexpr StorageTimingModel model100{100};
     constexpr StorageTimingModel model125{125};
@@ -59,6 +51,9 @@ TEST(StorageSchedulerTest, ProfilesProduceExactSequentialCeilings) {
     EXPECT_EQ(model125.TransferDuration(125 * 1024 * 1024), std::chrono::seconds{1});
     EXPECT_EQ(model100.TransferDuration(512 * 1024), std::chrono::milliseconds{5});
     EXPECT_EQ(model125.TransferDuration(1024 * 1024), std::chrono::milliseconds{8});
+
+    constexpr StorageTimingModel model137{137};
+    EXPECT_EQ(model137.TransferDuration(137 * 1024 * 1024), std::chrono::seconds{1});
 }
 
 TEST(StorageSchedulerTest, SmallSequentialReadsAggregateWithoutPerReadLatency) {
