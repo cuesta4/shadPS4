@@ -171,7 +171,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
-    controllers.TryOpenSDLControllers();
+    // Initial SDL discovery happens before the emulated kernel clock exists. The controller is
+    // already connected before the guest opens its pad handle, so no connection event needs to be
+    // queued here; scePadReadState still exposes the current state. Hotplug events publish
+    // normally.
+    controllers.TryOpenSDLControllers(false);
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");

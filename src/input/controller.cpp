@@ -269,7 +269,7 @@ void GameControllers::CalculateOrientation(const Libraries::Pad::OrbisFVector3& 
     orientation.w = q.w;
 }
 
-void GameController::ConnectController(SDL_Gamepad* pad) {
+void GameController::ConnectController(SDL_Gamepad* pad, bool publish_state) {
     std::scoped_lock l(m_state_mutex);
     m_sdl_gamepad = pad;
     const bool was_connected = m_state.connected;
@@ -285,7 +285,9 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
     }
     m_state.connected = true;
     m_last_orientation_update = 0;
-    PushStateLocked();
+    if (publish_state) {
+        PushStateLocked();
+    }
 }
 
 void GameController::DisconnectController() {
@@ -299,7 +301,7 @@ void GameController::DisconnectController() {
 
 bool is_first_check = true;
 
-void GameControllers::TryOpenSDLControllers() {
+void GameControllers::TryOpenSDLControllers(bool publish_connection_state) {
     using namespace Libraries::UserService;
     int controller_count;
     s32 move_count = 0;
@@ -358,7 +360,7 @@ void GameControllers::TryOpenSDLControllers() {
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
-                c->ConnectController(pad);
+                c->ConnectController(pad, publish_connection_state);
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
