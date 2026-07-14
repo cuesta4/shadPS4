@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -394,9 +394,6 @@ struct GPUSettings {
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
-    // Apply before launching a title. Changing this option while a game is running requires a
-    // restart so cached graphics state is rebuilt consistently.
-    Setting<bool> high_draw_call_optimization{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -428,8 +425,6 @@ struct GPUSettings {
                                        &GPUSettings::readback_linear_images_enabled),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
-            make_override<GPUSettings>("high_draw_call_optimization",
-                                       &GPUSettings::high_draw_call_optimization),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
         };
     }
@@ -706,7 +701,6 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
-    SETTING_FORWARD_BOOL(m_gpu, HighDrawCallOptimization, high_draw_call_optimization)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
 
     u32 GetVblankFrequency() {

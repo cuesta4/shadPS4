@@ -179,11 +179,6 @@ public:
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
-    /// Returns the ring-buffer generation. It changes whenever allocations wrap to offset zero.
-    [[nodiscard]] u64 Generation() const noexcept {
-        return generation;
-    }
-
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -207,7 +202,6 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
-    u64 generation{1};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

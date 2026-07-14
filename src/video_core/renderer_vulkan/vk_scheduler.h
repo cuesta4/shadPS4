@@ -393,24 +393,6 @@ public:
         return master_semaphore.CurrentTick();
     }
 
-    /// Returns true when high draw-call CPU optimizations are enabled for this session.
-    [[nodiscard]] bool IsHighDrawCallOptimization() const noexcept {
-        return high_draw_call_optimization;
-    }
-
-    /// Returns a monotonic epoch incremented whenever graphics push-descriptor state is disturbed
-    /// in the guest command buffer. Cached partial pushes use this to reject stale state.
-    [[nodiscard]] u64 GraphicsPushDescriptorEpoch() const noexcept {
-        return graphics_push_descriptor_epoch;
-    }
-
-    /// Records a graphics push-descriptor write in the guest command buffer.
-    void NotifyGraphicsPushDescriptorSet() noexcept {
-        if (high_draw_call_optimization) {
-            ++graphics_push_descriptor_epoch;
-        }
-    }
-
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         if (master_semaphore.IsFree(tick)) {
@@ -452,12 +434,10 @@ private:
 
 private:
     const Instance& instance;
-    const bool high_draw_call_optimization;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
-    u64 graphics_push_descriptor_epoch{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
