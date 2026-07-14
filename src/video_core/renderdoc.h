@@ -18,8 +18,8 @@ void StartCapture();
 /// Ends current renderdoc capture.
 void EndCapture();
 
-/// Triggers capturing process.
-void TriggerCapture();
+/// Toggles a multi-frame capture. The first call starts it and the second call saves it.
+void ToggleCapture();
 
 /// Sets output directory for captures
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
