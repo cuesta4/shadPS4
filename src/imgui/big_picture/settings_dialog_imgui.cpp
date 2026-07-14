@@ -99,7 +99,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
         connectedNetworkSetting = EmulatorSettings.IsConnectedToNetwork();
         pipelineCacheEnabledSetting = EmulatorSettings.IsPipelineCacheEnabled();
         pipelineCacheArchiveSetting = EmulatorSettings.IsPipelineCacheArchived();
-        highDrawCallOptimizationSetting = EmulatorSettings.IsHighDrawCallOptimization();
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         app0ReadBandwidthSetting = NormalizeHddReadBandwidth(
             static_cast<int>(EmulatorSettings.GetApp0ReadBandwidthMiBps()));
@@ -157,7 +156,6 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetConnectedToNetwork(connectedNetworkSetting, true);
         EmulatorSettings.SetPipelineCacheEnabled(pipelineCacheEnabledSetting, true);
         EmulatorSettings.SetPipelineCacheArchived(pipelineCacheArchiveSetting, true);
-        EmulatorSettings.SetHighDrawCallOptimization(highDrawCallOptimizationSetting, true);
         EmulatorSettings.SetExtraDmemInMBytes(extraDmemSetting, true);
         app0ReadBandwidthSetting = NormalizeHddReadBandwidth(app0ReadBandwidthSetting);
         EmulatorSettings.SetApp0ReadBandwidthMiBps(static_cast<u32>(app0ReadBandwidthSetting), true);
@@ -765,8 +763,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
-            AddSettingCheckbox("Enable High Draw-Call Fast Path (Restart Required)",
-                               highDrawCallOptimizationSetting);
             AddSettingCheckbox("Enable Devkit Console Mode", devkitConsoleSetting);
             AddSettingCheckbox("Enable PS4 Neo Mode", neoModeSetting);
             AddSettingCheckbox("Enable ShadNet", shadnetEnabledSetting);
