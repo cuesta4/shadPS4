@@ -176,6 +176,10 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    // Monotonic version of the contents represented by this independent VkImage. Images that
+    // alias the same guest allocation may not be Vulkan-compatible views of one another, so the
+    // texture cache uses this to propagate the newest contents on demand.
+    u64 alias_generation{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
