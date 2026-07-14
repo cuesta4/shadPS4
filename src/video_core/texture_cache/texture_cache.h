@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -103,12 +104,21 @@ public:
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
+    /// Applies texture-binding side effects and refreshes image contents without resolving a view.
+    void PrepareTexture(ImageId image_id, const ImageDesc& desc);
+
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the render target with specified properties
+    /// Applies render-target side effects without resolving a Vulkan image view.
+    void PrepareRenderTarget(ImageId image_id, const ImageDesc& desc);
+
+    /// Retrieves the render target with specified properties.
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the depth target with specified properties
+    /// Applies depth-target side effects without resolving a Vulkan image view.
+    void PrepareDepthTarget(ImageId image_id, const ImageDesc& desc);
+
+    /// Retrieves the depth target with specified properties.
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
@@ -139,6 +149,10 @@ public:
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base);
+
+    [[nodiscard]] u64 BindingGeneration() const noexcept {
+        return binding_generation;
+    }
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -313,6 +327,7 @@ private:
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
+    const bool high_draw_call_optimization;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
@@ -321,6 +336,33 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+
+    // Small conservative lookup caches for the extremely hot texture-binding path.
+    // The image cache only shortcuts the exact-match branch already present in FindImage().
+    // It never bypasses UpdateImage(), view lookup, layout transitions, or descriptor emission.
+    struct FindImageFastEntry {
+        ImageId image_id{};
+        VAddr guest_address{};
+        u64 guest_size{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        vk::Format pixel_format{vk::Format::eUndefined};
+        AmdGpu::ImageType type{};
+        bool exact_fmt{};
+        bool valid{};
+    };
+    static constexpr size_t FindImageFastCacheSize = 8;
+    std::array<FindImageFastEntry, FindImageFastCacheSize> find_image_fast_cache{};
+    size_t find_image_fast_next{};
+
+    u64 binding_generation{1};
+
+    u64 sampler_fast_hash{};
+    vk::Sampler sampler_fast_handle{};
+    bool sampler_fast_valid{};
+
+    tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
