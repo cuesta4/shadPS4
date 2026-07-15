@@ -18,10 +18,6 @@ namespace Core::FileSys {
 
 struct File;
 
-[[nodiscard]] constexpr bool IsSupportedReadBandwidth(u32 bandwidth_mibps) {
-    return bandwidth_mibps == 0 || (bandwidth_mibps >= 50 && bandwidth_mibps <= 200);
-}
-
 // Zero and values above 200 select native/unlimited speed. Small non-zero values are clamped to
 // 50 MiB/s so a typo cannot make games appear broken. Every value in [50, 200] is accepted.
 [[nodiscard]] constexpr u32 NormalizeReadBandwidth(u32 bandwidth_mibps) {
@@ -30,6 +26,16 @@ struct File;
     }
     return std::max(bandwidth_mibps, 50u);
 }
+
+struct StorageSchedulerConfig {
+    u32 bandwidth_mibps{};
+    bool disable_time_stretching{};
+    bool unlimited_sequential_read_speed{};
+
+    [[nodiscard]] constexpr bool IsEnabled() const {
+        return bandwidth_mibps != 0;
+    }
+};
 
 [[nodiscard]] constexpr u8 StoragePriorityIndex(s32 priority) {
     return static_cast<u8>(std::clamp(priority, -128, 127) + 128);
@@ -41,27 +47,32 @@ public:
     static constexpr auto AverageSeek = std::chrono::milliseconds{13};
     static constexpr auto AverageRotation = std::chrono::microseconds{5'556};
 
-    explicit constexpr StorageTimingModel(u32 bandwidth_mibps) : bandwidth_mibps{bandwidth_mibps} {}
+    explicit constexpr StorageTimingModel(StorageSchedulerConfig config) : config{config} {}
 
     [[nodiscard]] constexpr std::chrono::nanoseconds TransferDuration(u64 bytes) const {
-        if (bandwidth_mibps == 0 || bytes == 0) {
+        if (!config.IsEnabled() || bytes == 0) {
             return {};
         }
-        const u64 bytes_per_second = static_cast<u64>(bandwidth_mibps) * 1024ULL * 1024ULL;
+        const u64 bytes_per_second = static_cast<u64>(config.bandwidth_mibps) * 1024ULL * 1024ULL;
         const u64 whole_seconds = bytes / bytes_per_second;
         const u64 remainder = bytes % bytes_per_second;
         return std::chrono::seconds{whole_seconds} +
                std::chrono::nanoseconds{remainder * 1'000'000'000ULL / bytes_per_second};
     }
 
-    [[nodiscard]] constexpr std::chrono::nanoseconds ServiceDuration(u64 bytes,
-                                                                     bool sequential) const {
-        return TransferDuration(bytes) +
-               (sequential ? std::chrono::nanoseconds::zero() : AverageSeek + AverageRotation);
+    [[nodiscard]] constexpr std::chrono::nanoseconds ServiceDuration(
+        u64 bytes, bool sequential, u32 slowdown_percent = 100) const {
+        const auto transfer = sequential && config.unlimited_sequential_read_speed
+                                  ? std::chrono::nanoseconds::zero()
+                                  : TransferDuration(bytes);
+        const auto positioning =
+            sequential ? std::chrono::nanoseconds::zero() : AverageSeek + AverageRotation;
+        const auto duration = transfer + positioning;
+        return duration * (config.disable_time_stretching ? 100 : slowdown_percent) / 100;
     }
 
 private:
-    u32 bandwidth_mibps{};
+    StorageSchedulerConfig config;
 };
 
 struct StorageReadSpan {
@@ -107,9 +118,8 @@ public:
     StorageScheduler(const StorageScheduler&) = delete;
     StorageScheduler& operator=(const StorageScheduler&) = delete;
 
-    void Configure(u32 bandwidth_mibps);
+    [[nodiscard]] StorageSchedulerConfig Configure(StorageSchedulerConfig config);
     [[nodiscard]] bool IsEnabled() const;
-    [[nodiscard]] u32 GetBandwidthMiBps() const;
 
     StorageRequestHandle SubmitRead(std::shared_ptr<File> file, StorageReadSpans spans, u64 offset,
                                     s32 priority, StorageCompletion completion);

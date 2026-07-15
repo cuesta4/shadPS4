@@ -351,10 +351,10 @@ bool VideoOutDriver::Flip(const Request& req) {
     // Real guest flips (never DrawLastFrame re-presents) feed the app0 storage scheduler so
     // modeled I/O stretches when the emulator runs below the game's target flip cadence.
     auto& storage = Core::FileSys::GetApp0StorageScheduler();
-    if (storage.IsEnabled()) {
+    const u32 vblank_frequency = EmulatorSettings.GetVblankFrequency();
+    if (storage.IsEnabled() && vblank_frequency != 0) {
         const auto expected_period =
-            std::chrono::nanoseconds{1'000'000'000 / EmulatorSettings.GetVblankFrequency()} *
-            (port->flip_rate + 1);
+            std::chrono::nanoseconds{1'000'000'000 / vblank_frequency} * (port->flip_rate + 1);
         storage.ReportGuestFlip(expected_period);
     }
 

@@ -95,6 +95,9 @@ void InterruptibleTimer::WaitUntil(std::chrono::steady_clock::time_point deadlin
     const std::array handles{impl->timer, impl->interrupt};
     const DWORD result =
         WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, INFINITE);
+    if (result == WAIT_OBJECT_0 + 1) {
+        CancelWaitableTimer(impl->timer);
+    }
     if (result == WAIT_FAILED) {
         std::this_thread::sleep_until(deadline);
         return;

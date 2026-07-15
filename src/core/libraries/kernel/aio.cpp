@@ -35,16 +35,26 @@ constexpr u32 SlotMask = (1u << SlotBits) - 1;
 
 void PublishResult(OrbisKernelAioResult* result, s64 return_value, AioState state) {
     result->returnValue = return_value;
-    std::atomic_thread_fence(std::memory_order_release);
     std::atomic_ref{result->state}.store(state, std::memory_order_release);
 }
 
 struct AioRecord {
-    OrbisKernelAioSubmitId id{};
-    std::atomic<s32> state{ORBIS_KERNEL_AIO_STATE_SUBMITTED};
-    std::atomic<u32> remaining{};
+    AioRecord(OrbisKernelAioSubmitId id, u32 command_count, bool abort_on_error)
+        : id{id}, remaining{command_count}, abort_on_error{abort_on_error} {}
+
+    [[nodiscard]] bool IsPending() const {
+        return state.load(std::memory_order_acquire) <= ORBIS_KERNEL_AIO_STATE_PROCESSING;
+    }
+
+    [[nodiscard]] bool IsComplete() const {
+        return state.load(std::memory_order_acquire) >= ORBIS_KERNEL_AIO_STATE_COMPLETED;
+    }
+
+    const OrbisKernelAioSubmitId id;
+    std::atomic<s32> state{ORBIS_KERNEL_AIO_STATE_PROCESSING};
+    std::atomic<u32> remaining;
     std::atomic_bool cancel_requested{};
-    bool abort_on_error{};
+    const bool abort_on_error;
     std::mutex mutex;
     std::vector<Core::FileSys::StorageRequestHandle> storage_requests;
 };
@@ -62,8 +72,7 @@ public:
             const u32 slot = next_slot;
             next_slot = next_slot == MaxRequests - 1 ? 1 : next_slot + 1;
             const auto& existing = records[slot];
-            if (existing && existing->state.load(std::memory_order_acquire) <=
-                                ORBIS_KERNEL_AIO_STATE_PROCESSING) {
+            if (existing && existing->IsPending()) {
                 continue;
             }
 
@@ -71,11 +80,8 @@ public:
             if (generation == 0 || generation >= (1u << (31 - SlotBits))) {
                 generation = generations[slot] = 1;
             }
-            auto record = std::make_shared<AioRecord>();
-            record->id = static_cast<s32>((generation << SlotBits) | slot);
-            record->remaining = command_count;
-            record->abort_on_error = abort_on_error;
-            record->state = ORBIS_KERNEL_AIO_STATE_PROCESSING;
+            const auto id = static_cast<s32>((generation << SlotBits) | slot);
+            auto record = std::make_shared<AioRecord>(id, command_count, abort_on_error);
             records[slot] = record;
             return record;
         }
@@ -102,8 +108,7 @@ public:
         if (!slot) {
             return ORBIS_KERNEL_ERROR_EINVAL;
         }
-        if (records[*slot]->state.load(std::memory_order_acquire) <=
-            ORBIS_KERNEL_AIO_STATE_PROCESSING) {
+        if (records[*slot]->IsPending()) {
             return ORBIS_KERNEL_ERROR_EBUSY;
         }
         records[*slot] = nullptr;
@@ -123,12 +128,16 @@ public:
 
     void AttachStorageRequest(const std::shared_ptr<AioRecord>& record,
                               Core::FileSys::StorageRequestHandle request) {
-        std::scoped_lock lock{record->mutex};
-        if (record->cancel_requested.load(std::memory_order_acquire)) {
-            Core::FileSys::GetApp0StorageScheduler().Cancel(request);
+        bool cancel{};
+        {
+            std::scoped_lock lock{record->mutex};
+            cancel = record->cancel_requested.load(std::memory_order_acquire);
+            if (!cancel && record->IsPending()) {
+                record->storage_requests.push_back(std::move(request));
+            }
         }
-        if (record->state.load(std::memory_order_acquire) <= ORBIS_KERNEL_AIO_STATE_PROCESSING) {
-            record->storage_requests.push_back(std::move(request));
+        if (cancel) {
+            Core::FileSys::GetApp0StorageScheduler().Cancel(request);
         }
     }
 
@@ -156,16 +165,17 @@ public:
     }
 
     s32 Cancel(const std::shared_ptr<AioRecord>& record) {
-        const s32 current = record->state.load(std::memory_order_acquire);
-        if (current >= ORBIS_KERNEL_AIO_STATE_COMPLETED) {
-            return current;
+        if (record->IsComplete()) {
+            return record->state.load(std::memory_order_acquire);
         }
         record->cancel_requested.store(true, std::memory_order_release);
+        std::vector<Core::FileSys::StorageRequestHandle> requests;
         {
             std::scoped_lock lock{record->mutex};
-            for (const auto& request : record->storage_requests) {
-                Core::FileSys::GetApp0StorageScheduler().Cancel(request);
-            }
+            requests = record->storage_requests;
+        }
+        for (const auto& request : requests) {
+            Core::FileSys::GetApp0StorageScheduler().Cancel(request);
         }
         return record->state.load(std::memory_order_acquire);
     }
@@ -174,15 +184,11 @@ public:
              u32* usec) {
         const auto predicate = [&] {
             if (wait_any) {
-                return std::ranges::any_of(records_to_wait, [](const auto& record) {
-                    return record->state.load(std::memory_order_acquire) >=
-                           ORBIS_KERNEL_AIO_STATE_COMPLETED;
-                });
+                return std::ranges::any_of(records_to_wait,
+                                           [](const auto& record) { return record->IsComplete(); });
             }
-            return std::ranges::all_of(records_to_wait, [](const auto& record) {
-                return record->state.load(std::memory_order_acquire) >=
-                       ORBIS_KERNEL_AIO_STATE_COMPLETED;
-            });
+            return std::ranges::all_of(records_to_wait,
+                                       [](const auto& record) { return record->IsComplete(); });
         };
 
         std::unique_lock lock{wait_mutex};
@@ -243,10 +249,11 @@ private:
     std::mutex work_mutex;
     std::condition_variable work_cv;
     std::deque<std::function<void()>> work;
-    std::jthread worker;
 
     std::mutex wait_mutex;
     std::condition_variable wait_cv;
+    // Joined before the synchronization primitives and queues it accesses are destroyed.
+    std::jthread worker;
 };
 
 AioManager& GetAioManager() {
@@ -300,7 +307,7 @@ s32 SubmitCommands(OrbisKernelAioRWRequest requests[], s32 size, s32 priority,
         if (requests[index].nbyte < 0 || requests[index].offset < 0) {
             return ORBIS_KERNEL_ERROR_EINVAL;
         }
-        auto file = handles->GetFileLease(requests[index].fd);
+        auto file = handles->GetFileShared(requests[index].fd);
         if (!file) {
             return ORBIS_KERNEL_ERROR_EBADF;
         }

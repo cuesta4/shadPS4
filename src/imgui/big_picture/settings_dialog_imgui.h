@@ -167,6 +167,8 @@ private:
     bool highDrawCallOptimizationSetting;
     int extraDmemSetting;
     int app0ReadBandwidthSetting;
+    bool app0ReadDisableTimeStretchingSetting;
+    bool app0ReadUnlimitedSequentialReadSpeedSetting;
     int vblankFrequencySetting;
 };
 

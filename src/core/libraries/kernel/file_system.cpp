@@ -428,9 +428,7 @@ s64 ReadRegularScheduled(const std::shared_ptr<Core::FileSys::File>& file,
             requested += iov[index].iov_len;
         }
         readable = read_offset < file_size ? std::min(requested, file_size - read_offset) : 0;
-        // The position advances by the full readable amount up front; a short host read
-        // (host-level I/O failure on read-only /app0) would leave it past the bytes
-        // actually delivered. Accepted as a known minor fidelity gap.
+        // Reserve the range before releasing the file lock so concurrent reads cannot claim it.
         if (!offset && !file->f.Seek(static_cast<s64>(read_offset + readable))) {
             *__Error() = POSIX_EIO;
             return -1;
@@ -439,6 +437,14 @@ s64 ReadRegularScheduled(const std::shared_ptr<Core::FileSys::File>& file,
 
     auto spans = MakeReadSpans(iov, iovcnt, readable);
     const s64 result = scheduler.ReadBlocking(file, spans, read_offset);
+    if (!offset && result != static_cast<s64>(readable)) {
+        std::scoped_lock lock{file->m_mutex};
+        const auto reserved_end = static_cast<s64>(read_offset + readable);
+        // Do not overwrite a position changed by another operation while this read was pending.
+        if (file->f.Tell() == reserved_end) {
+            file->f.Seek(static_cast<s64>(read_offset + std::max<s64>(result, 0)));
+        }
+    }
     if (result < 0) {
         *__Error() = POSIX_EIO;
         return -1;
@@ -452,7 +458,7 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
         return -1;
     }
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto file = h->GetFileLease(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;
@@ -619,7 +625,7 @@ s64 PS4_SYSV_ABI sceKernelLseek(s32 fd, s64 offset, s32 whence) {
 
 s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto file = h->GetFileLease(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;
@@ -1043,7 +1049,7 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
     }
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto file = h->GetFileLease(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;

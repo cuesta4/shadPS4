@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <map>
 #include <ranges>
 #include <ImGuiFileDialog.h>
@@ -12,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/devtools/layer.h"
+#include "core/file_sys/storage_scheduler.h"
 #include "imgui/imgui_std.h"
 #include "settings_dialog_imgui.h"
 
@@ -25,10 +25,8 @@ namespace ImGuiEmuSettings {
 namespace {
 
 int NormalizeHddReadBandwidth(int bandwidthMibps) {
-    if (bandwidthMibps <= 0 || bandwidthMibps > 200) {
-        return 0;
-    }
-    return std::max(bandwidthMibps, 50);
+    return static_cast<int>(
+        Core::FileSys::NormalizeReadBandwidth(static_cast<u32>(bandwidthMibps)));
 }
 
 } // namespace
@@ -103,6 +101,9 @@ void SettingsWindow::LoadSettings(std::string profile) {
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         app0ReadBandwidthSetting = NormalizeHddReadBandwidth(
             static_cast<int>(EmulatorSettings.GetApp0ReadBandwidthMiBps()));
+        app0ReadDisableTimeStretchingSetting = EmulatorSettings.IsApp0ReadDisableTimeStretching();
+        app0ReadUnlimitedSequentialReadSpeedSetting =
+            EmulatorSettings.IsApp0ReadUnlimitedSequentialReadSpeed();
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
     }
 }
@@ -160,7 +161,12 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetHighDrawCallOptimization(highDrawCallOptimizationSetting, true);
         EmulatorSettings.SetExtraDmemInMBytes(extraDmemSetting, true);
         app0ReadBandwidthSetting = NormalizeHddReadBandwidth(app0ReadBandwidthSetting);
-        EmulatorSettings.SetApp0ReadBandwidthMiBps(static_cast<u32>(app0ReadBandwidthSetting), true);
+        EmulatorSettings.SetApp0ReadBandwidthMiBps(static_cast<u32>(app0ReadBandwidthSetting),
+                                                   true);
+        EmulatorSettings.SetApp0ReadDisableTimeStretching(app0ReadDisableTimeStretchingSetting,
+                                                          true);
+        EmulatorSettings.SetApp0ReadUnlimitedSequentialReadSpeed(
+            app0ReadUnlimitedSequentialReadSpeedSetting, true);
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
     }
 
@@ -761,6 +767,18 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingInputInt(
                 "HDD Read Bandwidth\n0 or above 200: Unlimited; 1-49: 50 MiB/s minimum",
                 app0ReadBandwidthSetting, "MiB/s");
+            const bool storageScheduleEnabled =
+                NormalizeHddReadBandwidth(app0ReadBandwidthSetting) != 0;
+            ImGui::BeginDisabled(!storageScheduleEnabled);
+            AddSettingCheckbox(
+                "Disable Time Stretching\nUse fixed HDD timing without frame-rate scaling. "
+                "Warning: this might break some games.",
+                app0ReadDisableTimeStretchingSetting);
+            AddSettingCheckbox(
+                "Unlimited Sequential Readspeeds\nRemove the bandwidth cap from contiguous "
+                "reads. Warning: this might break some games.",
+                app0ReadUnlimitedSequentialReadSpeedSetting);
+            ImGui::EndDisabled();
             AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);

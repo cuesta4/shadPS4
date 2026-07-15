@@ -13,15 +13,17 @@ namespace {
 
 using Core::FileSys::StorageTimingModel;
 
-TEST(StorageSchedulerTest, AcceptsEveryUserBandwidthInRange) {
+constexpr StorageTimingModel MakeTimingModel(u32 bandwidth_mibps,
+                                             bool disable_time_stretching = false,
+                                             bool unlimited_sequential_read_speed = false) {
+    return StorageTimingModel{
+        {bandwidth_mibps, disable_time_stretching, unlimited_sequential_read_speed}};
+}
+
+TEST(StorageSchedulerTest, PreservesEveryUserBandwidthInRange) {
     for (u32 bandwidth = 50; bandwidth <= 200; ++bandwidth) {
-        EXPECT_TRUE(Core::FileSys::IsSupportedReadBandwidth(bandwidth));
         EXPECT_EQ(Core::FileSys::NormalizeReadBandwidth(bandwidth), bandwidth);
     }
-    EXPECT_TRUE(Core::FileSys::IsSupportedReadBandwidth(0));
-    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(1));
-    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(49));
-    EXPECT_FALSE(Core::FileSys::IsSupportedReadBandwidth(201));
 }
 
 TEST(StorageSchedulerTest, OutOfRangeValuesNormalizeSafely) {
@@ -36,15 +38,15 @@ TEST(StorageSchedulerTest, OutOfRangeValuesNormalizeSafely) {
 }
 
 TEST(StorageSchedulerTest, DisabledProfileAddsNoTransferDelay) {
-    constexpr StorageTimingModel model{0};
+    constexpr auto model = MakeTimingModel(0);
     EXPECT_EQ(model.TransferDuration(0), std::chrono::nanoseconds::zero());
     EXPECT_EQ(model.TransferDuration(1024 * 1024), std::chrono::nanoseconds::zero());
 }
 
 TEST(StorageSchedulerTest, UserBandwidthsProduceExactSequentialCeilings) {
-    constexpr StorageTimingModel model75{75};
-    constexpr StorageTimingModel model100{100};
-    constexpr StorageTimingModel model125{125};
+    constexpr auto model75 = MakeTimingModel(75);
+    constexpr auto model100 = MakeTimingModel(100);
+    constexpr auto model125 = MakeTimingModel(125);
 
     EXPECT_EQ(model75.TransferDuration(75 * 1024 * 1024), std::chrono::seconds{1});
     EXPECT_EQ(model100.TransferDuration(100 * 1024 * 1024), std::chrono::seconds{1});
@@ -52,27 +54,48 @@ TEST(StorageSchedulerTest, UserBandwidthsProduceExactSequentialCeilings) {
     EXPECT_EQ(model100.TransferDuration(512 * 1024), std::chrono::milliseconds{5});
     EXPECT_EQ(model125.TransferDuration(1024 * 1024), std::chrono::milliseconds{8});
 
-    constexpr StorageTimingModel model137{137};
+    constexpr auto model137 = MakeTimingModel(137);
     EXPECT_EQ(model137.TransferDuration(137 * 1024 * 1024), std::chrono::seconds{1});
 }
 
 TEST(StorageSchedulerTest, SmallSequentialReadsAggregateWithoutPerReadLatency) {
-    constexpr StorageTimingModel model{75};
+    constexpr auto model = MakeTimingModel(75);
     constexpr auto individual = model.ServiceDuration(4 * 1024, true);
     EXPECT_NEAR((individual * 128).count(), model.TransferDuration(512 * 1024).count(), 128);
 }
 
 TEST(StorageSchedulerTest, RandomReadAddsMechanicalPositioningOnce) {
-    constexpr StorageTimingModel model{100};
+    constexpr auto model = MakeTimingModel(100);
     constexpr auto sequential = model.ServiceDuration(4 * 1024, true);
     constexpr auto positioned = model.ServiceDuration(4 * 1024, false);
     EXPECT_EQ(positioned - sequential,
               StorageTimingModel::AverageSeek + StorageTimingModel::AverageRotation);
 }
 
+TEST(StorageSchedulerTest, DisableTimeStretchingOnlyRemovesSlowdownFactor) {
+    constexpr auto stretched = MakeTimingModel(100);
+    constexpr auto unstretched = MakeTimingModel(100, true);
+    constexpr auto normal_sequential = stretched.ServiceDuration(512 * 1024, true);
+    constexpr auto normal_positioned = stretched.ServiceDuration(512 * 1024, false);
+
+    EXPECT_EQ(unstretched.ServiceDuration(512 * 1024, true, 250), normal_sequential);
+    EXPECT_EQ(unstretched.ServiceDuration(512 * 1024, false, 250), normal_positioned);
+    EXPECT_EQ(stretched.ServiceDuration(512 * 1024, true, 250), normal_sequential * 5 / 2);
+    EXPECT_EQ(stretched.ServiceDuration(512 * 1024, false, 250), normal_positioned * 5 / 2);
+}
+
+TEST(StorageSchedulerTest, UnlimitedSequentialReadSpeedOnlyUncapsContiguousReads) {
+    constexpr auto limited = MakeTimingModel(100);
+    constexpr auto unlimited = MakeTimingModel(100, false, true);
+    constexpr auto normal_positioned = limited.ServiceDuration(512 * 1024, false);
+
+    EXPECT_EQ(unlimited.ServiceDuration(512 * 1024, true), std::chrono::nanoseconds::zero());
+    EXPECT_EQ(unlimited.ServiceDuration(512 * 1024, false), normal_positioned);
+}
+
 TEST(StorageSchedulerTest, UsesFiosDefaultChunkSize) {
     EXPECT_EQ(StorageTimingModel::MaxChunkSize, 512u * 1024u);
-    constexpr StorageTimingModel model{100};
+    constexpr auto model = MakeTimingModel(100);
     EXPECT_EQ(model.TransferDuration(StorageTimingModel::MaxChunkSize),
               std::chrono::milliseconds{5});
 }
@@ -88,30 +111,56 @@ TEST(StorageSchedulerTest, PriorityMappingClampsToSdkRange) {
 TEST(StorageSchedulerTest, BandwidthDefaultsToNativeSpeed) {
     EmulatorSettingsImpl settings;
     EXPECT_EQ(settings.GetApp0ReadBandwidthMiBps(), 0u);
+    EXPECT_FALSE(settings.IsApp0ReadDisableTimeStretching());
+    EXPECT_FALSE(settings.IsApp0ReadUnlimitedSequentialReadSpeed());
 }
 
 TEST(StorageSchedulerTest, BandwidthSupportsPerGameOverride) {
     EmulatorSettingsImpl settings;
     settings.SetApp0ReadBandwidthMiBps(100);
     settings.SetApp0ReadBandwidthMiBps(75, true);
+    settings.SetApp0ReadDisableTimeStretching(false);
+    settings.SetApp0ReadDisableTimeStretching(true, true);
+    settings.SetApp0ReadUnlimitedSequentialReadSpeed(false);
+    settings.SetApp0ReadUnlimitedSequentialReadSpeed(true, true);
 
     settings.SetConfigMode(ConfigMode::Global);
     EXPECT_EQ(settings.GetApp0ReadBandwidthMiBps(), 100u);
+    EXPECT_FALSE(settings.IsApp0ReadDisableTimeStretching());
+    EXPECT_FALSE(settings.IsApp0ReadUnlimitedSequentialReadSpeed());
     settings.SetConfigMode(ConfigMode::Default);
     EXPECT_EQ(settings.GetApp0ReadBandwidthMiBps(), 75u);
+    EXPECT_TRUE(settings.IsApp0ReadDisableTimeStretching());
+    EXPECT_TRUE(settings.IsApp0ReadUnlimitedSequentialReadSpeed());
     settings.SetConfigMode(ConfigMode::Clean);
     EXPECT_EQ(settings.GetApp0ReadBandwidthMiBps(), 0u);
+    EXPECT_FALSE(settings.IsApp0ReadDisableTimeStretching());
+    EXPECT_FALSE(settings.IsApp0ReadUnlimitedSequentialReadSpeed());
 }
 
 TEST(StorageSchedulerTest, BandwidthIsSerializedAndOverrideable) {
     GeneralSettings settings;
     const nlohmann::json json = settings;
     EXPECT_EQ(json.at("app0_read_bandwidth_mibps"), 0u);
+    EXPECT_FALSE(json.at("app0_read_disable_time_stretching"));
+    EXPECT_FALSE(json.at("app0_read_unlimited_sequential_read_speed"));
 
     const auto overrides = settings.GetOverrideableFields();
     EXPECT_NE(std::ranges::find_if(overrides,
                                    [](const OverrideItem& item) {
                                        return std::string{item.key} == "app0_read_bandwidth_mibps";
+                                   }),
+              overrides.end());
+    EXPECT_NE(std::ranges::find_if(overrides,
+                                   [](const OverrideItem& item) {
+                                       return std::string{item.key} ==
+                                              "app0_read_disable_time_stretching";
+                                   }),
+              overrides.end());
+    EXPECT_NE(std::ranges::find_if(overrides,
+                                   [](const OverrideItem& item) {
+                                       return std::string{item.key} ==
+                                              "app0_read_unlimited_sequential_read_speed";
                                    }),
               overrides.end());
 }

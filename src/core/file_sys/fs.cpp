@@ -305,7 +305,7 @@ std::shared_ptr<File> HandleTable::TakeHandle(int d) {
     return std::move(m_files[d]);
 }
 
-std::shared_ptr<File> HandleTable::GetFileLease(int d) {
+std::shared_ptr<File> HandleTable::GetFileShared(int d) {
     std::scoped_lock lock{m_mutex};
     if (d < 0 || d >= m_files.size()) {
         return {};

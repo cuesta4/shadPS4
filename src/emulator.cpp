@@ -293,8 +293,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
-    Core::FileSys::GetApp0StorageScheduler().Configure(
-        EmulatorSettings.GetApp0ReadBandwidthMiBps());
+    const auto storage_config = Core::FileSys::GetApp0StorageScheduler().Configure({
+        .bandwidth_mibps = EmulatorSettings.GetApp0ReadBandwidthMiBps(),
+        .disable_time_stretching = EmulatorSettings.IsApp0ReadDisableTimeStretching(),
+        .unlimited_sequential_read_speed =
+            EmulatorSettings.IsApp0ReadUnlimitedSequentialReadSpeed(),
+    });
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
@@ -338,8 +342,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
     LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
-    LOG_INFO(Config, "Storage app0ReadBandwidthMiBps: {}",
-             Core::FileSys::GetApp0StorageScheduler().GetBandwidthMiBps());
+    LOG_INFO(Config, "Storage app0ReadBandwidthMiBps: {}", storage_config.bandwidth_mibps);
+    LOG_INFO(Config, "Storage app0ReadDisableTimeStretching: {}",
+             storage_config.disable_time_stretching);
+    LOG_INFO(Config, "Storage app0ReadUnlimitedSequentialReadSpeed: {}",
+             storage_config.unlimited_sequential_read_speed);
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
     LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
 #ifdef _WIN32

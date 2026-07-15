@@ -131,9 +131,9 @@ public:
     int CreateHandle();
     void DeleteHandle(int d);
     std::shared_ptr<File> TakeHandle(int d);
-    std::shared_ptr<File> GetFileLease(int d);
+    std::shared_ptr<File> GetFileShared(int d);
     // Returns a raw pointer without extending the file's lifetime: a caller racing close()
-    // can observe a dangling pointer. New call sites should prefer GetFileLease; existing
+    // can observe a dangling pointer. New call sites should prefer GetFileShared; existing
     // ones still need to be migrated.
     File* GetFile(int d);
     File* GetSocket(int d);

@@ -87,10 +87,8 @@ struct StorageScheduler::Impl {
 
     using Queue = std::list<std::shared_ptr<Pending>>;
 
-    Impl() = default;
-
     void EnsureWorkersStarted() {
-        if (workers_started) {
+        if (worker.joinable()) {
             return;
         }
         for (size_t index = 0; index < StagingBufferCount; ++index) {
@@ -102,7 +100,6 @@ struct StorageScheduler::Impl {
                 std::jthread{[this](std::stop_token stop_token) { RunHostWorker(stop_token); }};
         }
         worker = std::jthread{[this](std::stop_token stop_token) { Run(stop_token); }};
-        workers_started = true;
     }
 
     ~Impl() {
@@ -113,17 +110,6 @@ struct StorageScheduler::Impl {
         timer.Notify();
         cv.notify_all();
         host_cv.notify_all();
-        // Join before member destruction begins: the workers touch queues, continuations
-        // and stats until they exit, and those members are destroyed before the jthreads
-        // would join themselves.
-        if (worker.joinable()) {
-            worker.join();
-        }
-        for (auto& host_worker : host_workers) {
-            if (host_worker.joinable()) {
-                host_worker.join();
-            }
-        }
     }
 
     void SetBucket(u8 index) {
@@ -277,11 +263,6 @@ struct StorageScheduler::Impl {
         }
     }
 
-    size_t ReadHost(const std::shared_ptr<Pending>& pending, u64 offset, std::span<u8> buffer) {
-        const s64 read = pending->file->PRead(buffer.data(), buffer.size(), offset);
-        return read > 0 ? static_cast<size_t>(read) : 0;
-    }
-
     void RunHostWorker(std::stop_token stop_token) {
         Common::SetCurrentThreadName("shadPS4:HddHost");
         while (!stop_token.stop_requested()) {
@@ -310,9 +291,10 @@ struct StorageScheduler::Impl {
             }
 
             auto& buffer = staging_buffers[task.pending->staging_index];
-            const size_t read = ReadHost(
-                task.pending, task.pending->staged_offset,
-                std::span<u8>{buffer.data(), static_cast<size_t>(task.pending->staged_size)});
+            const s64 result = task.pending->file->PRead(
+                buffer.data(), static_cast<size_t>(task.pending->staged_size),
+                task.pending->staged_offset);
+            const size_t read = result > 0 ? static_cast<size_t>(result) : 0;
 
             {
                 std::scoped_lock lock{mutex};
@@ -387,17 +369,21 @@ struct StorageScheduler::Impl {
 
             const u64 chunk_offset = pending->offset + pending->processed;
             const u64 chunk_size = std::min(MaxChunkSize, pending->requested - pending->processed);
-            const StorageTimingModel timing{bandwidth_mibps.load(std::memory_order_relaxed)};
+            const auto current_config = config.load(std::memory_order_acquire);
+            const StorageTimingModel timing{current_config};
             const auto transfer = timing.TransferDuration(chunk_size);
-            const s64 slowdown = static_cast<s64>(slowdown_percent.load(std::memory_order_relaxed));
+            const u32 slowdown = current_config.disable_time_stretching
+                                     ? 100
+                                     : slowdown_percent.load(std::memory_order_relaxed);
+            const auto credit_lifetime = timing.TransferDuration(MaxChunkSize);
 
             bool sequential{};
             Nanoseconds applied_credit{};
             {
                 std::scoped_lock lock{mutex};
                 sequential = head_file == pending->file.get() && head_offset == chunk_offset;
-                if (sequential &&
-                    Clock::now() - credit_timestamp <= timing.TransferDuration(MaxChunkSize)) {
+                if (sequential && !current_config.unlimited_sequential_read_speed &&
+                    Clock::now() - credit_timestamp <= credit_lifetime) {
                     applied_credit = std::min(timer_credit, transfer);
                     timer_credit -= applied_credit;
                 } else {
@@ -407,7 +393,7 @@ struct StorageScheduler::Impl {
 
             const auto service_start = Clock::now();
             const auto modeled_duration =
-                timing.ServiceDuration(chunk_size, sequential) * slowdown / 100 - applied_credit;
+                timing.ServiceDuration(chunk_size, sequential, slowdown) - applied_credit;
             const auto deadline = service_start + modeled_duration;
 
             size_t staging_index{};
@@ -451,7 +437,10 @@ struct StorageScheduler::Impl {
 
             const auto completed_at = Clock::now();
             Nanoseconds oversleep{};
-            if (completed_at > deadline) {
+            // Only compensate timer imprecision. Host latency and positioning time must not
+            // make the next sequential transfer artificially faster.
+            if (sequential && !current_config.unlimited_sequential_read_speed &&
+                host_ready <= deadline && completed_at > deadline) {
                 oversleep = std::chrono::duration_cast<Nanoseconds>(completed_at - deadline);
             }
             const Nanoseconds host_overrun =
@@ -474,8 +463,7 @@ struct StorageScheduler::Impl {
                 head_file = pending->file.get();
                 head_offset = chunk_offset + read;
                 if (oversleep != Nanoseconds::zero()) {
-                    const auto credit_limit = timing.TransferDuration(MaxChunkSize);
-                    timer_credit = std::min(timer_credit + oversleep, credit_limit);
+                    timer_credit = std::min(timer_credit + oversleep, credit_lifetime);
                     credit_timestamp = completed_at;
                     stats.timer_oversleep_ns += oversleep.count();
                 }
@@ -578,7 +566,7 @@ struct StorageScheduler::Impl {
 
     static constexpr auto StatsWindowPeriod = std::chrono::seconds{5};
 
-    std::atomic<u32> bandwidth_mibps{};
+    std::atomic<StorageSchedulerConfig> config{};
     std::atomic<u32> slowdown_percent{100};
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -587,14 +575,11 @@ struct StorageScheduler::Impl {
     std::array<std::vector<u8>, StagingBufferCount> staging_buffers;
     std::vector<size_t> free_staging;
     std::deque<HostTask> host_tasks;
-    std::array<std::jthread, HostWorkerCount> host_workers;
-    std::jthread worker;
     std::array<Queue, 256> queues;
     std::array<u64, 4> active_buckets{};
     std::unordered_map<ContinuationKey, std::weak_ptr<Pending>, ContinuationKeyHash> continuations;
     u64 queue_depth{};
     u64 host_sequence{};
-    bool workers_started{};
     const File* head_file{};
     u64 head_offset{};
     Nanoseconds timer_credit{};
@@ -604,22 +589,25 @@ struct StorageScheduler::Impl {
     StorageSchedulerStats stats_window_base{};
     Clock::time_point last_flip_time{};
     Nanoseconds flip_period_ema{};
+    // Declared last so their implicit joins happen before the state they access is destroyed.
+    std::array<std::jthread, HostWorkerCount> host_workers;
+    std::jthread worker;
 };
 
 StorageScheduler::StorageScheduler() : impl{std::make_unique<Impl>()} {}
 
 StorageScheduler::~StorageScheduler() = default;
 
-void StorageScheduler::Configure(u32 bandwidth_mibps) {
-    const u32 normalized_bandwidth = NormalizeReadBandwidth(bandwidth_mibps);
-    if (normalized_bandwidth != bandwidth_mibps) {
+StorageSchedulerConfig StorageScheduler::Configure(StorageSchedulerConfig config) {
+    const u32 requested_bandwidth = config.bandwidth_mibps;
+    config.bandwidth_mibps = NormalizeReadBandwidth(requested_bandwidth);
+    if (config.bandwidth_mibps != requested_bandwidth) {
         LOG_WARNING(Config, "App0 HDD bandwidth {} MiB/s normalized to {} MiB/s",
-                    bandwidth_mibps, normalized_bandwidth);
+                    requested_bandwidth, config.bandwidth_mibps);
     }
-    bandwidth_mibps = normalized_bandwidth;
-    impl->bandwidth_mibps.store(bandwidth_mibps, std::memory_order_release);
+    impl->config.store(config, std::memory_order_release);
     std::scoped_lock lock{impl->mutex};
-    if (bandwidth_mibps != 0) {
+    if (config.IsEnabled()) {
         impl->EnsureWorkersStarted();
     }
     impl->head_file = nullptr;
@@ -630,14 +618,11 @@ void StorageScheduler::Configure(u32 bandwidth_mibps) {
     impl->slowdown_percent.store(100, std::memory_order_relaxed);
     impl->last_flip_time = {};
     impl->flip_period_ema = Nanoseconds::zero();
+    return config;
 }
 
 bool StorageScheduler::IsEnabled() const {
-    return impl->bandwidth_mibps.load(std::memory_order_acquire) != 0;
-}
-
-u32 StorageScheduler::GetBandwidthMiBps() const {
-    return impl->bandwidth_mibps.load(std::memory_order_acquire);
+    return impl->config.load(std::memory_order_acquire).IsEnabled();
 }
 
 StorageRequestHandle StorageScheduler::SubmitRead(std::shared_ptr<File> file,
