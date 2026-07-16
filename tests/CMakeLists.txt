@@ -139,7 +139,9 @@ add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 add_executable(shadps4_video_core_test ${VIDEO_CORE_TEST_SOURCES})
 add_executable(shadps4_cache_storage_test
     ${CMAKE_SOURCE_DIR}/src/video_core/cache_archive.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/host_shader_cache.cpp
     test_cache_archive.cpp
+    test_host_shader_cache.cpp
     test_cache_task_queue.cpp
 )
 

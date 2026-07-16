@@ -303,7 +303,9 @@ void PipelineCache::WarmUp() {
     database.Open();
 
     const auto save_profile = [&] {
-        database.FinishPreload();
+        if (!database.FinishPreload()) {
+            return;
+        }
 
         std::vector<u8> data(sizeof(profile));
         std::memcpy(data.data(), &profile, sizeof(profile));

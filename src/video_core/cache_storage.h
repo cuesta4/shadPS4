@@ -34,7 +34,7 @@ public:
     [[nodiscard]] bool IsOpened() const {
         return opened.load(std::memory_order_acquire);
     }
-    void FinishPreload();
+    bool FinishPreload();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

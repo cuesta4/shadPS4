@@ -79,7 +79,7 @@ bool ArchiveEntriesAreUnique() {
 
 namespace Storage {
 
-constexpr std::string GetBlobFileExtension(BlobType type) {
+constexpr std::string_view GetBlobFileExtension(BlobType type) {
     switch (type) {
     case BlobType::ShaderMeta: {
         return "meta";
@@ -260,29 +260,53 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
 }
 
 template <typename T>
+bool IsValidVectorSize(u64 byte_size, const std::vector<T>& data) {
+    return byte_size % sizeof(T) == 0 && byte_size / sizeof(T) <= data.max_size();
+}
+
+template <typename T>
 void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v, bool archive_mode) {
     using namespace Common::FS;
+    v.clear();
     path.replace_extension(GetBlobFileExtension(type));
     if (archive_mode) {
-        int index{-1};
-        index = mz_zip_reader_locate_file(&zip_ar, path.string().c_str(), nullptr, 0);
+        const int index = mz_zip_reader_locate_file(&zip_ar, path.string().c_str(), nullptr, 0);
         if (index < 0) {
             LOG_WARNING(Render, "File {} is not found in the archive", path.string().c_str());
             return;
         }
         mz_zip_archive_file_stat stat{};
-        mz_zip_reader_file_stat(&zip_ar, index, &stat);
+        if (!mz_zip_reader_file_stat(&zip_ar, index, &stat) ||
+            !IsValidVectorSize(stat.m_uncomp_size, v)) {
+            LOG_WARNING(Render, "Cache entry {} has an invalid size", path.string());
+            return;
+        }
         v.resize(stat.m_uncomp_size / sizeof(T));
-        mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0);
+        if (stat.m_uncomp_size != 0 &&
+            !mz_zip_reader_extract_to_mem(&zip_ar, index, v.data(), stat.m_uncomp_size, 0)) {
+            LOG_WARNING(Render, "Failed to extract cache entry {}", path.string());
+            v.clear();
+        }
     } else {
         const auto file = IOFile{path, FileAccessMode::Read};
-        v.resize(file.GetSize() / sizeof(T));
-        file.Read(v);
+        if (!file.IsOpen()) {
+            return;
+        }
+        const auto file_size = file.GetSize();
+        if (!IsValidVectorSize(file_size, v)) {
+            LOG_WARNING(Render, "Cache entry {} has an invalid size", path.string());
+            return;
+        }
+        v.resize(file_size / sizeof(T));
+        if (file.Read(v) != v.size()) {
+            LOG_WARNING(Render, "Failed to read cache entry {}", path.string());
+            v.clear();
+        }
     }
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data) {
-    if (!IsOpened()) {
+    if (!IsOpened() || (archive_mode && !ar_is_writer)) {
         return false;
     }
 
@@ -291,7 +315,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data) {
-    if (!IsOpened()) {
+    if (!IsOpened() || (archive_mode && !ar_is_writer)) {
         return false;
     }
 
@@ -318,48 +342,73 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
 }
 
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
-    const auto& ext = GetBlobFileExtension(type);
+    if (!IsOpened()) {
+        return;
+    }
+
+    const auto extension = "." + std::string{GetBlobFileExtension(type)};
     if (archive_mode) {
         const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
         for (int index = 0; index < num_files; ++index) {
             std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
-            file_name.fill(0);
-            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
-            if (std::string{file_name.data()}.ends_with(ext)) {
+            if (!mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size())) {
+                continue;
+            }
+            if (std::string_view{file_name.data()}.ends_with(extension)) {
                 mz_zip_archive_file_stat stat{};
-                mz_zip_reader_file_stat(&zip_ar, index, &stat);
-                std::vector<u8> data(stat.m_uncomp_size);
-                mz_zip_reader_extract_to_mem(&zip_ar, index, data.data(), data.size(), 0);
+                std::vector<u8> data;
+                if (!mz_zip_reader_file_stat(&zip_ar, index, &stat) || stat.m_uncomp_size == 0 ||
+                    !IsValidVectorSize(stat.m_uncomp_size, data)) {
+                    LOG_WARNING(Render, "Skipping invalid cache entry {}", file_name.data());
+                    continue;
+                }
+                data.resize(stat.m_uncomp_size);
+                if (!mz_zip_reader_extract_to_mem(&zip_ar, index, data.data(), data.size(), 0)) {
+                    LOG_WARNING(Render, "Failed to extract cache entry {}", file_name.data());
+                    continue;
+                }
                 func(std::move(data));
             }
         }
     } else {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
-            if (file_name.path().extension().string().ends_with(ext)) {
+            if (file_name.path().extension() == extension) {
                 using namespace Common::FS;
                 const auto& file = IOFile{file_name, FileAccessMode::Read};
                 if (file.IsOpen()) {
-                    std::vector<u8> data(file.GetSize());
-                    file.Read(data);
-                    func(std::move(data));
+                    std::vector<u8> data;
+                    const auto file_size = file.GetSize();
+                    if (file_size == 0 || !IsValidVectorSize(file_size, data)) {
+                        LOG_WARNING(Render, "Skipping invalid cache entry {}",
+                                    file_name.path().string());
+                        continue;
+                    }
+                    data.resize(file_size);
+                    if (file.Read(data) == data.size()) {
+                        func(std::move(data));
+                    } else {
+                        LOG_WARNING(Render, "Skipping invalid cache entry {}",
+                                    file_name.path().string());
+                    }
                 }
             }
         }
     }
 }
 
-void DataBase::FinishPreload() {
+bool DataBase::FinishPreload() {
     if (!IsOpened()) {
-        return;
+        return false;
     }
     if (archive_mode && !ar_is_writer) {
         if (!mz_zip_writer_init_from_reader(&zip_ar, archive_work_path.string().c_str())) {
             LOG_ERROR(Render, "Failed to make pipeline cache writable: {}",
                       archive_work_path.string());
-            return;
+            return false;
         }
         ar_is_writer = true;
     }
+    return true;
 }
 
 } // namespace Storage
