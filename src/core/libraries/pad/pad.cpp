@@ -138,10 +138,7 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
-    bool connected = false;
-    int connected_count = 0;
-    Input::State state{};
-    it->second->ReadState(&state, &connected, &connected_count);
+    const Input::State state = it->second->ReadState();
 
     std::memset(pInfo, 0, sizeof(OrbisPadControllerInformation));
     pInfo->touchPadInfo.pixelDensity = 1;
@@ -150,10 +147,10 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     pInfo->stickInfo.deadZoneLeft = 1;
     pInfo->stickInfo.deadZoneRight = 1;
     pInfo->connectionType = ORBIS_PAD_CONNECTION_TYPE_LOCAL;
-    pInfo->connectedCount = static_cast<u8>(std::clamp(connected_count, 0, 0xff));
+    pInfo->connectedCount = state.connected_count;
     pInfo->deviceClass = OrbisPadDeviceClass::Standard;
-    pInfo->connected = connected;
-    if (connected) {
+    pInfo->connected = state.connected;
+    if (state.connected) {
         pInfo->deviceClass = EmulatorSettings.IsUsingSpecialPad()
                                  ? (OrbisPadDeviceClass)EmulatorSettings.GetSpecialPadClass()
                                  : OrbisPadDeviceClass::Standard;
@@ -368,7 +365,7 @@ int PS4_SYSV_ABI scePadOutputReport() {
     return ORBIS_OK;
 }
 
-int ProcessStates(OrbisPadData* pData, Input::State* states, s32 num) {
+int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
     const bool gamepad_input_intercepted = ImGui::Core::IsGamepadInputCaptured();
     for (int i = 0; i < num; i++) {
         pData[i] = {};

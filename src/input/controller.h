@@ -7,7 +7,6 @@
 #include <mutex>
 #include <optional>
 #include <utility>
-#include <vector>
 
 #include <SDL3/SDL_gamepad.h>
 #include "SDL3/SDL_joystick.h"
@@ -16,12 +15,11 @@
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
 
-struct SDL_Gamepad;
-
 namespace Input {
 
-enum class ControllerType {
-    Standard,
+enum class StatePublication {
+    Suppress,
+    Publish,
 };
 
 enum class Axis {
@@ -74,13 +72,13 @@ public:
     Libraries::Pad::OrbisPadButtonDataOffset buttonsState{};
     u64 time = 0;
     AxisArray<s32> axes{axis_defaults};
-    TouchpadEntry touchpad[2] = {{false, 0, 0}, {false, 0, 0}};
+    TouchpadEntry touchpad[2]{};
     Libraries::Pad::OrbisFVector3 acceleration = {0.0f, -9.81f, 0.0f};
     Libraries::Pad::OrbisFVector3 angularVelocity = {0.0f, 0.0f, 0.0f};
     Libraries::Pad::OrbisFQuaternion orientation = {0.0f, 0.0f, 0.0f, 1.0f};
     u64 touch_time_since_held_down{};
-    bool connected{true};
-    u8 connected_count{1};
+    bool connected{};
+    u8 connected_count{};
 };
 
 inline int GetAxis(int min, int max, int value) {
@@ -92,12 +90,13 @@ class GameController {
     friend class GameControllers;
 
 public:
-    explicit GameController(bool initially_connected = true);
+    GameController();
     virtual ~GameController() = default;
-    void ConnectController(SDL_Gamepad* pad, bool publish_state = true);
+    void ConnectController(SDL_Gamepad* pad,
+                           StatePublication publication = StatePublication::Publish);
     void DisconnectController();
 
-    void ReadState(State* state, bool* isConnected, int* connectedCount);
+    State ReadState();
     int ReadStates(State* states, int states_num);
 
     void Button(Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
@@ -140,7 +139,7 @@ class GameControllers {
 public:
     GameControllers()
         : controllers({new GameController(), new GameController(), new GameController(),
-                       new GameController(), new GameController(false)}) {};
+                       new GameController(), new GameController()}) {};
     virtual ~GameControllers() = default;
     GameController* operator[](const size_t& i) const {
         if (i > 4) {
@@ -148,7 +147,7 @@ public:
         }
         return controllers[i];
     }
-    void TryOpenSDLControllers(bool publish_connection_state = true);
+    void TryOpenSDLControllers(StatePublication publication = StatePublication::Publish);
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);
