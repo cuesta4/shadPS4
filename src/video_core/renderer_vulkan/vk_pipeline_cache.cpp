@@ -319,7 +319,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    // Finalize the per-title cache while its asynchronous writer and archive are still alive.
+    // Without this, archived caches remain open until process teardown and newly discovered
+    // shaders/pipelines never make it into the ZIP used by the next run.
+    Sync();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!high_draw_call_optimization) {

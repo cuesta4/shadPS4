@@ -315,9 +315,17 @@ void PipelineCache::WarmUp() {
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {
         LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
+                    "Pipeline cache profile has unexpected size ({} != {}). Rebuilding the cache",
                     profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
+        if (!Storage::DataBase::Instance().Reset()) {
+            return;
+        }
+        Storage::DataBase::Instance().FinishPreload();
+
+        profile_data.resize(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
         return;
     }
 
@@ -325,8 +333,16 @@ void PipelineCache::WarmUp() {
     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
     if (cached_profile != profile) {
         LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+                    "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+        if (!Storage::DataBase::Instance().Reset()) {
+            return;
+        }
+        Storage::DataBase::Instance().FinishPreload();
+
+        profile_data.resize(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
         return;
     }
 
