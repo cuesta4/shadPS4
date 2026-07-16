@@ -10,14 +10,13 @@
 #include "video_core/cache_archive.h"
 #include "video_core/cache_storage.h"
 #include "video_core/cache_task_queue.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 #include <miniz.h>
 
+#include <array>
 #include <functional>
 #include <future>
-#include <mutex>
+#include <string>
 #include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
@@ -30,10 +29,6 @@ Storage::Detail::CacheTaskQueue request_queue{};
 mz_zip_archive zip_ar{};
 bool ar_is_writer{};
 bool archive_dirty{};
-
-} // namespace
-
-namespace Storage {
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
@@ -79,6 +74,10 @@ bool ArchiveEntriesAreUnique() {
     }
     return true;
 }
+
+} // namespace
+
+namespace Storage {
 
 constexpr std::string GetBlobFileExtension(BlobType type) {
     switch (type) {
@@ -205,7 +204,6 @@ void DataBase::Close() {
         std::filesystem::remove(archive_work_path, ec);
     }
 
-    opened = false;
     LOG_INFO(Render, "Cache dumped");
 }
 
@@ -284,7 +282,7 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v, b
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data) {
-    if (!opened) {
+    if (!IsOpened()) {
         return false;
     }
 
@@ -293,7 +291,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data) {
-    if (!opened) {
+    if (!IsOpened()) {
         return false;
     }
 
@@ -302,7 +300,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& data) {
-    if (!opened) {
+    if (!IsOpened()) {
         return;
     }
 
@@ -311,7 +309,7 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& data) {
-    if (!opened) {
+    if (!IsOpened()) {
         return;
     }
 

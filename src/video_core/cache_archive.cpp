@@ -39,6 +39,7 @@ bool CompactArchive(const std::filesystem::path& source, const std::filesystem::
     mz_zip_archive writer{};
     if (!mz_zip_writer_init_file(&writer, destination.string().c_str(), 0)) {
         mz_zip_reader_end(&reader);
+        std::filesystem::remove(destination, ec);
         return false;
     }
 

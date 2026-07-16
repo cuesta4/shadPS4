@@ -3,7 +3,9 @@
 
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -20,10 +22,13 @@ using ArchiveEntry = std::pair<std::string_view, std::string_view>;
 class ArchivePaths {
 public:
     ArchivePaths() {
-        const auto test_directory = std::filesystem::path{testing::TempDir()};
-        source = test_directory / "shadps4_cache_source.zip";
-        compacted = test_directory / "shadps4_cache_compacted.zip";
+        const auto* test_info = testing::UnitTest::GetInstance()->current_test_info();
+        const auto test_name = std::string{test_info->test_suite_name()} + "_" + test_info->name();
+        directory = std::filesystem::path{testing::TempDir()} / test_name;
         Cleanup();
+        std::filesystem::create_directories(directory);
+        source = directory / "source.zip";
+        compacted = directory / "compacted.zip";
     }
 
     ~ArchivePaths() {
@@ -32,10 +37,10 @@ public:
 
     void Cleanup() const {
         std::error_code ec;
-        std::filesystem::remove(source, ec);
-        std::filesystem::remove(compacted, ec);
+        std::filesystem::remove_all(directory, ec);
     }
 
+    std::filesystem::path directory;
     std::filesystem::path source;
     std::filesystem::path compacted;
 };
@@ -121,6 +126,29 @@ TEST(CacheArchive, CompactionUpdatesAnEntryAcrossRuns) {
     const auto contents = ReadEntry(reader, "shader.meta");
     EXPECT_EQ(std::string_view(contents.data(), contents.size()), updated_contents);
     mz_zip_reader_end(&reader);
+}
+
+TEST(CacheArchive, CompactionRemovesStaleDestinationWhenSourceIsMissing) {
+    ArchivePaths paths;
+    constexpr std::string_view stale_contents{"stale compacted archive"};
+    {
+        std::ofstream destination{paths.compacted, std::ios::binary};
+        ASSERT_TRUE(destination.is_open());
+        destination.write(stale_contents.data(), stale_contents.size());
+    }
+
+    ASSERT_FALSE(Storage::Detail::CompactArchive(paths.source, paths.compacted));
+    EXPECT_FALSE(std::filesystem::exists(paths.compacted));
+}
+
+TEST(CacheArchive, CompactionCleansUpAfterWriterInitializationFailure) {
+    ArchivePaths paths;
+    constexpr std::array entries{ArchiveEntry{"shader.spv", "shader"}};
+    ASSERT_TRUE(CreateArchive(paths.source, entries));
+    paths.compacted = paths.directory / "missing" / "compacted.zip";
+
+    ASSERT_FALSE(Storage::Detail::CompactArchive(paths.source, paths.compacted));
+    EXPECT_FALSE(std::filesystem::exists(paths.compacted));
 }
 
 } // namespace
