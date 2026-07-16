@@ -10,7 +10,8 @@ include(FetchContent)
 FetchContent_MakeAvailable(googletest)
 
 set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test shadps4_video_core_test
-                 shadps4_cache_storage_test shadps4_input_test)
+                 shadps4_cache_storage_test shadps4_input_test
+                 shadps4_presentation_queue_test)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -156,6 +157,7 @@ add_executable(shadps4_cache_storage_test
     test_cache_task_queue.cpp
 )
 add_executable(shadps4_input_test ${INPUT_TEST_SOURCES})
+add_executable(shadps4_presentation_queue_test test_presentation_queue.cpp)
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -198,6 +200,7 @@ target_link_libraries(shadps4_input_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
 )
+target_link_libraries(shadps4_presentation_queue_test PRIVATE GTest::gtest_main)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
