@@ -90,6 +90,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     if (isSpecific) {
         readbacksModeSetting = EmulatorSettings.GetReadbacksMode();
         readbackLinearImagesSetting = EmulatorSettings.IsReadbackLinearImagesEnabled();
+        gpuSyncFastPathsSetting = EmulatorSettings.IsGpuSyncFastPathsEnabled();
         directMemoryAccessSetting = EmulatorSettings.IsDirectMemoryAccessEnabled();
         devkitConsoleSetting = EmulatorSettings.IsDevKit();
         neoModeSetting = EmulatorSettings.IsNeo();
@@ -151,6 +152,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     if (isSpecific) {
         EmulatorSettings.SetReadbacksMode(readbacksModeSetting, true);
         EmulatorSettings.SetReadbackLinearImagesEnabled(readbackLinearImagesSetting, true);
+        EmulatorSettings.SetGpuSyncFastPathsEnabled(gpuSyncFastPathsSetting, true);
         EmulatorSettings.SetDirectMemoryAccessEnabled(directMemoryAccessSetting, true);
         EmulatorSettings.SetDevKit(devkitConsoleSetting, true);
         EmulatorSettings.SetNeo(neoModeSetting, true);
@@ -782,6 +784,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
+            AddSettingCheckbox(
+                "Enable GPU Sync Fast Paths (Requires Linear Readbacks; Restart Required)",
+                gpuSyncFastPathsSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
             AddSettingCheckbox("Enable High Draw-Call Fast Path (Restart Required)",
                                highDrawCallOptimizationSetting);

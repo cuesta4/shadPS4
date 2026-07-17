@@ -88,14 +88,21 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// Materializes GPU-written linear images before a CPU read consumes their RAM backing.
+    bool ReadMemory(VAddr addr, size_t size);
+
+    /// Materializes GPU-written linear images before BufferCache consumes their RAM backing.
+    bool MaterializeForBufferAccess(VAddr addr, size_t size);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
-    /// Schedules a copy of pending images for download back to CPU memory.
-    void ProcessDownloadImages();
+    /// Schedules pending images for download back to CPU memory.
+    /// Returns true when at least one image copy was recorded.
+    bool ProcessDownloadImages();
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -269,6 +276,15 @@ public:
     }
 
 private:
+    struct PendingImageDownload {
+        ImageId image_id;
+        VAddr guest_address;
+        u8* data;
+        u64 offset;
+        u32 size;
+    };
+    using PendingImageDownloads = boost::container::small_vector<PendingImageDownload, 8>;
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
@@ -285,8 +301,20 @@ private:
         }
     }
 
+    /// Records an image copy into the download buffer.
+    bool ScheduleImageDownload(ImageId image_id, PendingImageDownloads& downloads);
+
+    /// Publishes completed image copies to CPU-visible guest memory.
+    void QueueImageDownloads(PendingImageDownloads&& downloads);
+
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    bool DownloadImageMemory(ImageId image_id, bool sync = false);
+
+    /// Publishes one completed image copy and releases its CPU read watch.
+    void CommitImageDownload(const PendingImageDownload& download);
+
+    bool TrackCpuReadback(ImageId image_id);
+    void UntrackCpuReadback(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -325,6 +353,7 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        UntrackCpuReadback(image_id);
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -382,6 +411,7 @@ private:
     tsl::robin_map<VAddr, AliasState> alias_states;
     boost::container::small_vector<VAddr, 4> pending_alias_downloads;
     u64 alias_generation{};
+    tsl::robin_map<VAddr, u32> cpu_readback_page_refs;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
@@ -394,8 +424,11 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
+    bool gpu_sync_fast_paths;
     PageTable page_table;
-    std::mutex mutex;
+    // A protected CPU access may re-enter the cache from the GPU command processor while a
+    // cache operation is already in progress on that same thread.
+    std::recursive_mutex mutex;
     std::mutex samplers_mutex;
     struct MetaDataInfo {
         enum class Type {

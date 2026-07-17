@@ -9,6 +9,13 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
+# GoogleTest 1.17 triggers Clang 22's new character-conversion warning in its
+# own headers. The project promotes warnings to errors, so keep the suppression
+# scoped to the third-party target instead of weakening shadPS4's diagnostics.
+if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(gtest PRIVATE /clang:-Wno-character-conversion)
+endif()
+
 set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test shadps4_video_core_test
                  shadps4_cache_storage_test shadps4_input_test
                  shadps4_presentation_queue_test)
@@ -133,6 +140,8 @@ set(GCN_TEST_SOURCES
 
 set(VIDEO_CORE_TEST_SOURCES
     test_depth_stencil_state.cpp
+    test_buffer_access.cpp
+    test_pm4_sync.cpp
 )
 
 set(INPUT_TEST_SOURCES
@@ -191,8 +200,10 @@ target_link_libraries(shadps4_gcn_test PRIVATE
 )
 target_link_libraries(shadps4_video_core_test PRIVATE
     GTest::gtest_main
+    Boost::headers
     fmt::fmt
     spdlog::spdlog
+    Vulkan::Headers
 )
 target_link_libraries(shadps4_cache_storage_test PRIVATE GTest::gtest_main miniz::miniz)
 target_link_libraries(shadps4_input_test PRIVATE

@@ -9,6 +9,7 @@
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -29,6 +30,12 @@ namespace Vulkan {
 class Scheduler;
 class RenderState;
 class GraphicsPipeline;
+
+enum class GuestSyncDomain : u8 {
+    ComputeShader,
+    PixelShader,
+    EndOfPipe,
+};
 
 class Rasterizer {
 public:
@@ -66,7 +73,8 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
-    void ProcessDownloadImages();
+    bool ProcessDownloadImages();
+    void InsertGuestSyncBarrier(GuestSyncDomain domain);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -74,6 +82,8 @@ public:
     void CpSync();
     u64 Flush();
     void Finish();
+    u64 FlushGuestCompletionPoint();
+    void DeferGuestCompletion(u64 tick, Common::UniqueFunction<void>&& callback);
     void OnSubmit();
 
     PipelineCache& GetPipelineCache() {

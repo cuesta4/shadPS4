@@ -14,6 +14,8 @@ namespace Vulkan {
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance},
       high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()},
+      gpu_sync_fast_paths{EmulatorSettings.IsGpuSyncFastPathsEnabled() &&
+                          EmulatorSettings.IsReadbackLinearImagesEnabled()},
       master_semaphore{instance}, command_pool{instance, &master_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
@@ -187,6 +189,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (gpu_sync_fast_paths) {
+        submitted_recording_generation = command_recording_generation;
+        last_submitted_tick = signal_value;
+    }
 
     master_semaphore.Refresh();
     AllocateWorkerCommandBuffers();

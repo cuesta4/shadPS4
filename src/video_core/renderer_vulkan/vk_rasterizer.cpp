@@ -1455,6 +1455,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     }
     liverpool->InvalidateGraphicsPipelineRevision();
     buffer_cache.InvalidateMemory(addr, size);
+    texture_cache.ReadMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
@@ -1465,11 +1466,56 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         return false;
     }
     buffer_cache.ReadMemory(addr, size);
+    texture_cache.ReadMemory(addr, size);
     return true;
 }
 
-void Rasterizer::ProcessDownloadImages() {
-    texture_cache.ProcessDownloadImages();
+bool Rasterizer::ProcessDownloadImages() {
+    return texture_cache.ProcessDownloadImages();
+}
+
+void Rasterizer::InsertGuestSyncBarrier(const GuestSyncDomain domain) {
+    scheduler.EndRendering();
+
+    vk::PipelineStageFlags2 src_stage;
+    vk::AccessFlags2 src_access;
+    switch (domain) {
+    case GuestSyncDomain::ComputeShader:
+        src_stage = vk::PipelineStageFlagBits2::eComputeShader;
+        src_access = vk::AccessFlagBits2::eShaderWrite;
+        break;
+    case GuestSyncDomain::PixelShader:
+        src_stage = vk::PipelineStageFlagBits2::eFragmentShader;
+        src_access = vk::AccessFlagBits2::eShaderWrite;
+        break;
+    case GuestSyncDomain::EndOfPipe:
+        src_stage = vk::PipelineStageFlagBits2::eAllCommands;
+        src_access = vk::AccessFlagBits2::eMemoryWrite;
+        break;
+    }
+
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+}
+
+u64 Rasterizer::FlushGuestCompletionPoint() {
+    if (scheduler.HasUnsubmittedGpuWork()) {
+        return Flush();
+    }
+    return scheduler.LastSubmittedTick();
+}
+
+void Rasterizer::DeferGuestCompletion(const u64 tick,
+                                      Common::UniqueFunction<void>&& callback) {
+    scheduler.DeferPriorityOperationAt(tick, std::move(callback));
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {

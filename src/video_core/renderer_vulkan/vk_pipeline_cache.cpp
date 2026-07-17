@@ -319,7 +319,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    // Drain cache writes and publish the staged archive before its backing storage is torn down.
+    Sync();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!high_draw_call_optimization) {

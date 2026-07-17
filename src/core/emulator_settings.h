@@ -398,6 +398,9 @@ struct GPUSettings {
     Setting<bool> copy_gpu_buffers{false};
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
+    // Apply before launching a title. The fast paths replace only recognized immediate GPU
+    // signal-to-wait pairs and remain disabled by default for compatibility.
+    Setting<bool> gpu_sync_fast_paths_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
     // Apply before launching a title. Changing this option while a game is running requires a
     // restart so cached graphics state is rebuilt consistently.
@@ -431,6 +434,8 @@ struct GPUSettings {
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
             make_override<GPUSettings>("readback_linear_images_enabled",
                                        &GPUSettings::readback_linear_images_enabled),
+            make_override<GPUSettings>("gpu_sync_fast_paths_enabled",
+                                       &GPUSettings::gpu_sync_fast_paths_enabled),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("high_draw_call_optimization",
@@ -442,10 +447,10 @@ struct GPUSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, high_draw_call_optimization,
-                                   dump_shaders, patch_shaders, vblank_frequency, full_screen,
-                                   full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
-                                   rcas_enabled, rcas_attenuation)
+                                   gpu_sync_fast_paths_enabled, direct_memory_access_enabled,
+                                   high_draw_call_optimization, dump_shaders, patch_shaders,
+                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
+                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -715,6 +720,7 @@ public:
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, GpuSyncFastPathsEnabled, gpu_sync_fast_paths_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL(m_gpu, HighDrawCallOptimization, high_draw_call_optimization)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)

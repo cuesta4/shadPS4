@@ -16,12 +16,20 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/pm4_sync.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
 
 namespace {
+
+void WriteGuestCompletion(void* address, const u64 data, const u32 num_bytes) {
+    auto* memory = Core::Memory::Instance();
+    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+        std::memcpy(address, &data, num_bytes);
+    }
+}
 
 constexpr bool RegisterRangesOverlap(const u32 first, const u32 count, const u32 field_first,
                                      const u32 field_count) {
@@ -148,7 +156,9 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 }
 
 Liverpool::Liverpool()
-    : high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()} {
+    : high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()},
+      gpu_sync_fast_paths{EmulatorSettings.IsGpuSyncFastPathsEnabled() &&
+                          EmulatorSettings.IsReadbackLinearImagesEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -315,6 +325,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
+    const PM4Header* gpu_native_wait_packet{};
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
@@ -789,16 +800,59 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
+                bool gpu_native = false;
+                bool is_compute_done = false;
+                bool is_pixel_done = false;
+                std::span<const u32> next_packet;
+                if (gpu_sync_fast_paths && rasterizer &&
+                    event_eos->command.Value() == PM4CmdEventWriteEos::Command::SignalFence) {
+                    const auto event_type = static_cast<EventType>(event_eos->event_type.Value());
+                    is_compute_done = event_type == EventType::CsDone;
+                    is_pixel_done = event_type == EventType::PsDone;
+                    if (is_compute_done || is_pixel_done) {
+                        next_packet = NextPacket(dcb, count + 1);
+                        gpu_native = WaitMatchesImmediateSignal(
+                            next_packet, reinterpret_cast<VAddr>(event_eos->Address()),
+                            event_eos->DataDWord());
+                    }
+                }
+                if (gpu_native) {
+                    rasterizer->InsertGuestSyncBarrier(
+                        is_compute_done ? Vulkan::GuestSyncDomain::ComputeShader
+                                        : Vulkan::GuestSyncDomain::PixelShader);
+                    gpu_native_wait_packet =
+                        reinterpret_cast<const PM4Header*>(next_packet.data());
+                } else if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
                 InvalidateGraphicsPipelineRevision();
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
+                if (!gpu_native) {
+                    if (gpu_sync_fast_paths &&
+                        event_eos->command.Value() ==
+                            PM4CmdEventWriteEos::Command::SignalFence) {
+                        void* completion_address{};
+                        u64 completion_data{};
+                        u32 completion_bytes{};
+                        event_eos->SignalFence(
+                            [&](void* write_address, const u64 data, const u32 num_bytes) {
+                                completion_address = write_address;
+                                completion_data = data;
+                                completion_bytes = num_bytes;
+                            });
+                        auto completion = [completion_address, completion_data, completion_bytes] {
+                            WriteGuestCompletion(completion_address, completion_data,
+                                                 completion_bytes);
+                        };
+                        if (rasterizer) {
+                            const u64 tick = rasterizer->FlushGuestCompletionPoint();
+                            rasterizer->DeferGuestCompletion(tick, std::move(completion));
+                        } else {
+                            completion();
+                        }
+                    } else {
+                        event_eos->SignalFence(WriteGuestCompletion);
                     }
-                });
+                }
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -811,18 +865,61 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
+                bool gpu_native = false;
+                std::span<const u32> next_packet;
+                if (gpu_sync_fast_paths && rasterizer &&
+                    event_eop->data_sel.Value() == DataSelect::Data32Low &&
+                    event_eop->int_sel.Value() == InterruptSelect::None) {
+                    next_packet = NextPacket(dcb, count + 1);
+                    gpu_native = WaitMatchesImmediateSignal(
+                        next_packet, reinterpret_cast<VAddr>(event_eop->Address<u32>()),
+                        event_eop->DataDWord());
+                }
+                if (gpu_native) {
+                    rasterizer->InsertGuestSyncBarrier(Vulkan::GuestSyncDomain::EndOfPipe);
+                    gpu_native_wait_packet =
+                        reinterpret_cast<const PM4Header*>(next_packet.data());
+                } else if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
                 InvalidateGraphicsPipelineRevision();
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
-                        }
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                if (!gpu_native) {
+                    const bool has_guest_completion =
+                        event_eop->data_sel.Value() != DataSelect::None ||
+                        event_eop->int_sel.Value() != InterruptSelect::None;
+                    const bool asynchronous =
+                        gpu_sync_fast_paths && rasterizer && has_guest_completion;
+                    if (asynchronous) {
+                        void* completion_address{};
+                        u64 completion_data{};
+                        u32 completion_bytes{};
+                        bool signal_irq{};
+                        event_eop->SignalFence(
+                            [&](void* write_address, const u64 data, const u32 num_bytes) {
+                                completion_address = write_address;
+                                completion_data = data;
+                                completion_bytes = num_bytes;
+                            },
+                            [&] { signal_irq = true; });
+                        auto completion = [completion_address, completion_data, completion_bytes,
+                                           signal_irq] {
+                            if (completion_bytes != 0) {
+                                WriteGuestCompletion(completion_address, completion_data,
+                                                     completion_bytes);
+                            }
+                            if (signal_irq) {
+                                Platform::IrqC::Instance()->Signal(
+                                    Platform::InterruptId::GfxEop);
+                            }
+                        };
+                        const u64 tick = rasterizer->FlushGuestCompletionPoint();
+                        rasterizer->DeferGuestCompletion(tick, std::move(completion));
+                    } else {
+                        event_eop->SignalFence(WriteGuestCompletion, [] {
+                            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                        });
+                    }
+                }
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -912,6 +1009,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                if (gpu_native_wait_packet == header) {
+                    gpu_native_wait_packet = nullptr;
+                    break;
+                }
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
@@ -1007,6 +1108,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
+    const PM4Header* gpu_native_wait_packet{};
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -1239,6 +1341,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            if (gpu_native_wait_packet == header) {
+                gpu_native_wait_packet = nullptr;
+                break;
+            }
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
@@ -1247,17 +1353,74 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
+            bool gpu_native = false;
+            std::span<const u32> next_packet;
+            if (gpu_sync_fast_paths && rasterizer &&
+                release_mem->data_sel.Value() == DataSelect::Data32Low &&
+                release_mem->int_sel.Value() == InterruptSelect::None) {
+                const bool packet_is_contiguous =
+                    header == reinterpret_cast<const PM4Header*>(acb.data());
+                next_packet =
+                    packet_is_contiguous ? NextPacket(acb, next_dw_off) : std::span<const u32>{};
+                gpu_native =
+                    WaitMatchesImmediateSignal(next_packet, release_mem->Address<VAddr>(),
+                                               release_mem->DataDWord());
+            }
+            if (gpu_native) {
+                rasterizer->InsertGuestSyncBarrier(Vulkan::GuestSyncDomain::ComputeShader);
+                gpu_native_wait_packet = reinterpret_cast<const PM4Header*>(next_packet.data());
+            } else if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
             InvalidateGraphicsPipelineRevision();
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+            if (!gpu_native) {
+                if (gpu_sync_fast_paths) {
+                    void* completion_address{};
+                    u64 completion_data{};
+                    u32 completion_bytes{};
+                    bool signal_irq{};
+                    release_mem->SignalFence(
+                        [&](void* write_address, const u64 data, const u32 num_bytes) {
+                            completion_address = write_address;
+                            completion_data = data;
+                            completion_bytes = num_bytes;
+                        },
+                        [&] { signal_irq = true; },
+                        [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                            if (rasterizer) {
+                                rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32),
+                                                       false, true);
+                            }
+                        });
+                    auto completion = [completion_address, completion_data, completion_bytes,
+                                       signal_irq, pipe_id = queue.pipe_id] {
+                        if (completion_bytes != 0) {
+                            WriteGuestCompletion(completion_address, completion_data,
+                                                 completion_bytes);
+                        }
+                        if (signal_irq) {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
+                        }
+                    };
+                    if (rasterizer && (completion_bytes != 0 || signal_irq)) {
+                        const u64 tick = rasterizer->FlushGuestCompletionPoint();
+                        rasterizer->DeferGuestCompletion(tick, std::move(completion));
+                    } else if (completion_bytes != 0 || signal_irq) {
+                        completion();
+                    }
+                } else {
+                    release_mem->SignalFence(
+                        [pipe_id = queue.pipe_id] {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
+                        },
+                        [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                            rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                                   true);
+                        });
+                }
+            }
             break;
         }
         case PM4ItOpcode::EventWrite: {

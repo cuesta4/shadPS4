@@ -137,6 +137,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
+        download_buffer.InvalidateCpuCache(offset, total_size_bytes);
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
@@ -576,6 +577,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     ASSERT(device_addr != 0);
+    texture_cache.MaterializeForBufferAccess(device_addr, size);
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {

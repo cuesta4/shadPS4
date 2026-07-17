@@ -157,6 +157,7 @@ private:
     // Experimental tab
     int readbacksModeSetting;
     bool readbackLinearImagesSetting;
+    bool gpuSyncFastPathsSetting;
     bool directMemoryAccessSetting;
     bool devkitConsoleSetting;
     bool neoModeSetting;

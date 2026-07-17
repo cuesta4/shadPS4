@@ -271,6 +271,7 @@ private:
 
     Vulkan::Rasterizer* rasterizer{};
     const bool high_draw_call_optimization;
+    const bool gpu_sync_fast_paths;
     Libraries::VideoOut::VideoOutPort* vo_port{};
     std::atomic<u64> graphics_pipeline_revision{1};
     std::atomic<u64> graphics_pipeline_structural_revision{1};
