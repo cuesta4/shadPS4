@@ -11,14 +11,19 @@ AmdGpu::PM4CmdWaitRegMem MakeMemoryWait(
     const VAddr address, const u32 reference, const u32 mask = 0xFFFFFFFF,
     const AmdGpu::PM4CmdWaitRegMem::Function function =
         AmdGpu::PM4CmdWaitRegMem::Function::Equal) {
-    AmdGpu::PM4CmdWaitRegMem wait{};
-    wait.header = AmdGpu::PM4Type3Header{AmdGpu::PM4ItOpcode::WaitRegMem, 5};
+    AmdGpu::PM4CmdWaitRegMem wait{
+        .header = AmdGpu::PM4Type3Header{AmdGpu::PM4ItOpcode::WaitRegMem, 5},
+        .raw = 0,
+        .poll_addr_lo_raw = 0,
+        .poll_addr_hi = 0,
+        .ref = reference,
+        .mask = mask,
+        .poll_interval = 0,
+    };
     wait.function.Assign(function);
     wait.mem_space.Assign(AmdGpu::PM4CmdWaitRegMem::MemSpace::Memory);
     wait.poll_addr_lo.Assign(static_cast<u32>(address >> 2));
     wait.poll_addr_hi = static_cast<u32>(address >> 32);
-    wait.ref = reference;
-    wait.mask = mask;
     return wait;
 }
 
