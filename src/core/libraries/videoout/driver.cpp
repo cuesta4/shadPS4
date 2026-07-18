@@ -484,7 +484,7 @@ void VideoOutDriver::VblankThread(std::stop_token token) {
 
     // Vblank is an edge, not replayable work. A missed deadline is dropped so a host scheduling
     // stall can never produce a burst of back-to-back guest vblanks.
-    Common::AccurateTimer timer{vblank_period, 0};
+    Common::AccurateTimer timer{vblank_period, 0, Common::MissedTickPolicy::SkipMissed};
     u64 feedback_generation{};
     std::vector<Kernel::OrbisKernelEqueue> vblank_events;
 

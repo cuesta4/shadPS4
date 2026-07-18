@@ -323,8 +323,10 @@ void SetThreadName(void* thread, const char* name) {
 #endif
 
 AccurateTimer::AccurateTimer(const std::chrono::nanoseconds target_interval,
-                             const u32 max_catch_up_intervals)
-    : target_interval{target_interval}, max_timing_debt{target_interval * max_catch_up_intervals} {}
+                             const u32 max_catch_up_intervals,
+                             const MissedTickPolicy missed_tick_policy)
+    : target_interval{target_interval}, max_timing_debt{target_interval * max_catch_up_intervals},
+      missed_tick_policy{missed_tick_policy} {}
 
 void AccurateTimer::Start() {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
@@ -340,11 +342,15 @@ void AccurateTimer::End() {
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
 
-    total_wait = std::clamp(total_wait, -max_timing_debt, target_interval);
+    total_wait = Detail::NormalizePeriodicWait(total_wait, target_interval, max_timing_debt,
+                                               missed_tick_policy);
 }
 
 void AccurateTimer::Adjust(const std::chrono::nanoseconds correction) {
-    total_wait = std::clamp(total_wait + correction, -max_timing_debt, target_interval);
+    const auto minimum_wait = missed_tick_policy == MissedTickPolicy::CatchUp
+                                  ? -max_timing_debt
+                                  : std::chrono::nanoseconds{1};
+    total_wait = std::clamp(total_wait + correction, minimum_wait, target_interval);
 }
 
 void AccurateTimer::Reset() {

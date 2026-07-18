@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include "common/thread.h"
 #include "core/libraries/videoout/presentation_queue.h"
 
 namespace Libraries::VideoOut {
@@ -47,6 +48,45 @@ TEST(PresentationQueue, DrainReturnsAllFifoFrames) {
     EXPECT_EQ(drained[0], 4);
     EXPECT_EQ(drained[1], 5);
     EXPECT_TRUE(queue.Empty());
+}
+
+TEST(AccurateTimer, CatchUpPreservesBoundedTimingDebt) {
+    using namespace std::chrono_literals;
+
+    EXPECT_EQ(
+        Common::Detail::NormalizePeriodicWait(-35ms, 10ms, 20ms, Common::MissedTickPolicy::CatchUp),
+        -20ms);
+}
+
+TEST(AccurateTimer, SkipMissedNeverShortensTheRecoveryInterval) {
+    using namespace std::chrono_literals;
+
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(-1ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::SkipMissed),
+              10ms);
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(-21ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::SkipMissed),
+              10ms);
+    EXPECT_EQ(
+        Common::Detail::NormalizePeriodicWait(0ms, 10ms, 0ms, Common::MissedTickPolicy::SkipMissed),
+        10ms);
+}
+
+TEST(AccurateTimer, PreservePhaseDropsMissedMediaTicksWithoutReplayingThem) {
+    using namespace std::chrono_literals;
+
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(-1ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::PreservePhase),
+              9ms);
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(-21ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::PreservePhase),
+              9ms);
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(-20ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::PreservePhase),
+              10ms);
+    EXPECT_EQ(Common::Detail::NormalizePeriodicWait(0ms, 10ms, 0ms,
+                                                    Common::MissedTickPolicy::PreservePhase),
+              10ms);
 }
 
 } // namespace
