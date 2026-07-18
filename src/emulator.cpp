@@ -23,6 +23,7 @@
 #include "common/ntapi.h"
 #include "common/path_util.h"
 #include "common/polyfill_thread.h"
+#include "common/process_memory.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
 #include "core/debugger.h"
@@ -326,6 +327,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 #ifdef _WIN32
     LOG_INFO(Config, "Log type: {}", EmulatorSettings.GetLogType());
 #endif
+    LOG_INFO(Config, "Debug artificialRamLimitMiB: {}",
+             EmulatorSettings.GetArtificialRamLimitMiB());
+    Common::ConfigureProcessWorkingSetLimit(EmulatorSettings.GetArtificialRamLimitMiB());
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",

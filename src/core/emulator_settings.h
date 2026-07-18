@@ -283,17 +283,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, max_skip
 // Debug settings
 // -------------------------------
 struct DebugSettings {
-    Setting<bool> debug_dump{false};         // specific
-    Setting<bool> shader_collect{false};     // specific
-    Setting<std::string> config_version{""}; // specific
+    Setting<bool> debug_dump{false};          // specific
+    Setting<bool> shader_collect{false};      // specific
+    Setting<u32> artificial_ram_limit_mib{0}; // specific
+    Setting<std::string> config_version{""};  // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
-            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
+            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect),
+            make_override<DebugSettings>("artificial_ram_limit_mib",
+                                         &DebugSettings::artificial_ram_limit_mib)};
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect,
+                                   artificial_ram_limit_mib, config_version)
 
 // -------------------------------
 // Input settings
@@ -676,6 +680,7 @@ public:
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
     SETTING_FORWARD_BOOL(m_debug, ShaderCollect, shader_collect)
+    SETTING_FORWARD(m_debug, ArtificialRamLimitMiB, artificial_ram_limit_mib)
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
 
     // GPU Settings

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -121,8 +122,11 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
-            memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
-                                    copy.size);
+            if (!memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
+                                         download + dst_offset, copy.size)) {
+                std::memcpy(std::bit_cast<void*>(copy_device_addr), download + dst_offset,
+                            copy.size);
+            }
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         if (is_write) {

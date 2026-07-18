@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -102,13 +104,19 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
     if (sync) {
         scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
+        const bool written = Core::Memory::Instance()->TryWriteBacking(
+            std::bit_cast<u8*>(image.info.guest_address), download, download_size);
+        if (!written) {
+            std::memcpy(std::bit_cast<void*>(image.info.guest_address), download, download_size);
+        }
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
+                const bool written = Core::Memory::Instance()->TryWriteBacking(
+                    std::bit_cast<u8*>(device_addr), download, download_size);
+                if (!written) {
+                    std::memcpy(std::bit_cast<void*>(device_addr), download, download_size);
+                }
             });
     }
 }

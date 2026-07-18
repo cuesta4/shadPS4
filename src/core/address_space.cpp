@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
 #include <map>
+#include <mutex>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -194,7 +197,7 @@ struct AddressSpace::Impl {
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
+                                            PAGE_EXECUTE_READWRITE, SEC_RESERVE, BackingSize,
                                             nullptr, nullptr, 0);
 
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
@@ -204,14 +207,21 @@ struct AddressSpace::Impl {
                                                       PAGE_NOACCESS, nullptr, 0));
         ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
 
-        // Map backing placeholder. This will commit the pages
-        void* const ret =
-            MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
-                           MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
+        // Keep one non-executable canonical view. SEC_RESERVE lets us commit physical pages only
+        // when the guest actually maps them instead of charging the full backing size up front.
+        void* const ret = MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
+                                         MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
         ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
+        LOG_INFO(Kernel_Vmm, "Physical backing writes use {} bounded {} MiB views",
+                 BackingWindowCount, BackingWindowSize / 1_MB);
     }
 
     ~Impl() {
+        for (BackingWindow& window : backing_windows) {
+            if (window.address && !UnmapViewOfFile(window.address)) {
+                LOG_CRITICAL(Core, "Failed to unmap a physical backing write window");
+            }
+        }
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(Core, "Failed to free virtual memory");
@@ -240,6 +250,13 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
+            if (fd == -1) {
+                void* const committed =
+                    VirtualAlloc(backing_base + phys_addr, size, MEM_COMMIT, PAGE_READWRITE);
+                ASSERT_MSG(committed == backing_base + phys_addr,
+                           "Failed to commit physical backing at {:#x}, size {:#x}: {}", phys_addr,
+                           size, Common::GetLastErrorMsg());
+            }
             if (fd != -1 && prot == PAGE_READONLY) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
@@ -571,7 +588,118 @@ struct AddressSpace::Impl {
         return reserved_regions;
     }
 
+    void DiscardPhysical(PAddr phys_addr, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical discard is out of bounds");
+        std::scoped_lock lk{backing_window_mutex};
+        InvalidateBackingWindows(phys_addr, size);
+        void* const address = backing_base + phys_addr;
+        const DWORD discard_error = DiscardVirtualMemory(address, size);
+        if (discard_error == ERROR_SUCCESS) {
+            return;
+        }
+
+        // DiscardVirtualMemory may reject a shared page-file view on older Windows revisions.
+        // MEM_RESET has the same content-invalidating contract for such mappings.
+        if (VirtualAlloc(address, size, MEM_RESET, PAGE_READWRITE) != nullptr) {
+            return;
+        }
+        const DWORD reset_error = GetLastError();
+        std::call_once(discard_failure_once, [=] {
+            LOG_WARNING(Kernel_Vmm,
+                        "Unable to discard physical backing pages (DiscardVirtualMemory={}, "
+                        "MEM_RESET={})",
+                        discard_error, reset_error);
+        });
+    }
+
+    void WriteBacking(PAddr phys_addr, const void* data, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical backing write is out of bounds");
+        if (size == 0) {
+            return;
+        }
+
+        std::scoped_lock lk{backing_window_mutex};
+        const u8* source = static_cast<const u8*>(data);
+        while (size != 0) {
+            const PAddr window_base = Common::AlignDown(phys_addr, BackingWindowSize);
+            const u64 window_size = std::min<u64>(BackingWindowSize, BackingSize - window_base);
+
+            BackingWindow* selected{};
+            for (BackingWindow& window : backing_windows) {
+                if (window.address && window.base == window_base) {
+                    selected = &window;
+                    break;
+                }
+            }
+
+            if (!selected) {
+                selected = &backing_windows.front();
+                for (BackingWindow& window : backing_windows) {
+                    if (!window.address) {
+                        selected = &window;
+                        break;
+                    }
+                    if (window.last_use < selected->last_use) {
+                        selected = &window;
+                    }
+                }
+
+                if (selected->address) {
+                    const bool unmapped = UnmapViewOfFile(selected->address);
+                    ASSERT_MSG(unmapped, "Unable to unmap a physical backing write window: {}",
+                               Common::GetLastErrorMsg());
+                }
+
+                selected->address =
+                    static_cast<u8*>(MapViewOfFile3(backing_handle, process, nullptr, window_base,
+                                                    window_size, 0, PAGE_READWRITE, nullptr, 0));
+                ASSERT_MSG(selected->address,
+                           "Unable to map physical backing write window at {:#x}: {}", window_base,
+                           Common::GetLastErrorMsg());
+                selected->base = window_base;
+            }
+
+            selected->last_use = ++backing_window_tick;
+            const u64 offset = phys_addr - window_base;
+            const u64 copy_size = std::min<u64>(size, window_size - offset);
+            std::memcpy(selected->address + offset, source, copy_size);
+            phys_addr += copy_size;
+            source += copy_size;
+            size -= copy_size;
+        }
+    }
+
+    void InvalidateBackingWindows(PAddr phys_addr, u64 size) {
+        const PAddr discard_end = phys_addr + size;
+        for (BackingWindow& window : backing_windows) {
+            const u64 window_size = std::min<u64>(BackingWindowSize, BackingSize - window.base);
+            if (!window.address || window.base >= discard_end ||
+                phys_addr >= window.base + window_size) {
+                continue;
+            }
+            const bool unmapped = UnmapViewOfFile(window.address);
+            ASSERT_MSG(unmapped, "Unable to unmap a physical backing write window: {}",
+                       Common::GetLastErrorMsg());
+            window = {};
+        }
+    }
+
+    // Buffer downloads arrive in chunks of at most 32 MiB, while completion labels repeatedly hit
+    // a few locations. Four windows preserve both access patterns while bounding alias residency.
+    static constexpr u64 BackingWindowSize = 32_MB;
+    static constexpr size_t BackingWindowCount = 4;
+
+    struct BackingWindow {
+        PAddr base{};
+        u8* address{};
+        u64 last_use{};
+    };
+
     std::mutex mutex;
+    std::mutex backing_window_mutex;
+    std::once_flag discard_failure_once;
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
@@ -580,6 +708,8 @@ struct AddressSpace::Impl {
     u64 system_managed_size{};
     u8* system_reserved_base{};
     u64 system_reserved_size{};
+    std::array<BackingWindow, BackingWindowCount> backing_windows{};
+    u64 backing_window_tick{};
     u8* user_base{};
     u64 user_size{};
     std::map<VAddr, MemoryRegion> regions;
@@ -792,7 +922,33 @@ struct AddressSpace::Impl {
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
+    void DiscardPhysical(PAddr phys_addr, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical discard is out of bounds");
+        void* const address = backing_base + phys_addr;
+#ifdef MADV_REMOVE
+        if (madvise(address, size, MADV_REMOVE) == 0) {
+            return;
+        }
+#endif
+        if (madvise(address, size, MADV_DONTNEED) == 0) {
+            return;
+        }
+        const int error = errno;
+        std::call_once(discard_failure_once, [=] {
+            LOG_WARNING(Kernel_Vmm, "Unable to discard physical backing pages: {}",
+                        strerror(error));
+        });
+    }
+
+    void WriteBacking(PAddr phys_addr, const void* data, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical backing write is out of bounds");
+        std::memcpy(backing_base + phys_addr, data, size);
+    }
+
     int backing_fd;
+    std::once_flag discard_failure_once;
     u8* backing_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
@@ -805,7 +961,6 @@ struct AddressSpace::Impl {
 #endif
 
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
-    backing_base = impl->backing_base;
     system_managed_base = impl->system_managed_base;
     system_managed_size = impl->system_managed_size;
     system_reserved_base = impl->system_reserved_base;
@@ -839,6 +994,14 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
 
 void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
     impl->Unmap(virtual_addr, size);
+}
+
+void AddressSpace::DiscardPhysical(PAddr phys_addr, u64 size) {
+    impl->DiscardPhysical(phys_addr, size);
+}
+
+void AddressSpace::WriteBacking(PAddr phys_addr, const void* data, u64 size) {
+    impl->WriteBacking(phys_addr, data, size);
 }
 
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {

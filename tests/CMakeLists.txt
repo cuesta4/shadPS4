@@ -31,6 +31,7 @@ set(SETTINGS_TEST_SOURCES
 
     # Tests
     test_emulator_settings.cpp
+    test_artificial_ram_limit.cpp
 )
 
 set(GCN_TEST_SOURCES

@@ -29,10 +29,6 @@ public:
     explicit AddressSpace();
     ~AddressSpace();
 
-    [[nodiscard]] u8* BackingBase() const noexcept {
-        return backing_base;
-    }
-
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);
     }
@@ -81,6 +77,12 @@ public:
     /// Unmaps specified virtual memory area.
     void Unmap(VAddr virtual_addr, u64 size);
 
+    /// Marks the contents of a physical backing range as discardable.
+    void DiscardPhysical(PAddr phys_addr, u64 size);
+
+    /// Writes to physical backing without retaining an unbounded resident alias.
+    void WriteBacking(PAddr phys_addr, const void* data, u64 size);
+
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 
@@ -90,7 +92,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
-    u8* backing_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
     u8* system_reserved_base{};
