@@ -141,6 +141,7 @@ set(GCN_TEST_SOURCES
 set(VIDEO_CORE_TEST_SOURCES
     test_depth_stencil_state.cpp
     test_buffer_access.cpp
+    test_blend_rewrite.cpp
     test_pm4_sync.cpp
 )
 
