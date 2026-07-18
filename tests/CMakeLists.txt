@@ -9,7 +9,7 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test)
+set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test shadps4_blend_rewrite_test)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -128,8 +128,13 @@ set(GCN_TEST_SOURCES
     gcn/test_gcn_instructions.cpp
 )
 
+set(BLEND_REWRITE_TEST_SOURCES
+    test_blend_rewrite.cpp
+)
+
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+add_executable(shadps4_blend_rewrite_test ${BLEND_REWRITE_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -160,6 +165,9 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
     half::half
+)
+target_link_libraries(shadps4_blend_rewrite_test PRIVATE
+    GTest::gtest_main
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
