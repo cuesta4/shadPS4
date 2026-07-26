@@ -4,6 +4,8 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/buffer_access_state_store.h"
+#include "video_core/renderer_vulkan/execution/resource_command_recorder.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -12,6 +14,8 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+Common::IncrementalIdProvider<u64> Buffer::global_uid{};
 
 std::string_view BufferTypeName(MemoryUsage type) {
     switch (type) {
@@ -102,8 +106,9 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
-    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
-      usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, uid{global_uid.Next()}, instance{&instance_},
+      scheduler{&scheduler_}, usage{usage_},
+      buffer{instance->GetDevice(), instance->GetAllocator()} {
     // Create buffer object.
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
@@ -128,7 +133,6 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
     scheduler->EndRendering();
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer size must be a multiple of 4 bytes");
-    const auto cmdbuf = scheduler->CommandBuffer();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
@@ -147,13 +151,13 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
         .offset = offset,
         .size = num_bytes,
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    Vulkan::ResourceCommandRecorder::PipelineBarrier2(*scheduler, vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &pre_barrier,
     });
-    cmdbuf.fillBuffer(buffer, offset, num_bytes, value);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    Vulkan::ResourceCommandRecorder::FillBuffer(*scheduler, buffer, offset, num_bytes, value);
+    Vulkan::ResourceCommandRecorder::PipelineBarrier2(*scheduler, vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,
@@ -198,6 +202,9 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         std::swap(previous_watches, current_watches);
         wait_cursor = 0;
         wait_bound = 0;
+        if (++generation == 0) {
+            generation = 1;
+        }
     }
 
     const u64 mapped_upper_bound = offset + size;
@@ -206,6 +213,17 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     return {mapped_data.data() + offset, offset};
+}
+
+bool StreamBuffer::CanMapWithoutWrapping(u64 size, u64 alignment) const {
+    if (!is_coherent && usage == MemoryUsage::Stream) {
+        size = Common::AlignUp(size, instance->NonCoherentAtomSize());
+    }
+    if (size > size_bytes) {
+        return false;
+    }
+    const u64 aligned_offset = alignment > 0 ? Common::AlignUp(offset, alignment) : offset;
+    return aligned_offset <= size_bytes && size <= size_bytes - aligned_offset;
 }
 
 void StreamBuffer::Commit() {
@@ -253,6 +271,64 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         ++wait_cursor;
     }
     return true;
+}
+
+} // namespace VideoCore
+
+namespace VideoCore {
+
+void Buffer::BindAccessState(BufferAccessStateStore& store, BufferId id,
+                             u32 generation) noexcept {
+    access_state_store = &store;
+    access_state_id = id;
+    access_state_generation = generation;
+    store.ResetResource(id, generation);
+    store.UpdateAccessState(id, generation, stage, access_mask);
+}
+
+void Buffer::UnbindAccessState() noexcept {
+    if (access_state_store && access_state_id) {
+        access_state_store->RemoveResource(access_state_id);
+    }
+    access_state_store = nullptr;
+    access_state_id = {};
+    access_state_generation = 0;
+}
+
+void Buffer::CommitAccessState(vk::AccessFlags2 dst_access_mask,
+                               vk::PipelineStageFlagBits2 dst_stage) noexcept {
+    access_mask = dst_access_mask;
+    stage = dst_stage;
+    if (access_state_store && access_state_id) {
+        access_state_store->UpdateAccessState(
+            access_state_id, access_state_generation, dst_stage, dst_access_mask);
+    }
+}
+
+std::optional<vk::BufferMemoryBarrier2> Buffer::PlanBarrier(
+    vk::AccessFlags2 dst_access_mask, vk::PipelineStageFlagBits2 dst_stage,
+    u32 offset) const {
+    vk::PipelineStageFlags2 source_stage = stage;
+    vk::AccessFlags2 source_access = access_mask;
+    if (access_state_store && access_state_id) {
+        const auto state = access_state_store->GetAccessState(access_state_id);
+        source_stage = state.stage_mask;
+        source_access = state.access_mask;
+    }
+    if (dst_access_mask == source_access && source_stage == dst_stage) {
+        return {};
+    }
+
+    DEBUG_ASSERT(offset < size_bytes);
+    return vk::BufferMemoryBarrier2{
+        .srcStageMask = source_stage,
+        .srcAccessMask = source_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access_mask,
+        .buffer = buffer.buffer,
+        .offset = offset,
+        .size = size_bytes - offset,
+    };
 }
 
 } // namespace VideoCore

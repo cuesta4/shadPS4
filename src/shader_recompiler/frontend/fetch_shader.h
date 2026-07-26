@@ -7,6 +7,7 @@
 #include <vector>
 #include "common/types.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/invocation.h"
 
 namespace Serialization {
 struct Archive;
@@ -36,8 +37,9 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
-        auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+    template <typename Invocation>
+    constexpr AmdGpu::Buffer GetSharp(const Invocation& invocation) const noexcept {
+        auto buffer = invocation.template ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
         buffer.base_address += inst_offset;
         if (data_format) {
             buffer.data_format = data_format;
@@ -69,7 +71,10 @@ struct FetchShaderData {
 };
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
+const u32* GetFetchShaderCode(const ShaderInvocationData& invocation, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
+std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info,
+                                                const ShaderInvocationData& invocation);
 
 } // namespace Shader::Gcn

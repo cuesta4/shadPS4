@@ -10,14 +10,28 @@ union Regs;
 
 namespace Shader {
 struct Info;
+struct ShaderInvocationData;
 }
 
 namespace Vulkan {
 
-class Rasterizer;
+class VulkanCommandRecorder;
+}
+
+namespace VideoCore {
+class BufferCache;
+}
+
+namespace Vulkan {
+
+struct ShaderHleServices {
+    VideoCore::BufferCache& buffers;
+    VulkanCommandRecorder& recorder;
+};
 
 /// Attempts to execute a shader using HLE if possible.
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);
+bool ExecuteShaderHLE(const Shader::Info& info, const Shader::ShaderInvocationData& invocation,
+                      const AmdGpu::ComputeProgram& cs_program,
+                      const ShaderHleServices& services);
 
 } // namespace Vulkan

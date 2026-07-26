@@ -12,6 +12,7 @@
 
 #include <deque>
 #include <optional>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
@@ -24,6 +25,8 @@ VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace VideoCore {
+class ImageAccessStateStore;
+struct ImageAccessState;
 
 enum ImageFlagBits : u32 {
     Empty = 0,
@@ -102,6 +105,8 @@ struct Image {
         return backing->image.image;
     }
 
+    [[nodiscard]] vk::ImageLayout CurrentLayout() const;
+
     bool IsTracked() {
         return track_addr != 0 && track_addr_end != 0;
     }
@@ -121,8 +126,19 @@ struct Image {
     }
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+    [[nodiscard]] ImageViewId FindViewId(const ImageViewInfo& view_info) const;
+    [[nodiscard]] size_t ViewCount() const noexcept {
+        size_t count = 0;
+        for (const auto& backing_image : backing_images) {
+            count += backing_image.image_view_ids.size();
+        }
+        return count;
+    }
+    void BindAccessState(ImageAccessStateStore& store, ImageId id, u32 generation);
+    void UnbindAccessState();
+    void MirrorAccessState(const ImageAccessState& state);
 
-    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    using Barriers = std::vector<vk::ImageMemoryBarrier2>;
     Barriers GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                          vk::PipelineStageFlags2 dst_stage,
                          std::optional<SubresourceRange> subres_range);
@@ -188,15 +204,13 @@ public:
         u32 vo_surface : 1;
     } usage{};
 
-    struct {
-        u32 is_bound : 1;
-        u32 is_target : 1;
-        u32 needs_rebind : 1;
-        u32 force_general : 1;
-    } binding{};
-
 private:
+    void PublishAccessState();
+
     static Common::IncrementalIdProvider<u64> global_image_uid;
+    ImageAccessStateStore* access_state_store{};
+    ImageId access_state_id{};
+    u32 access_state_generation{};
 };
 
 } // namespace VideoCore

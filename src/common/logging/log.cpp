@@ -140,6 +140,12 @@ std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGER
     {Class::Tty, nullptr},
 };
 
+const std::shared_ptr<spdlog::logger>& GetLogger(const std::string_view log_class) {
+    const auto logger = ALL_LOGGERS.find(log_class);
+    ASSERT_MSG(logger != ALL_LOGGERS.end(), "Unknown log class '{}'", log_class);
+    return logger->second;
+}
+
 template <typename T>
 static auto UpdateColorLevels(T sink) {
 #ifdef _WIN32
@@ -218,6 +224,7 @@ void Setup(std::string_view shadps4_filename) {
 void Switch(std::string_view game_filename) {
     UpdateSinks();
     UpdateLogLevels(EmulatorSettings.GetLogFilter());
+    UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());
 
     g_shad_file_sink->_size_limit = EmulatorSettings.GetLogSizeLimit();
     g_shad_file_sink->session_file_helper_.open(
@@ -314,6 +321,14 @@ void UpdateLogLevels(std::string_view log_filter) {
                                                                     : default_log_level);
         } else {
             logger->set_level(spdlog::level::off);
+        }
+    }
+}
+
+void UpdateLogFlushLevel(std::string_view log_flush_level) {
+    if (!log_flush_level.empty()) {
+        for (auto& [name, logger] : ALL_LOGGERS) {
+            logger->flush_on(spdlog::level_from_str(log_flush_level.data()));
         }
     }
 }

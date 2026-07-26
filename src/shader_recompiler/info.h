@@ -116,9 +116,15 @@ struct Info : InfoPersistent {
         Qualifier auxiliary;
     };
 
-    std::span<const u32> user_data;
+    std::span<const u32> user_data{};
     std::vector<u32> flattened_ud_buf;
     PersistentSrtInfo srt_info;
+
+    std::span<const AmdGpu::Buffer> resolved_buffers{};
+    std::span<const AmdGpu::Image> resolved_images{};
+    std::span<const AmdGpu::Sampler> resolved_samplers{};
+    std::span<const AmdGpu::Image> resolved_fmasks{};
+    std::span<const AmdGpu::Buffer> resolved_vertex_buffers{};
 
     AttributeFlags loads{};
     AttributeFlags stores{};
@@ -127,7 +133,7 @@ struct Info : InfoPersistent {
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
 
-    VAddr pgm_base;
+    VAddr pgm_base{};
     bool has_storage_images{};
     bool has_discard{};
     bool has_image_gather{};
@@ -205,6 +211,17 @@ struct Info : InfoPersistent {
         memcpy(&tess_constants,
                reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
                sizeof(tess_constants));
+    }
+
+    void ClearInvocationState() {
+        user_data = {};
+        flattened_ud_buf.clear();
+        resolved_buffers = {};
+        resolved_images = {};
+        resolved_samplers = {};
+        resolved_fmasks = {};
+        resolved_vertex_buffers = {};
+        pgm_base = 0;
     }
 
     void Serialize(Serialization::Archive& ar) const;

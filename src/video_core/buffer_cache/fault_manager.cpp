@@ -4,6 +4,7 @@
 #include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/renderer_vulkan/execution/resource_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -134,21 +135,22 @@ void FaultManager::ProcessFaultBuffer() {
         },
     }};
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    Vulkan::ResourceCommandRecorder::PipelineBarrier2(scheduler, vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &pre_barrier,
     });
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
-                                writes);
+    Vulkan::ResourceCommandRecorder::BindPipeline(
+        scheduler, vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
+    Vulkan::ResourceCommandRecorder::PushDescriptorSet(
+        scheduler, vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
+        writes);
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
-    cmdbuf.dispatch(num_workgroups, 1, 1);
+    Vulkan::ResourceCommandRecorder::Dispatch(scheduler, num_workgroups, 1, 1);
 
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    Vulkan::ResourceCommandRecorder::PipelineBarrier2(scheduler, vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,

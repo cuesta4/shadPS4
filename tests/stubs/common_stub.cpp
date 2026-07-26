@@ -5,6 +5,6 @@
 
 namespace Common {
 
-std::string GetCurrentThreadName() { return "shadPS4::Test"; }
+std::string_view GetCurrentThreadName() { return "shadPS4::Test"; }
 
 } // namespace Common

@@ -5,8 +5,9 @@
 
 #include <condition_variable>
 #include <mutex>
-#include <thread>
 #include <queue>
+#include <ranges>
+#include <thread>
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -170,16 +171,18 @@ struct DynamicState {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
     }
 
-    void SetViewports(const Viewports& viewports_) {
+    template <std::ranges::input_range Range>
+    void SetViewports(const Range& viewports_) {
         if (!std::ranges::equal(viewports, viewports_)) {
-            viewports = viewports_;
+            viewports.assign(std::ranges::begin(viewports_), std::ranges::end(viewports_));
             dirty_state.viewports = true;
         }
     }
 
-    void SetScissors(const Scissors& scissors_) {
+    template <std::ranges::input_range Range>
+    void SetScissors(const Range& scissors_) {
         if (!std::ranges::equal(scissors, scissors_)) {
-            scissors = scissors_;
+            scissors.assign(std::ranges::begin(scissors_), std::ranges::end(scissors_));
             dirty_state.scissors = true;
         }
     }

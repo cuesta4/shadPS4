@@ -141,33 +141,33 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
 }
 
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
-    compute_key.Deserialize(ar);
+    PipelineBuildContext context;
+    context.compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
     std::vector<u8> meta_blob;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
-                                       fmt::format("{:#018x}", compute_key.value), meta_blob);
+                                       fmt::format("{:#018x}", context.compute_key.value), meta_blob);
     if (meta_blob.empty()) {
         return false;
     }
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
-    if (!LoadPipelineStage(meta_ar, 0)) {
+    const auto compute_index = u32(Shader::LogicalStage::Compute);
+    if (!LoadPipelineStage(meta_ar, compute_index, context)) {
         return false;
     }
 
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    const auto [it, is_new] = compute_pipelines.try_emplace(context.compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
-
-    infos.fill(nullptr);
-    modules.fill(nullptr);
+    it.value() = std::make_unique<ComputePipeline>(
+        instance, profile, *pipeline_cache, context.compute_key,
+        *context.infos[compute_index], context.invocations[compute_index],
+        context.modules[compute_index], sdata, true);
 
     return true;
 }
@@ -209,13 +209,14 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
-    graphics_key.Deserialize(ar);
+    PipelineBuildContext context;
+    context.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
-        const auto& hash = graphics_key.stage_hashes[stage_idx];
+        const auto& hash = context.graphics_key.stage_hashes[stage_idx];
         if (!hash) {
             continue;
         }
@@ -229,37 +230,36 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        if (!LoadPipelineStage(meta_ar, stage_idx, context)) {
             return false;
         }
     }
 
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto [it, is_new] = graphics_pipelines.try_emplace(context.graphics_key);
     ASSERT(is_new);
 
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
-
-    infos.fill(nullptr);
-    modules.fill(nullptr);
-    fetch_shader.reset();
+        instance, profile, context.graphics_key, *pipeline_cache, context.infos,
+        context.invocations, context.runtime_infos, context.fetch_shader, context.modules, sdata,
+        true);
 
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
-    auto program = std::make_unique<Program>();
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                                      PipelineBuildContext& context) {
+    Shader::Info loaded_info{};
     Shader::StageSpecialization spec{};
-    spec.info = &program->info;
+    spec.info = &loaded_info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, loaded_info, context.fetch_shader, spec, perm_idx)) {
         return false;
     }
+    auto invocation = Shader::ShaderInvocationData::FromCompilerInfo(loaded_info);
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
+                                       fmt::format("{:#018x}_{}", loaded_info.pgm_hash, perm_idx),
                                        spv);
     if (spv.empty()) {
         return false;
@@ -270,26 +270,33 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     vk::ShaderModule module{};
 
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+    const u64 program_hash = loaded_info.pgm_hash;
+    const Shader::Stage program_stage = loaded_info.stage;
+    auto [it_pgm, new_program] = program_cache.try_emplace(program_hash);
     if (new_program) {
         module = CompileSPV(spv, instance.GetDevice());
-        it_pgm.value() = std::move(program);
+        loaded_info.ClearInvocationState();
+        it_pgm.value() = std::make_unique<Program>(std::move(loaded_info));
+        spec.info = &it_pgm.value()->Metadata();
     } else {
+        spec.info = &it_pgm.value()->Metadata();
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
             // If the permutation is already preloaded, make sure it has the same permutation index
             const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
             ASSERT_MSG(perm_idx == idx, "Permutation {} is already inserted at {}! ({}_{:x})",
-                       perm_idx, idx, program->info.stage, program->info.pgm_hash);
+                       perm_idx, idx, program_stage, program_hash);
             module = it->module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    spec.info = &it_pgm.value()->Metadata();
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
-    infos[stage] = &it_pgm.value()->info;
-    modules[stage] = module;
+    context.infos[stage] = &it_pgm.value()->Metadata();
+    context.invocations[stage] = std::move(invocation);
+    context.modules[stage] = module;
 
     return true;
 }
@@ -391,6 +398,13 @@ bool Info::Deserialize(Serialization::Archive& ar) {
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
+    user_data = {};
+    resolved_buffers = {};
+    resolved_images = {};
+    resolved_samplers = {};
+    resolved_fmasks = {};
+    resolved_vertex_buffers = {};
+    pgm_base = 0;
 
     return srt_info.Deserialize(ar);
 }

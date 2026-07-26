@@ -7,10 +7,12 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include "common/incremental_id.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/resources/resource_ids.h"
 
 namespace Vulkan {
 class Instance;
@@ -23,6 +25,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
 struct VmaAllocationInfo;
 
 namespace VideoCore {
+class BufferAccessStateStore;
 
 /// Hints and requirements for the backing memory type of a commit
 enum class MemoryUsage {
@@ -116,6 +119,13 @@ public:
         return lru_id;
     }
 
+    u64 Uid() const noexcept {
+        return uid;
+    }
+
+    void BindAccessState(BufferAccessStateStore& store, BufferId id, u32 generation) noexcept;
+    void UnbindAccessState() noexcept;
+
     vk::Buffer Handle() const noexcept {
         return buffer;
     }
@@ -125,26 +135,29 @@ public:
         return buffer.bda_addr;
     }
 
-    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
+    [[nodiscard]] std::optional<vk::BufferMemoryBarrier2> PlanBarrier(
+        vk::AccessFlags2 dst_access_mask, vk::PipelineStageFlagBits2 dst_stage,
+        u32 offset = 0) const;
+
+    void CommitAccessState(vk::AccessFlags2 dst_access_mask,
+                           vk::PipelineStageFlagBits2 dst_stage) noexcept;
+    void MirrorAccessState(vk::AccessFlags2 access,
+                           vk::PipelineStageFlags2 stage_) noexcept {
+        access_mask = access;
+        stage = stage_;
+    }
+    [[nodiscard]] vk::AccessFlags2 LocalAccessMask() const noexcept {
+        return access_mask;
+    }
+    [[nodiscard]] vk::PipelineStageFlags2 LocalStageMask() const noexcept {
+        return stage;
+    }
+
+    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_access_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
-        if (dst_acess_mask == access_mask && stage == dst_stage) {
-            return {};
-        }
-
-        DEBUG_ASSERT(offset < size_bytes);
-
-        const auto barrier = vk::BufferMemoryBarrier2{
-            .srcStageMask = stage,
-            .srcAccessMask = access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_acess_mask,
-            .buffer = buffer.buffer,
-            .offset = offset,
-            .size = size_bytes - offset,
-        };
-        access_mask = dst_acess_mask;
-        stage = dst_stage;
+        auto barrier = PlanBarrier(dst_access_mask, dst_stage, offset);
+        CommitAccessState(dst_access_mask, dst_stage);
         return barrier;
     }
 
@@ -158,15 +171,22 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
+    u64 uid = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
     MemoryUsage usage;
     UniqueBuffer buffer;
-    vk::Flags<vk::AccessFlagBits2> access_mask{
+
+private:
+    static Common::IncrementalIdProvider<u64> global_uid;
+    vk::AccessFlags2 access_mask{
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    BufferAccessStateStore* access_state_store{};
+    BufferId access_state_id{};
+    u32 access_state_generation{};
 };
 
 class StreamBuffer : public Buffer {
@@ -179,6 +199,12 @@ public:
 
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
+
+    [[nodiscard]] bool CanMapWithoutWrapping(u64 size, u64 alignment = 0) const;
+
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -209,6 +235,7 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
+    u64 generation{1};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

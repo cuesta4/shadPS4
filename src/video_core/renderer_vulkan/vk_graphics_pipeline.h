@@ -3,10 +3,11 @@
 
 #pragma once
 
-#include <boost/container/static_vector.hpp>
+#include <boost/container/small_vector.hpp>
 #include <xxhash.h>
 
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/invocation.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -21,13 +22,14 @@ namespace Vulkan {
 
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::LogicalStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
+static constexpr u32 InlineVertexBufferCount = 8;
 
 class Instance;
 class Scheduler;
 class DescriptorHeap;
 
 template <typename T>
-using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
+using VertexInputs = boost::container::small_vector<T, InlineVertexBufferCount>;
 
 struct GraphicsPipelineKey {
     std::array<size_t, MaxShaderStages> stage_hashes;
@@ -82,10 +84,11 @@ public:
         bool Deserialize(Serialization::Archive& ar);
     };
 
-    GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
+    GraphicsPipeline(const Instance& instance,
                      const Shader::Profile& profile, const GraphicsPipelineKey& key,
                      vk::PipelineCache pipeline_cache,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
+                     std::span<const Shader::ShaderInvocationData, MaxShaderStages> invocations,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
@@ -105,10 +108,13 @@ public:
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
-                         u32 step_rate_1) const;
+                         u32 step_rate_1,
+                         const Shader::ShaderInvocationData& invocation) const;
 
 private:
-    void BuildDescSetLayout(bool preloading);
+    void BuildDescSetLayout(bool preloading,
+                            std::span<const Shader::ShaderInvocationData, MaxShaderStages>
+                                invocations);
 
 private:
     GraphicsPipelineKey key;

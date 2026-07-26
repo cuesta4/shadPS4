@@ -8,32 +8,38 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/buffer_access_state_store.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/resources/resource_alias_coordinator.h"
+#include "video_core/resources/resource_ids.h"
+#include "video_core/renderer_vulkan/preparation/input_binding_plan.h"
+#include "video_core/renderer_vulkan/preparation/resource_access_plan.h"
+#include "video_core/resources/transfer_buffer_pool.h"
 
 namespace AmdGpu {
-struct Liverpool;
+class GpuThreadDispatcher;
 }
 
 namespace Core {
 class MemoryManager;
 }
 
-namespace Vulkan {
-class GraphicsPipeline;
-}
-
 namespace VideoCore {
 
-using BufferId = Common::SlotId;
-
-class TextureCache;
 class MemoryTracker;
 class PageManager;
 
-class BufferCache {
+class BufferCache : public BufferSynchronizer {
 public:
+    struct ResolvedBuffer {
+        Buffer* buffer{};
+        BufferId id{};
+        u32 generation{};
+        u32 offset{};
+    };
+
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
@@ -66,8 +72,10 @@ public:
 
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                         AmdGpu::Liverpool* liverpool, TextureCache& texture_cache,
-                         PageManager& tracker);
+                         AmdGpu::GpuThreadDispatcher* gpu_thread_dispatcher,
+                         TransferBufferPool& transfer_buffers,
+                         ResourceAliasCoordinator& alias_coordinator, PageManager& tracker,
+                         BufferAccessStateStore& access_states);
     ~BufferCache();
 
     /// Returns a pointer to GDS device local buffer.
@@ -92,15 +100,7 @@ public:
 
     /// Retrieves a utility buffer optimized for specified memory usage.
     StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
-        if (usage == MemoryUsage::Stream) {
-            return stream_buffer;
-        } else if (usage == MemoryUsage::Download) {
-            return download_buffer;
-        } else if (usage == MemoryUsage::DeviceLocal) {
-            return device_buffer;
-        } else {
-            return staging_buffer;
-        }
+        return transfer_buffers.Get(usage);
     }
 
     /// Invalidates any buffer in the logical page range.
@@ -110,12 +110,12 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
     /// Binds host vertex buffers for the current draw.
-    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
-                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    [[nodiscard]] Vulkan::VertexInputPlan PrepareVertexBuffers(
+        const Vulkan::VertexInputRequest& request, Vulkan::BufferAccessPlan& accesses);
 
     /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset,
-                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    [[nodiscard]] Vulkan::IndexInputPlan PrepareIndexBuffer(
+        const Vulkan::IndexInputRequest& request, Vulkan::BufferAccessPlan& accesses);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -128,8 +128,11 @@ public:
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {});
 
+    [[nodiscard]] ResolvedBuffer ResolveBuffer(VAddr gpu_addr, u32 size, bool is_written,
+                                               bool is_texel_buffer = false);
+
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size) override;
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);
@@ -140,7 +143,10 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
-    /// Return buffer id for the specified region
+    /// Looks up a containing buffer without creating, merging, or synchronizing resources.
+    [[nodiscard]] BufferId LookupBuffer(VAddr device_addr, u32 size) const;
+
+    /// Ensures a buffer exists for the specified region and returns its id.
     BufferId FindBuffer(VAddr device_addr, u32 size);
 
     /// Processes the fault buffer.
@@ -201,15 +207,17 @@ private:
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
-    AmdGpu::Liverpool* liverpool;
+    AmdGpu::GpuThreadDispatcher* gpu_thread_dispatcher;
     Core::MemoryManager* memory;
-    TextureCache& texture_cache;
+    TransferBufferPool& transfer_buffers;
+    ResourceAliasCoordinator& alias_coordinator;
+    BufferAccessStateStore& access_states;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
-    StreamBuffer staging_buffer;
-    StreamBuffer stream_buffer;
-    StreamBuffer download_buffer;
-    StreamBuffer device_buffer;
+    StreamBuffer& staging_buffer;
+    StreamBuffer& stream_buffer;
+    StreamBuffer& download_buffer;
+    StreamBuffer& device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;

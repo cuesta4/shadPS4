@@ -45,12 +45,17 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
-std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+const u32* GetFetchShaderCode(const ShaderInvocationData& invocation, u32 sgpr_base) {
+    const u32* code;
+    std::memcpy(&code, &invocation.user_data[sgpr_base], sizeof(code));
+    return code;
+}
+
+static std::optional<FetchShaderData> ParseFetchShaderImpl(const Shader::Info& info,
+                                                           const u32* code) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }
-
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     FetchShaderData data{};
     GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
     GcnDecodeContext decoder;
@@ -109,6 +114,16 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     }
 
     return data;
+}
+
+std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    return ParseFetchShaderImpl(info, GetFetchShaderCode(info, info.fetch_shader_sgpr_base));
+}
+
+std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info,
+                                                const ShaderInvocationData& invocation) {
+    return ParseFetchShaderImpl(
+        info, GetFetchShaderCode(invocation, info.fetch_shader_sgpr_base));
 }
 
 } // namespace Shader::Gcn

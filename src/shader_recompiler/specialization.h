@@ -9,6 +9,7 @@
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/invocation.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader {
@@ -85,37 +86,46 @@ struct StageSpecialization {
     RuntimeInfo runtime_info{};
     std::bitset<MaxStageResources> bitset{};
     std::optional<Gcn::FetchShaderData> fetch_shader_data{};
-    boost::container::small_vector<VsAttribSpecialization, 32> vs_attribs;
-    boost::container::small_vector<BufferSpecialization, 16> buffers;
-    boost::container::small_vector<ImageSpecialization, 16> images;
-    boost::container::small_vector<FMaskSpecialization, 8> fmasks;
-    boost::container::small_vector<SamplerSpecialization, 16> samplers;
+    boost::container::small_vector<VsAttribSpecialization, 8> vs_attribs;
+    boost::container::small_vector<BufferSpecialization, 8> buffers;
+    boost::container::small_vector<ImageSpecialization, 8> images;
+    boost::container::small_vector<FMaskSpecialization, 2> fmasks;
+    boost::container::small_vector<SamplerSpecialization, 8> samplers;
     Backend::Bindings start{};
 
     StageSpecialization() = default;
-    StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+    StageSpecialization(const Info& info_, const ShaderInvocationData& invocation,
+                        RuntimeInfo runtime_info_, const Profile& profile_,
+                        Backend::Bindings start_,
+                        const std::optional<Gcn::FetchShaderData>* fetch_shader_hint = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        fetch_shader_data = Gcn::ParseFetchShader(info_);
+        fetch_shader_data =
+            fetch_shader_hint ? *fetch_shader_hint : Gcn::ParseFetchShader(info_, invocation);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
+            vs_attribs.reserve(fetch_shader_data->attributes.size());
             // Specialize shader on VS input number types to follow spec.
-            ForEachSharp(vs_attribs, fetch_shader_data->attributes,
-                         [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                             using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                             if (const auto step_rate = desc.GetStepRate();
-                                 step_rate != InstanceIdType::None) {
-                                 spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.vs_info.step_rate_0
-                                                    : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.vs_info.step_rate_1
-                                                           : 1);
-                             }
-                             spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
-                         });
+            ForEachSharp(
+                vs_attribs, fetch_shader_data->attributes, invocation.ResolvedVertexBuffers(),
+                invocation, [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+                    if (const auto step_rate = desc.GetStepRate();
+                        step_rate != InstanceIdType::None) {
+                        spec.divisor = step_rate == InstanceIdType::OverStepRate0
+                                           ? runtime_info.vs_info.step_rate_0
+                                           : (step_rate == InstanceIdType::OverStepRate1
+                                                  ? runtime_info.vs_info.step_rate_1
+                                                  : 1);
+                    }
+                    spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+                    spec.dst_select = sharp.DstSelect();
+                });
         }
+        buffers.reserve(info->buffers.size());
+        images.reserve(info->images.size());
+        fmasks.reserve(info->fmasks.size());
+        samplers.reserve(info->samplers.size());
         u32 binding{};
-        ForEachSharp(binding, buffers, info->buffers,
+        ForEachSharp(binding, buffers, info->buffers, invocation.ResolvedBuffers(), invocation,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
                          spec.is_storage = desc.IsStorage(sharp);
@@ -132,7 +142,7 @@ struct StageSpecialization {
                              spec.element_size = sharp.element_size;
                          }
                      });
-        ForEachSharp(binding, images, info->images,
+        ForEachSharp(binding, images, info->images, invocation.ResolvedImages(), invocation,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
@@ -144,14 +154,14 @@ struct StageSpecialization {
                              spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
-                         spec.num_bindings = desc.NumBindings(*info);
+                         spec.num_bindings = desc.NumBindings(sharp);
                      });
-        ForEachSharp(binding, fmasks, info->fmasks,
+        ForEachSharp(binding, fmasks, info->fmasks, invocation.ResolvedFmasks(), invocation,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
                          spec.height = sharp.height;
                      });
-        ForEachSharp(samplers, info->samplers,
+        ForEachSharp(samplers, info->samplers, invocation.ResolvedSamplers(), invocation,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
@@ -161,15 +171,18 @@ struct StageSpecialization {
         if (info->l_stage == LogicalStage::TessellationControl ||
             info->l_stage == LogicalStage::TessellationEval) {
             TessellationDataConstantBuffer tess_constants{};
-            info->ReadTessConstantBuffer(tess_constants);
+            invocation.ReadTessConstantBuffer(*info, tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);
         }
     }
 
-    void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
-        for (const auto& desc : desc_list) {
+    void ForEachSharp(auto& spec_list, auto& desc_list, const auto& resolved_sharps,
+                      const auto& invocation, auto&& func) {
+        const bool use_resolved = resolved_sharps.size() == desc_list.size();
+        for (u32 index = 0; index < desc_list.size(); ++index) {
+            const auto& desc = desc_list[index];
             auto& spec = spec_list.emplace_back();
-            const auto sharp = desc.GetSharp(*info);
+            const auto sharp = use_resolved ? resolved_sharps[index] : desc.GetSharp(invocation);
             if (!sharp) {
                 continue;
             }
@@ -177,10 +190,13 @@ struct StageSpecialization {
         }
     }
 
-    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
-        for (const auto& desc : desc_list) {
+    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list,
+                      const auto& resolved_sharps, const auto& invocation, auto&& func) {
+        const bool use_resolved = resolved_sharps.size() == desc_list.size();
+        for (u32 index = 0; index < desc_list.size(); ++index) {
+            const auto& desc = desc_list[index];
             auto& spec = spec_list.emplace_back();
-            const auto sharp = desc.GetSharp(*info);
+            const auto sharp = use_resolved ? resolved_sharps[index] : desc.GetSharp(invocation);
             if (!sharp) {
                 binding++;
                 continue;
@@ -195,11 +211,7 @@ struct StageSpecialization {
     }
 
     bool operator==(const StageSpecialization& other) const {
-        if (!Valid()) {
-            return false;
-        }
-
-        if (vs_attribs != other.vs_attribs) {
+        if (!Valid() || !other.Valid()) {
             return false;
         }
 
@@ -207,11 +219,18 @@ struct StageSpecialization {
             return false;
         }
 
-        if (fetch_shader_data != other.fetch_shader_data) {
+        if (vs_attribs.size() != other.vs_attribs.size() ||
+            buffers.size() != other.buffers.size() || images.size() != other.images.size() ||
+            fmasks.size() != other.fmasks.size() || samplers.size() != other.samplers.size()) {
             return false;
         }
 
-        if (fmasks != other.fmasks) {
+        if (bitset != other.bitset) {
+            return false;
+        }
+
+        if (vs_attribs != other.vs_attribs || fetch_shader_data != other.fetch_shader_data ||
+            fmasks != other.fmasks) {
             return false;
         }
 
@@ -219,7 +238,7 @@ struct StageSpecialization {
         // bindings still may change as they depend on previously processed FS. The check below
         // handles this case and prevents generation of redundant permutations. This is also safe
         // for other types of shaders with no bindings.
-        if (bitset.none() && other.bitset.none()) {
+        if (bitset.none()) {
             return true;
         }
 

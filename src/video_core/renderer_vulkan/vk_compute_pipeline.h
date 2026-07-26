@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "shader_recompiler/invocation.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 
@@ -44,10 +45,11 @@ public:
         bool Deserialize(Serialization::Archive& ar);
     };
 
-    ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
+    ComputePipeline(const Instance& instance,
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
+                    const Shader::ShaderInvocationData& invocation, vk::ShaderModule module,
+                    SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
 
 private:

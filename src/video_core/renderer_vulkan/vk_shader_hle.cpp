@@ -1,26 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "shader_recompiler/info.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include <algorithm>
+#include <vector>
 
-extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+#include "shader_recompiler/info.h"
+#include "shader_recompiler/invocation.h"
+#include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
-static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
-                                 Rasterizer& rasterizer) {
-    auto& scheduler = rasterizer.GetScheduler();
-    auto& buffer_cache = rasterizer.GetBufferCache();
+static bool ExecuteCopyShaderHLE(const Shader::Info& info,
+                                 const Shader::ShaderInvocationData& invocation,
+                                 const AmdGpu::ComputeProgram& cs_program,
+                                 const ShaderHleServices& services) {
+    auto& buffer_cache = services.buffers;
+    auto& recorder = services.recorder;
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
-    const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
-    const auto src_buf_sharp = info.buffers[1].GetSharp(info);
-    const auto dst_buf_sharp = info.buffers[2].GetSharp(info);
+    const auto ctl_buf_sharp = info.buffers[0].GetSharp(invocation);
+    const auto src_buf_sharp = info.buffers[1].GetSharp(invocation);
+    const auto dst_buf_sharp = info.buffers[2].GetSharp(invocation);
     const auto buf_stride = src_buf_sharp.GetStride();
     ASSERT(buf_stride == dst_buf_sharp.GetStride());
 
@@ -33,8 +37,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     ASSERT(ctl_buf_sharp.GetStride() == sizeof(CopyShaderControl));
     const auto ctl_buf = reinterpret_cast<const CopyShaderControl*>(ctl_buf_sharp.base_address);
 
-    static std::vector<vk::BufferCopy> copies;
-    copies.clear();
+    std::vector<vk::BufferCopy> copies;
     copies.reserve(cs_program.dim_x);
 
     for (u32 i = 0; i < cs_program.dim_x; i++) {
@@ -45,19 +48,13 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
-    scheduler.EndRendering();
+    recorder.EndRendering();
 
-    static constexpr vk::MemoryBarrier READ_BARRIER{
-        .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
-        .dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
-    };
-    static constexpr vk::MemoryBarrier WRITE_BARRIER{
-        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-        .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-    };
-    scheduler.CommandBuffer().pipelineBarrier(
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
-        vk::DependencyFlagBits::eByRegion, READ_BARRIER, {}, {});
+    recorder.RecordMemoryBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                 vk::PipelineStageFlagBits::eTransfer,
+                                 vk::AccessFlagBits::eMemoryWrite,
+                                 vk::AccessFlagBits::eTransferRead |
+                                     vk::AccessFlagBits::eTransferWrite);
 
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
     u32 batch_start = 0;
@@ -109,22 +106,25 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
-        scheduler.CommandBuffer().copyBuffer(src_buf->Handle(), dst_buf->Handle(), vk_copies);
+        recorder.RecordBufferCopies(src_buf->Handle(), dst_buf->Handle(), vk_copies);
         batch_start = batch_end;
     }
 
-    scheduler.CommandBuffer().pipelineBarrier(
-        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
-        vk::DependencyFlagBits::eByRegion, WRITE_BARRIER, {}, {});
+    recorder.RecordMemoryBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                 vk::PipelineStageFlagBits::eAllCommands,
+                                 vk::AccessFlagBits::eTransferWrite,
+                                 vk::AccessFlagBits::eMemoryRead |
+                                     vk::AccessFlagBits::eMemoryWrite);
 
     return true;
 }
 
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+bool ExecuteShaderHLE(const Shader::Info& info, const Shader::ShaderInvocationData& invocation,
+                      const AmdGpu::ComputeProgram& cs_program,
+                      const ShaderHleServices& services) {
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
-        return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+        return ExecuteCopyShaderHLE(info, invocation, cs_program, services);
     default:
         return false;
     }

@@ -17,20 +17,20 @@
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/image_access_state_store.h"
+#include "video_core/texture_cache/image_use_tracker.h"
 #include "video_core/texture_cache/image_view.h"
-#include "video_core/texture_cache/sampler.h"
-#include "video_core/texture_cache/tile_manager.h"
-
-namespace AmdGpu {
-struct Liverpool;
-}
+#include "video_core/texture_cache/sampler_repository.h"
+#include "video_core/texture_cache/surface_metadata_tracker.h"
+#include "video_core/resources/resource_alias_coordinator.h"
 
 namespace VideoCore {
 
-class BufferCache;
 class PageManager;
+class TileManager;
+class TransferBufferPool;
 
-class TextureCache {
+class TextureCache : public ImageSynchronizer {
     // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
@@ -77,7 +77,9 @@ public:
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                 AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
+                 TransferBufferPool& transfer_buffers,
+                 ResourceAliasCoordinator& alias_coordinator, TileManager& tile_manager,
+                 PageManager& tracker, ImageAccessStateStore& access_states);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -90,14 +92,25 @@ public:
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
+    bool ClearMetadata(VAddr address) override { return ClearMeta(address); }
+    bool HasImage(VAddr address, u32 size) override {
+        return static_cast<bool>(FindImageFromRange(address, size));
+    }
+    void InvalidateImagesFromGpu(VAddr address, u32 size) override {
+        InvalidateMemoryFromGPU(address, size);
+    }
+    bool SynchronizeBufferFromImage(Buffer& buffer, VAddr address, u32 size) override;
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
-    /// Retrieves the image handle of the image with the provided attributes.
-    [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
+    /// Looks up an exact compatible image without touching cache state.
+    /// Ensures an image with the requested attributes exists.
+    [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false,
+                                    ImageUseTracker* use_tracker = nullptr);
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
@@ -106,7 +119,8 @@ public:
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
-    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
+    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
+                                              u32 num_samples = 0);
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
@@ -115,23 +129,35 @@ public:
     void UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
+        const vk::Image previous_backing = image.GetImage();
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        if (image.GetImage() != previous_backing) {
+            BumpBackingGeneration(image_id);
+        }
+    }
+
+    void BumpBackingGeneration(ImageId image_id) {
+        const u32 generation = alias_coordinator.Images().BumpBackingGeneration(image_id);
+        ASSERT(generation != 0);
+        slot_images[image_id].BindAccessState(access_states, image_id, generation);
     }
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
                                                                ImageId cache_img_id,
-                                                               ImageId merged_image_id);
+                                                               ImageId merged_image_id,
+                                                               ImageUseTracker* use_tracker);
 
     /// Resolves depth overlap and either re-creates the image or returns existing one
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);
 
     /// Creates a new image with provided image info and copies subresources from image_id
-    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id,
+                                      ImageUseTracker* use_tracker);
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
@@ -171,40 +197,22 @@ public:
 
     /// Returns true if the specified address is a metadata surface.
     bool IsMeta(VAddr address) const {
-        return surface_metas.contains(address);
+        return metadata_tracker.Contains(address);
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
     bool IsMetaCleared(VAddr address, u32 slice) const {
-        const auto& it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            return it.value().clear_mask & (1u << slice);
-        }
-        return false;
+        return metadata_tracker.IsCleared(address, slice);
     }
 
     /// Clears all slices of the specified metadata surface.
     bool ClearMeta(VAddr address) {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            it.value().clear_mask = u32(-1);
-            return true;
-        }
-        return false;
+        return metadata_tracker.Clear(address);
     }
 
     /// Updates the state of a slice of the specified metadata surface.
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            if (is_clear) {
-                it.value().clear_mask |= 1u << slice;
-            } else {
-                it.value().clear_mask &= ~(1u << slice);
-            }
-            return true;
-        }
-        return false;
+        return metadata_tracker.Touch(address, slice, is_clear);
     }
 
     /// Runs the garbage collector.
@@ -313,41 +321,27 @@ private:
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
-    AmdGpu::Liverpool* liverpool;
-    BufferCache& buffer_cache;
+    TransferBufferPool& transfer_buffers;
+    ResourceAliasCoordinator& alias_coordinator;
+    ImageAccessStateStore& access_states;
     PageManager& tracker;
     BlitHelper blit_helper;
-    TileManager tile_manager;
+    TileManager& tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
-    tsl::robin_map<u64, Sampler> samplers;
+    SamplerRepository sampler_repository;
+    SurfaceMetadataTracker metadata_tracker;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
-    u64 total_used_samplers = 0;
-    u64 trigger_gc_samplers = 0;
-    u64 pressure_gc_samplers = 0;
-    u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
-    Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
-    std::mutex samplers_mutex;
     std::mutex download_images_mutex;
-    struct MetaDataInfo {
-        enum class Type {
-            CMask,
-            FMask,
-            HTile,
-        };
-        Type type;
-        s32 clear_mask = -1;
-    };
-    tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
 };
 
 } // namespace VideoCore

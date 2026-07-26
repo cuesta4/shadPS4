@@ -152,9 +152,7 @@ public:
             return false;
         }
 
-        const RegionBits& bits = GetRegionBits<type>();
-        RegionBits test(bits, start_page, end_page);
-        return test.Any();
+        return GetRegionBits<type>().Any(start_page, end_page);
     }
 
     LockType lock;

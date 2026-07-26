@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <mutex>
 #include <glslang/Include/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
@@ -141,21 +142,17 @@ EShLanguage ToEshShaderStage(vk::ShaderStageFlagBits stage) {
 }
 
 bool InitializeCompiler() {
-    static bool glslang_initialized = false;
-
-    if (glslang_initialized) {
-        return true;
-    }
-
-    if (!glslang::InitializeProcess()) {
-        LOG_CRITICAL(Render_Vulkan, "Failed to initialize glslang shader compiler");
-        return false;
-    }
-
-    std::atexit([]() { glslang::FinalizeProcess(); });
-
-    glslang_initialized = true;
-    return true;
+    static std::once_flag initialize_once;
+    static bool initialized{};
+    std::call_once(initialize_once, [] {
+        initialized = glslang::InitializeProcess();
+        if (!initialized) {
+            LOG_CRITICAL(Render_Vulkan, "Failed to initialize glslang shader compiler");
+            return;
+        }
+        std::atexit([]() { glslang::FinalizeProcess(); });
+    });
+    return initialized;
 }
 } // Anonymous namespace
 

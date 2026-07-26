@@ -7,10 +7,10 @@
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
-#include "video_core/buffer_cache//region_definitions.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
-namespace Vulkan {
-class Rasterizer;
+namespace VideoCore {
+class GpuMemoryObserver;
 }
 
 namespace VideoCore {
@@ -26,8 +26,11 @@ class PageManager {
     static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
 
 public:
-    explicit PageManager(Vulkan::Rasterizer* rasterizer);
+    explicit PageManager(GpuMemoryObserver* observer);
     ~PageManager();
+
+    /// Stops OS fault callbacks before dependent caches begin destruction.
+    void StopFaultHandling() noexcept;
 
     /// Register a range of mapped gpu memory.
     void OnGpuMap(VAddr address, size_t size);

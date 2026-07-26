@@ -739,14 +739,13 @@ void Translator::V_MBCNT_U32_B32(bool is_low, const GcnInst& inst) {
 }
 
 void Translator::V_ADD_I32(const GcnInst& inst) {
-    // The sum is identical for signed and unsigned components. VCC (or the VOP3 scalar
-    // destination) receives the unsigned carry-out, despite the legacy _I32 mnemonic.
+    // Signed or unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.IAdd(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    SetCarryOut(inst, ir.ILessThan(result, src0, false));
+    // TODO: Carry-out with signed or unsigned components
 }
 
 void Translator::V_SUB_I32(const GcnInst& inst) {

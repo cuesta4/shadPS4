@@ -12,7 +12,6 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
-#include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -28,13 +27,6 @@ using Shader::Stage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
-constexpr static std::array DescriptorHeapSizes = {
-    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
-    vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
-};
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -87,9 +79,10 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
-const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage) {
-    auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(
+    PipelineBuildContext& context, const VideoCore::CapturedGraphicsState* graphics_state,
+    const VideoCore::CapturedComputeState* compute_state, Stage stage, LogicalStage l_stage) {
+    auto& info = context.runtime_infos[u32(l_stage)];
     const auto BuildCommon = [&](const auto& program) {
         info.num_user_data = program.settings.num_user_regs;
         info.num_input_vgprs = program.settings.vgpr_comp_cnt;
@@ -100,12 +93,27 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.fp_round_mode16_64 = program.settings.fp_round_mode64;
     };
     info.Initialize(stage);
+    if (stage == Stage::Compute) {
+        ASSERT(compute_state != nullptr);
+        const auto& cs_pgm = compute_state->program;
+        info.num_user_data = cs_pgm.settings.num_user_regs;
+        info.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
+        info.cs_info.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
+                                       cs_pgm.num_thread_z.full};
+        info.cs_info.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
+                                    cs_pgm.IsTgidEnabled(2)};
+        info.cs_info.shared_memory_size = cs_pgm.SharedMemSize();
+        return info;
+    }
+    ASSERT(graphics_state != nullptr);
+    const auto& regs = graphics_state->pipeline;
     switch (stage) {
     case Stage::Local: {
         BuildCommon(regs.ls_program);
         Shader::TessellationDataConstantBuffer tess_constants{};
-        const auto* hull_info = infos[u32(Shader::LogicalStage::TessellationControl)];
-        hull_info->ReadTessConstantBuffer(tess_constants);
+        const auto* hull_info = context.infos[u32(Shader::LogicalStage::TessellationControl)];
+        context.invocations[u32(Shader::LogicalStage::TessellationControl)]
+            .ReadTessConstantBuffer(*hull_info, tess_constants);
         info.ls_info.ls_stride = tess_constants.ls_stride;
         break;
     }
@@ -131,8 +139,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     }
     case Stage::Vertex: {
         BuildCommon(regs.vs_program);
-        info.vs_info.step_rate_0 = regs.vgt_instance_step_rate_0;
-        info.vs_info.step_rate_1 = regs.vgt_instance_step_rate_1;
+        info.vs_info.step_rate_0 = graphics_state->draw.vgt_instance_step_rate_0;
+        info.vs_info.step_rate_1 = graphics_state->draw.vgt_instance_step_rate_1;
         info.vs_info.num_outputs = MapOutputs(info.vs_info.outputs, regs.vs_output_control);
         info.vs_info.emulate_depth_negative_one_to_one =
             !instance.IsDepthClipControlSupported() &&
@@ -220,23 +228,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
             };
         }
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-            info.fs_info.color_buffers[i] = graphics_key.color_buffers[i];
+            info.fs_info.color_buffers[i] = context.graphics_key.color_buffers[i];
         }
         info.fs_info.clip_distance_emulation =
             regs.vs_output_control.clip_distance_enable &&
             !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Local)) &&
             profile.needs_clip_distance_emulation;
-        break;
-    }
-    case Stage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
-        info.num_user_data = cs_pgm.settings.num_user_regs;
-        info.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
-        info.cs_info.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
-                                       cs_pgm.num_thread_z.full};
-        info.cs_info.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
-                                    cs_pgm.IsTgidEnabled(2)};
-        info.cs_info.shared_memory_size = cs_pgm.SharedMemSize();
         break;
     }
     default:
@@ -245,10 +242,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     return info;
 }
 
-PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_)
+    : instance{instance_}, scheduler{scheduler_} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
@@ -316,71 +311,82 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    if (!RefreshGraphicsKey()) {
-        return nullptr;
+GraphicsPipelineLookup PipelineCache::GetGraphicsPipeline(
+    const VideoCore::CapturedGraphicsState& state) {
+    PipelineBuildContext context{};
+    if (!RefreshGraphicsKey(context, state)) {
+        return {};
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto [it, is_new] = graphics_pipelines.try_emplace(context.graphics_key);
     if (is_new) {
-        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(context.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            instance, profile, context.graphics_key, *pipeline_cache, context.infos,
+            context.invocations, context.runtime_infos, context.fetch_shader, context.modules,
+            sdata, false);
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+        RegisterPipelineData(context.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (infos[stage]) {
-                    auto& m = modules[stage];
-                    module_related_pipelines[m].emplace_back(graphics_key);
+                if (context.infos[stage]) {
+                    auto& m = context.modules[stage];
+                    module_related_pipelines[m].emplace_back(context.graphics_key);
                 }
             }
         }
-        fetch_shader.reset();
     }
-    return it->second.get();
+    return {it->second.get(), std::move(context.invocations)};
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
-    if (!RefreshComputeKey()) {
-        return nullptr;
+ComputePipelineLookup PipelineCache::GetComputePipeline(
+    const VideoCore::CapturedComputeState& state) {
+    PipelineBuildContext context{};
+    if (!RefreshComputeKey(context, state)) {
+        return {};
     }
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    const auto [it, is_new] = compute_pipelines.try_emplace(context.compute_key);
     if (is_new) {
-        const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+        const auto pipeline_hash = std::hash<ComputePipelineKey>{}(context.compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
-        RegisterPipelineData(compute_key, sdata);
+        const auto compute_index = u32(Shader::LogicalStage::Compute);
+        it.value() = std::make_unique<ComputePipeline>(
+            instance, profile, *pipeline_cache, context.compute_key,
+            *context.infos[compute_index], context.invocations[compute_index],
+            context.modules[compute_index], sdata, false);
+        RegisterPipelineData(context.compute_key, sdata);
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
-            auto& m = modules[0];
-            module_related_pipelines[m].emplace_back(compute_key);
+            auto& m = context.modules[compute_index];
+            module_related_pipelines[m].emplace_back(context.compute_key);
         }
     }
-    return it->second.get();
+    return {it->second.get(),
+            std::move(context.invocations[u32(Shader::LogicalStage::Compute)])};
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
-    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
-    auto& key = graphics_key;
+bool PipelineCache::RefreshGraphicsKey(PipelineBuildContext& context,
+                                       const VideoCore::CapturedGraphicsState& state) {
+    std::memset(&context.graphics_key, 0, sizeof(GraphicsPipelineKey));
+    const auto& regs = state.pipeline;
+    const auto& attachments = state.attachments;
+    auto& key = context.graphics_key;
 
-    const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
+    const bool db_enabled =
+        attachments.depth_buffer.DepthValid() || attachments.depth_buffer.StencilValid();
 
-    key.z_format = regs.depth_buffer.DepthValid() ? regs.depth_buffer.z_info.format
-                                                  : AmdGpu::DepthBuffer::ZFormat::Invalid;
-    key.stencil_format = regs.depth_buffer.StencilValid()
-                             ? regs.depth_buffer.stencil_info.format
+    key.z_format = attachments.depth_buffer.DepthValid()
+                       ? attachments.depth_buffer.z_info.format
+                       : AmdGpu::DepthBuffer::ZFormat::Invalid;
+    key.stencil_format = attachments.depth_buffer.StencilValid()
+                             ? attachments.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
@@ -391,7 +397,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
     key.logic_op = regs.color_control.rop3;
-    key.depth_samples = db_enabled ? regs.depth_buffer.NumSamples() : 1;
+    key.depth_samples = db_enabled ? attachments.depth_buffer.NumSamples() : 1;
     key.num_samples = key.depth_samples;
     key.cb_shader_mask = regs.color_shader_mask;
 
@@ -400,7 +406,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
-        const auto& col_buf = regs.color_buffers[cb];
+        const auto& col_buf = attachments.color_buffers[cb];
         if (!col_buf || !regs.color_target_mask.GetMask(cb)) {
             // No attachment bound or writing to it is disabled.
             continue;
@@ -416,7 +422,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    if (!RefreshGraphicsStages(context, state)) {
         return false;
     }
 
@@ -424,7 +430,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     u8 color_samples = 0;
     bool all_color_samples_same = true;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
-        const auto& col_buf = regs.color_buffers[cb];
+        const auto& col_buf = attachments.color_buffers[cb];
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
         if (!col_buf || !target_mask) {
             continue;
@@ -463,10 +469,11 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
-bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
-    auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+bool PipelineCache::RefreshGraphicsStages(PipelineBuildContext& context,
+                                          const VideoCore::CapturedGraphicsState& state) {
+    const auto& regs = state.pipeline;
+    auto& key = context.graphics_key;
+    context.fetch_shader = std::nullopt;
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
@@ -474,30 +481,30 @@ bool PipelineCache::RefreshGraphicsStages() {
         const auto stage_out_idx = static_cast<u32>(stage_out);
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
-            infos[stage_out_idx] = nullptr;
+            context.infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
             key.stage_hashes[stage_out_idx] = 0;
-            infos[stage_out_idx] = nullptr;
+            context.infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
+        std::tie(context.infos[stage_out_idx], context.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            GetProgram(context, stage_in, stage_out, params, binding, &state, nullptr);
         if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+            context.fetch_shader = fetch_shader_;
         }
         return true;
     };
 
-    infos.fill(nullptr);
-    modules.fill(nullptr);
+    context.infos.fill(nullptr);
+    context.modules.fill(nullptr);
     const auto result = bind_stage(Stage::Fragment, LogicalStage::Fragment);
     if (!result && regs.vs_output_control.clip_distance_enable &&
         profile.needs_clip_distance_emulation) {
@@ -506,7 +513,7 @@ bool PipelineCache::RefreshGraphicsStages() {
                     "Clip distance emulation is ineffective due to absense of fragment shader");
     }
 
-    const auto* fs_info = infos[static_cast<u32>(LogicalStage::Fragment)];
+    const auto* fs_info = context.infos[static_cast<u32>(LogicalStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
@@ -573,13 +580,14 @@ bool PipelineCache::RefreshGraphicsStages() {
         UNREACHABLE_MSG("unhandled stage_en: {}", (u32)regs.stage_enable.raw);
     }
 
-    const auto* vs_info = infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
-    if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
+    const auto* vs_info = context.infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
+    if (vs_info && context.fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : fetch_shader->attributes) {
-            const auto& buffer = attrib.GetSharp(*vs_info);
+        for (const auto& attrib : context.fetch_shader->attributes) {
+            const auto& buffer = attrib.GetSharp(
+                context.invocations[static_cast<u32>(Shader::LogicalStage::Vertex)]);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
@@ -591,12 +599,16 @@ bool PipelineCache::RefreshGraphicsStages() {
     return true;
 }
 
-bool PipelineCache::RefreshComputeKey() {
+bool PipelineCache::RefreshComputeKey(PipelineBuildContext& context,
+                                      const VideoCore::CapturedComputeState& state) {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = state.program;
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
-        GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
+    const auto compute_index = u32(Shader::LogicalStage::Compute);
+    std::tie(context.infos[compute_index], context.modules[compute_index], context.fetch_shader,
+             context.compute_key.value) =
+        GetProgram(context, Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding,
+                   nullptr, &state);
     return true;
 }
 
@@ -633,43 +645,50 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
-PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
-                                                const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+PipelineCache::Result PipelineCache::GetProgram(
+    PipelineBuildContext& context, Stage stage, LogicalStage l_stage,
+    const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
+    const VideoCore::CapturedGraphicsState* graphics_state,
+    const VideoCore::CapturedComputeState* compute_state) {
+    auto runtime_info =
+        BuildRuntimeInfo(context, graphics_state, compute_state, stage, l_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
-        auto& program = it_pgm.value();
-        auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+    const u32 invocation_index = static_cast<u32>(l_stage);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+    if (new_program) {
+        Shader::Info compile_info(stage, l_stage, params);
+        const auto start_bindings = binding;
+        const auto module = CompileModule(compile_info, runtime_info, params.code, 0, binding);
+        auto invocation = Shader::ShaderInvocationData::FromCompilerInfo(compile_info);
+        const auto perm_hash = HashCombine(params.hash, 0);
+        auto spec = Shader::StageSpecialization(compile_info, invocation, runtime_info, profile,
+                                                start_bindings);
+        RegisterShaderMeta(compile_info, spec.fetch_shader_data, spec, perm_hash, 0);
+        compile_info.ClearInvocationState();
+
+        it_pgm.value() = std::make_unique<Program>(std::move(compile_info));
+        auto& program = it_pgm.value();
+        spec.info = &program->Metadata();
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        context.invocations[invocation_index] = std::move(invocation);
+        return std::make_tuple(&program->Metadata(), module,
+                               program->modules[0].spec.fetch_shader_data, perm_hash);
     }
 
     auto& program = it_pgm.value();
-    auto& info = program->info;
-    info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    const auto& info = program->Metadata();
+    auto invocation = Shader::ShaderInvocationData::FromParams(info, params);
+    auto spec = Shader::StageSpecialization(info, invocation, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
-
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
-        auto new_info = Shader::Info(stage, l_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        Shader::Info compile_info(stage, l_stage, params);
+        module = CompileModule(compile_info, runtime_info, params.code, perm_idx, binding);
+        RegisterShaderMeta(compile_info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
     } else {
         info.AddBindings(binding);
@@ -677,7 +696,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    return std::make_tuple(&program->info, module,
+
+    context.invocations[invocation_index] = std::move(invocation);
+    return std::make_tuple(&program->Metadata(), module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
 }
 

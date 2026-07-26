@@ -207,6 +207,31 @@ public:
         return !None();
     }
 
+    inline constexpr bool Any(size_t start, size_t end) const {
+        if (start >= end || end > N) {
+            return false;
+        }
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const size_t start_bit = start % BITS_PER_WORD;
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << start_bit) - 1);
+        const u64 end_mask =
+            end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            return (data[first_word] & start_mask & end_mask) != 0;
+        }
+        if ((data[first_word] & start_mask) != 0 || (data[last_word] & end_mask) != 0) {
+            return true;
+        }
+        for (size_t word = first_word + 1; word < last_word; ++word) {
+            if (data[word] != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     Range FirstRangeFrom(size_t start) const {
         if (start >= N) {
             return {N, N};

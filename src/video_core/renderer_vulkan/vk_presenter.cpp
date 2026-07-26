@@ -17,6 +17,7 @@
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
+#include "video_core/amdgpu/gpu_thread_dispatcher.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -493,14 +494,19 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
     }
 }
 
-Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
-    : window{window_}, liverpool{liverpool_},
+Presenter::Presenter(Frontend::WindowSDL& window_,
+                     AmdGpu::GpuThreadDispatcher* gpu_dispatcher,
+                     VideoCore::GpuCommandSinkBinder* command_sink_binder_)
+    : window{window_}, command_sink_binder{command_sink_binder_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
       draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
       swapchain{instance, window},
-      rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
+      rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, gpu_dispatcher)},
       texture_cache{rasterizer->GetTextureCache()} {
+    if (!EmulatorSettings.IsNullGPU()) {
+        command_sink_binder->BindCommandSink(rasterizer.get());
+    }
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -530,6 +536,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    if (!EmulatorSettings.IsNullGPU()) {
+        command_sink_binder->BindCommandSink(nullptr);
+    }
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();

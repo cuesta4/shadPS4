@@ -85,6 +85,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/spirv_emit_context.h
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/format.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/invocation.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/decode.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/decode.h
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/fetch_shader.cpp
@@ -129,6 +130,9 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.h
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/resource.h
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/execution/graphics_operation_classifier.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/execution/resource_hazard_planner.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/image_access_state_store.cpp
 
     # Minimal common support
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
@@ -153,6 +157,10 @@ set(GCN_TEST_SOURCES
 
     # Tests
     gcn/test_gcn_instructions.cpp
+    gcn/test_gpu_refactor_layout.cpp
+    gcn/test_gpu_layout_probes.cpp
+    video_core/test_gpu_refactor_contracts.cpp
+    video_core/test_interleaving.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})

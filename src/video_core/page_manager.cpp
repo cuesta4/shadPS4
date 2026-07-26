@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -10,7 +11,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/gpu_memory_observer.h"
 
 #ifndef _WIN64
 #include <sys/mman.h>
@@ -21,6 +22,7 @@
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include "common/error.h"
 #endif
 #else
@@ -87,10 +89,11 @@ struct PageManager::Impl {
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
-    inline static Vulkan::Rasterizer* rasterizer;
+    inline static std::atomic<GpuMemoryObserver*> observer{};
 #ifdef ENABLE_USERFAULTFD
-    Impl(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
+    Impl(GpuMemoryObserver* observer_) {
+        GpuMemoryObserver* expected{};
+        ASSERT(observer.compare_exchange_strong(expected, observer_));
         uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
         ASSERT_MSG(uffd != -1, "{}", Common::GetLastErrorMsg());
 
@@ -103,6 +106,26 @@ struct PageManager::Impl {
 
         // Create uffd handler thread
         ufd_thread = std::jthread([&](std::stop_token token) { UffdHandler(token); });
+    }
+
+    ~Impl() {
+        Deactivate();
+    }
+
+    void Deactivate() noexcept {
+        if (!active) {
+            return;
+        }
+        active = false;
+        ufd_thread.request_stop();
+        if (uffd >= 0) {
+            close(uffd);
+            uffd = -1;
+        }
+        if (ufd_thread.joinable()) {
+            ufd_thread.join();
+        }
+        observer.store(nullptr, std::memory_order_release);
     }
 
     void OnMap(VAddr address, size_t size) {
@@ -166,7 +189,7 @@ struct PageManager::Impl {
             uffd_msg msg;
             const int readret = read(uffd, &msg, sizeof(msg));
             ASSERT_MSG(readret != -1 || errno == EAGAIN, "Unexpected result of uffd read");
-            if (errno == EAGAIN) {
+            if (readret == -1 && errno == EAGAIN) {
                 continue;
             }
             ASSERT_MSG(readret == sizeof(msg), "Unexpected short read, exiting");
@@ -174,20 +197,37 @@ struct PageManager::Impl {
 
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
-            rasterizer->InvalidateMemory(addr, 1);
+            if (auto* current = observer.load(std::memory_order_acquire)) {
+                current->InvalidateMemory(addr, 1);
+            }
         }
     }
 
     std::jthread ufd_thread;
     int uffd;
+    bool active{true};
 #else
-    Impl(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
+    Impl(GpuMemoryObserver* observer_) {
+        GpuMemoryObserver* expected{};
+        ASSERT(observer.compare_exchange_strong(expected, observer_));
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
+    }
+
+    ~Impl() {
+        Deactivate();
+    }
+
+    void Deactivate() noexcept {
+        if (!active) {
+            return;
+        }
+        active = false;
+        Core::Signals::Instance()->UnregisterAccessViolationHandler(GuestFaultSignalHandler);
+        observer.store(nullptr, std::memory_order_release);
     }
 
     void OnMap(VAddr address, size_t size) {
@@ -208,14 +248,18 @@ struct PageManager::Impl {
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        auto* current = observer.load(std::memory_order_acquire);
+        if (!current) {
+            return false;
+        }
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
+            return current->InvalidateMemory(addr, 8);
         } else {
-            return rasterizer->ReadMemory(addr, 8);
+            return current->ReadMemory(addr, 8);
         }
-        return false;
     }
+    bool active{true};
 #endif
 
     template <bool track, bool is_read>
@@ -248,7 +292,8 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
-        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+        auto* current = observer.load(std::memory_order_acquire);
+        if (!current || !current->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
@@ -364,10 +409,14 @@ struct PageManager::Impl {
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
 };
 
-PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
-    : impl{std::make_unique<Impl>(rasterizer_)} {}
+PageManager::PageManager(GpuMemoryObserver* observer_)
+    : impl{std::make_unique<Impl>(observer_)} {}
 
 PageManager::~PageManager() = default;
+
+void PageManager::StopFaultHandling() noexcept {
+    impl->Deactivate();
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

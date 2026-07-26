@@ -27,6 +27,8 @@ namespace Common::Log {
 extern bool g_should_append;
 extern std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS;
 
+[[nodiscard]] const std::shared_ptr<spdlog::logger>& GetLogger(std::string_view log_class);
+
 void Setup(std::string_view shadps4_filename);
 
 void Switch(std::string_view game_filename);
@@ -40,6 +42,7 @@ void Terminate();
 void UpdateSinks();
 
 void UpdateLogLevels(std::string_view log_filter);
+void UpdateLogFlushLevel(std::string_view log_flush_level);
 
 static constexpr std::array level_string_views{"Trace", "Debug",    "Info", "Warning",
                                                "Error", "Critical", "Off"};
@@ -52,7 +55,8 @@ static constexpr std::array level_string_views{"Trace", "Debug",    "Info", "War
 // Define the fmt lib macros
 #define LOG_GENERIC(log_class, log_level, format, ...)                                             \
     do {                                                                                           \
-        if (auto logger = Common::Log::ALL_LOGGERS[log_class]) {                                   \
+        static const auto& logger = Common::Log::GetLogger(log_class);                              \
+        if (logger && logger->should_log(log_level)) {                                              \
             logger->log(log_level, "[{}] <{}> ({}) {}:{} {}: " format, log_class,                  \
                         Common::Log::to_string_view(log_level), Common::GetCurrentThreadName(),    \
                         spdlog::source_loc::basename(__FILE__), __LINE__,                          \

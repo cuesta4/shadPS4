@@ -10,12 +10,13 @@
 
 namespace Vulkan {
 
-ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
-                                 DescriptorHeap& desc_heap, const Shader::Profile& profile,
+ComputePipeline::ComputePipeline(const Instance& instance, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
-                                 const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
+                                 const Shader::Info& info_,
+                                 const Shader::ShaderInvocationData& invocation,
+                                 vk::ShaderModule module, SerializationSupport& sdata,
+                                 bool preloading /*=false*/)
+    : Pipeline{instance, profile, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::LogicalStage::Compute)];
     info = &info_;
@@ -38,7 +39,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
         // interested only in "is storage" flag (which is not even effective atm), we can take a
         // shortcut there.
-        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
+        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(invocation);
         bindings.push_back({
             .binding = binding++,
             .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
@@ -48,7 +49,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
     for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+        const u32 num_bindings = image.NumBindings(invocation);
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

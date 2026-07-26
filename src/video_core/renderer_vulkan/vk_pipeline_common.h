@@ -3,11 +3,15 @@
 
 #pragma once
 
+#include <array>
+#include <span>
+#include <string>
+#include <vector>
+
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
-
-#include <boost/container/small_vector.hpp>
+#include "video_core/renderer_vulkan/preparation/descriptor_plan.h"
 
 namespace Shader {
 struct Info;
@@ -22,13 +26,10 @@ static constexpr auto AllGraphicsStageBits =
     vk::ShaderStageFlagBits::eFragment;
 
 class Instance;
-class Scheduler;
-class DescriptorHeap;
 
 class Pipeline {
 public:
-    Pipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-             const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+    Pipeline(const Instance& instance, const Shader::Profile& profile,
              bool is_compute = false);
     virtual ~Pipeline();
 
@@ -57,18 +58,21 @@ public:
         return is_compute;
     }
 
-    using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
+    using DescriptorWrites = DescriptorWritePlan;
+    using BufferBarriers = std::vector<vk::BufferMemoryBarrier2>;
 
-    void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
-                       const Shader::PushData& push_data) const;
+    vk::DescriptorSetLayout GetDescriptorSetLayout() const noexcept {
+        return *desc_layout;
+    }
+
+    bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
     const Instance& instance;
-    Scheduler& scheduler;
-    DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
     vk::UniquePipelineLayout pipeline_layout;

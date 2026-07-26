@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -14,8 +15,8 @@
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
 
-namespace Vulkan {
-class Rasterizer;
+namespace VideoCore {
+class GpuMemoryObserver;
 }
 
 namespace Libraries::Kernel {
@@ -167,8 +168,8 @@ public:
     explicit MemoryManager();
     ~MemoryManager();
 
-    void SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
+    void SetGpuMemoryObserver(VideoCore::GpuMemoryObserver* observer_) {
+        gpu_memory_observer = observer_;
     }
 
     AddressSpace& GetAddressSpace() {
@@ -341,7 +342,7 @@ private:
     u64 flexible_usage{};
     u64 pool_budget{};
     s32 sdk_version{};
-    Vulkan::Rasterizer* rasterizer{};
+    VideoCore::GpuMemoryObserver* gpu_memory_observer{};
 
     struct PrtArea {
         VAddr start;

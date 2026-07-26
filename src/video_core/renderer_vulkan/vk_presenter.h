@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/gpu_commands/command_sink.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Frontend {
@@ -19,7 +20,7 @@ class WindowSDL;
 }
 
 namespace AmdGpu {
-struct Liverpool;
+class GpuThreadDispatcher;
 }
 
 namespace Vulkan {
@@ -49,7 +50,8 @@ class Rasterizer;
 
 class Presenter {
 public:
-    Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
+    Presenter(Frontend::WindowSDL& window, AmdGpu::GpuThreadDispatcher* gpu_dispatcher,
+              VideoCore::GpuCommandSinkBinder* command_sink_binder);
     ~Presenter();
 
     HostPasses::PostProcessingPass::Settings& GetPPSettingsRef() {
@@ -113,12 +115,12 @@ private:
     u32 expected_frame_height{1080};
 
     Frontend::WindowSDL& window;
+    VideoCore::GpuCommandSinkBinder* command_sink_binder;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
-    AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
     Scheduler flip_scheduler;

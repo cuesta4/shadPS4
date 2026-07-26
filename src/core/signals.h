@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <set>
 #include <signal.h>
 #include "common/singleton.h"
@@ -31,6 +32,11 @@ public:
     /// Registers a handler for memory access violation signals.
     void RegisterAccessViolationHandler(const AccessViolationHandler& handler, u32 priority) {
         access_violation_handlers.emplace(handler, priority);
+    }
+
+    void UnregisterAccessViolationHandler(const AccessViolationHandler& handler) {
+        std::erase_if(access_violation_handlers,
+                      [&](const auto& entry) { return entry.handler == handler; });
     }
 
     /// Registers a handler for illegal instruction signals.

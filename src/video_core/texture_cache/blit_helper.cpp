@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/execution/resource_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -99,7 +100,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     state.depth_stencil_attachment.depth_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = color_view,
@@ -113,8 +113,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
-                                texture_write);
+    Vulkan::ResourceCommandRecorder::PushDescriptorSet(
+        scheduler, vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
+        texture_write);
 
     const MsPipelineKey key{num_samples, dst_pixel_format, false};
     auto it = std::ranges::find(color_to_ms_depth_pl, key, &MsPipeline::first);
@@ -122,7 +123,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         CreateColorToMSDepthPipeline(key);
         it = --color_to_ms_depth_pl.end();
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    Vulkan::ResourceCommandRecorder::BindPipeline(
+        scheduler, vk::PipelineBindPoint::eGraphics, *it->second);
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -132,15 +134,15 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .minDepth = 0.f,
         .maxDepth = 1.f,
     };
-    cmdbuf.setViewportWithCount(viewport);
+    Vulkan::ResourceCommandRecorder::SetViewports(scheduler, viewport);
 
     const vk::Rect2D scissor = {
         .offset = {0, 0},
         .extent = {state.width, state.height},
     };
-    cmdbuf.setScissorWithCount(scissor);
+    Vulkan::ResourceCommandRecorder::SetScissors(scheduler, scissor);
 
-    cmdbuf.draw(3, 1, 0, 0);
+    Vulkan::ResourceCommandRecorder::Draw(scheduler, 3, 1, 0, 0);
 
     scheduler.EndRendering();
     scheduler.GetDynamicState().Invalidate();
@@ -200,7 +202,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = src_view,
@@ -214,8 +215,9 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
-                                texture_write);
+    Vulkan::ResourceCommandRecorder::PushDescriptorSet(
+        scheduler, vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
+        texture_write);
 
     const MsPipelineKey key{num_samples, pixel_format, src_msaa};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
@@ -223,7 +225,8 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         CreateMsCopyPipeline(key);
         it = --ms_image_copy_pl.end();
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    Vulkan::ResourceCommandRecorder::BindPipeline(
+        scheduler, vk::PipelineBindPoint::eGraphics, *it->second);
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -233,15 +236,15 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .minDepth = 0.f,
         .maxDepth = 1.f,
     };
-    cmdbuf.setViewportWithCount(viewport);
+    Vulkan::ResourceCommandRecorder::SetViewports(scheduler, viewport);
 
     const vk::Rect2D scissor = {
         .offset = {0, 0},
         .extent = {state.width, state.height},
     };
-    cmdbuf.setScissorWithCount(scissor);
+    Vulkan::ResourceCommandRecorder::SetScissors(scheduler, scissor);
 
-    cmdbuf.draw(3, 1, 0, 0);
+    Vulkan::ResourceCommandRecorder::Draw(scheduler, 3, 1, 0, 0);
 
     scheduler.EndRendering();
     scheduler.GetDynamicState().Invalidate();

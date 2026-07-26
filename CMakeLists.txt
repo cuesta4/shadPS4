@@ -950,8 +950,11 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/recompiler.h
                       src/shader_recompiler/resource.h
                       src/shader_recompiler/info.h
+                      src/shader_recompiler/invocation.cpp
+                      src/shader_recompiler/invocation.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
+                      src/shader_recompiler/shader_program_analysis.h
                       src/shader_recompiler/specialization.h
                       src/shader_recompiler/backend/bindings.h
                       src/shader_recompiler/backend/spirv/emit_spirv.cpp
@@ -1048,6 +1051,12 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 )
 
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+               src/video_core/amdgpu/gpu_queue.h
+               src/video_core/amdgpu/gpu_command_processor.cpp
+               src/video_core/amdgpu/gpu_command_processor.h
+               src/video_core/amdgpu/gpu_state_slices.h
+               src/video_core/amdgpu/gpu_task.h
+               src/video_core/amdgpu/gpu_thread_dispatcher.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp
@@ -1063,24 +1072,59 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/regs_texture.h
                src/video_core/amdgpu/regs_vertex.h
                src/video_core/amdgpu/resource.h
+               src/video_core/amdgpu/register_file.h
                src/video_core/amdgpu/tiling.cpp
                src/video_core/amdgpu/tiling.h
                src/video_core/buffer_cache/buffer.cpp
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
                src/video_core/buffer_cache/buffer_cache.h
+               src/video_core/buffer_cache/buffer_access_state_store.h
+               src/video_core/buffer_cache/buffer_registry.h
                src/video_core/buffer_cache/fault_manager.cpp
                src/video_core/buffer_cache/fault_manager.h
                src/video_core/buffer_cache/memory_tracker.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/gpu_commands/captured_state.h
+               src/video_core/gpu_commands/command_sink.h
+               src/video_core/gpu_commands/commands.h
+               src/video_core/gpu_memory_observer.h
+               src/video_core/memory/gpu_memory_coordinator.cpp
+               src/video_core/memory/gpu_memory_coordinator.h
+               src/video_core/memory/mapped_range_registry.cpp
+               src/video_core/memory/mapped_range_registry.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
+               src/video_core/renderer_vulkan/execution/graphics_operation_classifier.cpp
+               src/video_core/renderer_vulkan/execution/graphics_operation_classifier.h
+               src/video_core/renderer_vulkan/execution/dynamic_state_emitter.cpp
+               src/video_core/renderer_vulkan/execution/dynamic_state_emitter.h
+               src/video_core/renderer_vulkan/execution/ordered_resource_committer.cpp
+               src/video_core/renderer_vulkan/execution/ordered_resource_committer.h
+               src/video_core/renderer_vulkan/execution/rendering_scope_controller.h
+               src/video_core/renderer_vulkan/execution/resource_command_recorder.h
+               src/video_core/renderer_vulkan/execution/resource_hazard_planner.cpp
+               src/video_core/renderer_vulkan/execution/resource_hazard_planner.h
+               src/video_core/renderer_vulkan/preparation/command_preparation_context.h
+               src/video_core/renderer_vulkan/preparation/command_requests.h
+               src/video_core/renderer_vulkan/preparation/compute_request_builder.cpp
+               src/video_core/renderer_vulkan/preparation/compute_request_builder.h
+               src/video_core/renderer_vulkan/preparation/descriptor_plan.h
+               src/video_core/renderer_vulkan/preparation/graphics_request_builder.cpp
+               src/video_core/renderer_vulkan/preparation/graphics_request_builder.h
+               src/video_core/renderer_vulkan/preparation/input_binding_plan.h
+               src/video_core/renderer_vulkan/preparation/input_binding_plan.cpp
+               src/video_core/renderer_vulkan/preparation/resource_access_plan.h
+               src/video_core/renderer_vulkan/vk_command_recorder.cpp
+               src/video_core/renderer_vulkan/vk_command_recorder.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
+               src/video_core/renderer_vulkan/vk_descriptor_binder.cpp
+               src/video_core/renderer_vulkan/vk_descriptor_binder.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
@@ -1113,18 +1157,31 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
                src/video_core/renderer_vulkan/host_passes/pp_pass.h
+               src/video_core/resources/resource_alias_coordinator.cpp
+               src/video_core/resources/resource_alias_coordinator.h
+               src/video_core/resources/resolved_resource_refs.h
+               src/video_core/resources/resource_ids.h
+               src/video_core/resources/transfer_buffer_pool.cpp
+               src/video_core/resources/transfer_buffer_pool.h
                src/video_core/texture_cache/blit_helper.cpp
                src/video_core/texture_cache/blit_helper.h
                src/video_core/texture_cache/host_compatibility.cpp
                src/video_core/texture_cache/host_compatibility.h
                src/video_core/texture_cache/image.cpp
                src/video_core/texture_cache/image.h
+               src/video_core/texture_cache/image_access_state_store.cpp
+               src/video_core/texture_cache/image_access_state_store.h
+               src/video_core/texture_cache/image_registry.h
                src/video_core/texture_cache/image_info.cpp
                src/video_core/texture_cache/image_info.h
                src/video_core/texture_cache/image_view.cpp
                src/video_core/texture_cache/image_view.h
+               src/video_core/texture_cache/image_use_tracker.h
                src/video_core/texture_cache/sampler.cpp
                src/video_core/texture_cache/sampler.h
+               src/video_core/texture_cache/sampler_repository.cpp
+               src/video_core/texture_cache/sampler_repository.h
+               src/video_core/texture_cache/surface_metadata_tracker.h
                src/video_core/texture_cache/texture_cache.cpp
                src/video_core/texture_cache/texture_cache.h
                src/video_core/texture_cache/tile_manager.cpp
