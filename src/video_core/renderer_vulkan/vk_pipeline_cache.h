@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <memory>
+#include <optional>
 #include <variant>
+#include <vector>
+#include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -37,6 +41,16 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
+struct ResolvedStageResources {
+    boost::container::static_vector<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers;
+    boost::container::static_vector<AmdGpu::Image, Shader::NUM_IMAGES> images;
+    boost::container::static_vector<AmdGpu::Sampler, Shader::NUM_SAMPLERS> samplers;
+    boost::container::static_vector<AmdGpu::Image, Shader::NUM_FMASKS> fmasks;
+    boost::container::static_vector<AmdGpu::Buffer, MaxVertexBufferCount> vertex_buffers;
+
+    void Bind(Shader::Info& info) const noexcept;
+};
+
 struct Program {
     struct Module {
         vk::ShaderModule module;
@@ -45,8 +59,23 @@ struct Program {
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
+    struct FetchShaderCacheEntry {
+        const u32* address{};
+        std::vector<u32> code;
+        std::optional<Shader::Gcn::FetchShaderData> parsed;
+        u64 revision{};
+    };
+    static constexpr size_t MaxFetchShaderCacheEntries = 4;
+
     Shader::Info info;
     ModuleList modules{};
+    ResolvedStageResources resolved_resources{};
+    boost::container::small_vector<FetchShaderCacheEntry, MaxFetchShaderCacheEntries>
+        fetch_shader_cache;
+    u64 next_fetch_shader_revision{1};
+    u8 next_fetch_shader_slot{};
+    bool specialization_plan_ready{};
+    bool specialization_plan_cacheable{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -96,6 +125,14 @@ public:
     }
 
 private:
+    struct OptimizationState;
+
+    const GraphicsPipeline* ResolveGraphicsPipelineSlow();
+    Result GetProgramSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
+                          const Shader::ShaderParams& params, Shader::RuntimeInfo runtime_info,
+                          Shader::Backend::Bindings& binding);
+    bool CanReuseGraphicsPipeline() const;
+
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -132,6 +169,7 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    std::unique_ptr<OptimizationState> optimization;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

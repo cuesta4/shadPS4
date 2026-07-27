@@ -2,9 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <string>
+#include <string_view>
 
 namespace Common {
 
-std::string GetCurrentThreadName() { return "shadPS4::Test"; }
+std::string_view GetCurrentThreadNameView() {
+    return "shadPS4::Test";
+}
+
+std::string GetCurrentThreadName() {
+    return std::string{GetCurrentThreadNameView()};
+}
 
 } // namespace Common

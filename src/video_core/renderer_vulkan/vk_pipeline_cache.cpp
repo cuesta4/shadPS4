@@ -1,7 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <optional>
 #include <ranges>
+#include <span>
+#include <type_traits>
+
+#include <boost/container/static_vector.hpp>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -34,6 +45,228 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+};
+
+void ResolvedStageResources::Bind(Shader::Info& info) const noexcept {
+    info.resolved_buffers = std::span<const AmdGpu::Buffer>{buffers.data(), buffers.size()};
+    info.resolved_images = std::span<const AmdGpu::Image>{images.data(), images.size()};
+    info.resolved_samplers = std::span<const AmdGpu::Sampler>{samplers.data(), samplers.size()};
+    info.resolved_fmasks = std::span<const AmdGpu::Image>{fmasks.data(), fmasks.size()};
+    info.resolved_vertex_buffers =
+        std::span<const AmdGpu::Buffer>{vertex_buffers.data(), vertex_buffers.size()};
+}
+
+namespace {
+
+template <typename DescriptorList, typename ResourceList>
+void ResolveResourceList(const DescriptorList& descriptors, ResourceList& resources,
+                         const Shader::Info& info) {
+    resources.resize(descriptors.size(), boost::container::default_init);
+    for (size_t index = 0; index < descriptors.size(); ++index) {
+        resources[index] = descriptors[index].GetSharp(info);
+    }
+}
+
+void ResolveStageResources(Shader::Info& info,
+                           const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader,
+                           ResolvedStageResources& resolved) {
+    ResolveResourceList(info.buffers, resolved.buffers, info);
+    ResolveResourceList(info.images, resolved.images, info);
+    ResolveResourceList(info.samplers, resolved.samplers, info);
+    ResolveResourceList(info.fmasks, resolved.fmasks, info);
+    if (fetch_shader && fetch_shader->has_value()) {
+        ResolveResourceList((*fetch_shader)->attributes, resolved.vertex_buffers, info);
+    } else {
+        resolved.vertex_buffers.clear();
+    }
+    resolved.Bind(info);
+}
+
+template <typename T, std::size_t Capacity>
+[[nodiscard]] bool EqualResourceList(
+    const boost::container::static_vector<T, Capacity>& lhs,
+    const boost::container::static_vector<T, Capacity>& rhs) noexcept {
+    return lhs.size() == rhs.size() &&
+           (lhs.empty() || std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(T)) == 0);
+}
+
+[[nodiscard]] bool EqualResolvedResources(const ResolvedStageResources& lhs,
+                                          const ResolvedStageResources& rhs) noexcept {
+    return EqualResourceList(lhs.buffers, rhs.buffers) &&
+           EqualResourceList(lhs.images, rhs.images) &&
+           EqualResourceList(lhs.samplers, rhs.samplers) &&
+           EqualResourceList(lhs.fmasks, rhs.fmasks) &&
+           EqualResourceList(lhs.vertex_buffers, rhs.vertex_buffers);
+}
+
+bool BuildSpecializationPlan(Program& program) {
+    if (program.specialization_plan_ready) {
+        return program.specialization_plan_cacheable;
+    }
+    program.specialization_plan_ready = true;
+    const auto& info = program.info;
+    program.specialization_plan_cacheable = !info.srt_info.walker_func &&
+                                            info.l_stage != LogicalStage::TessellationControl &&
+                                            info.l_stage != LogicalStage::TessellationEval;
+    const auto valid_range = [](u32 first, u32 dwords) {
+        return first + dwords <= Shader::ShaderParams::NumShaderUserData;
+    };
+    if (program.specialization_plan_cacheable) {
+        for (const auto& resource : info.buffers) {
+            program.specialization_plan_cacheable &=
+                static_cast<bool>(resource.inline_cbuf) ||
+                valid_range(resource.sharp_idx, sizeof(AmdGpu::Buffer) / sizeof(u32));
+        }
+        for (const auto& resource : info.images) {
+            program.specialization_plan_cacheable &=
+                valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32));
+        }
+        for (const auto& resource : info.samplers) {
+            program.specialization_plan_cacheable &=
+                resource.is_inline_sampler ||
+                valid_range(resource.sharp_idx, sizeof(AmdGpu::Sampler) / sizeof(u32));
+        }
+        for (const auto& resource : info.fmasks) {
+            program.specialization_plan_cacheable &=
+                valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32));
+        }
+        if (info.has_fetch_shader) {
+            program.specialization_plan_cacheable &= valid_range(info.fetch_shader_sgpr_base, 2);
+        }
+    }
+    return program.specialization_plan_cacheable;
+}
+
+void RefreshDynamicProgramData(
+    Shader::Info& info, VAddr program_base,
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data) {
+    info.pgm_base = program_base;
+    info.user_data = user_data;
+    info.RefreshFlatBuf();
+}
+
+void RefreshDynamicProgramData(Shader::Info& info, const Shader::ShaderParams& params) {
+    RefreshDynamicProgramData(info, params.Base(), params.user_data);
+}
+
+struct CachedFetchShader {
+    const std::optional<Shader::Gcn::FetchShaderData>* parsed{};
+    u64 revision{};
+
+    [[nodiscard]] bool IsUsable(const Shader::Info& info) const noexcept {
+        return parsed && (!info.has_fetch_shader || parsed->has_value());
+    }
+};
+
+[[nodiscard]] CachedFetchShader GetCachedFetchShader(Program& program) {
+    static const std::optional<Shader::Gcn::FetchShaderData> EmptyFetchShader{};
+    auto& info = program.info;
+    if (!info.has_fetch_shader) {
+        return {.parsed = &EmptyFetchShader, .revision = 0};
+    }
+
+    const u32* code = Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    if (!code) {
+        return {.parsed = &EmptyFetchShader, .revision = 0};
+    }
+
+    for (auto& entry : program.fetch_shader_cache) {
+        if (entry.address != code || !entry.parsed) {
+            continue;
+        }
+        ASSERT(entry.parsed->size % sizeof(u32) == 0);
+        const size_t word_count = entry.parsed->size / sizeof(u32);
+        if (entry.code.size() == word_count &&
+            std::equal(entry.code.begin(), entry.code.end(), code)) {
+            return {.parsed = &entry.parsed, .revision = entry.revision};
+        }
+    }
+
+    auto parsed = Shader::Gcn::ParseFetchShader(info);
+    if (!parsed) {
+        return {.parsed = &EmptyFetchShader, .revision = 0};
+    }
+    ASSERT(parsed->size % sizeof(u32) == 0);
+    const size_t word_count = parsed->size / sizeof(u32);
+
+    u8 slot{};
+    if (program.fetch_shader_cache.size() < Program::MaxFetchShaderCacheEntries) {
+        slot = static_cast<u8>(program.fetch_shader_cache.size());
+        program.fetch_shader_cache.emplace_back();
+    } else {
+        slot = program.next_fetch_shader_slot;
+        program.next_fetch_shader_slot = static_cast<u8>((program.next_fetch_shader_slot + 1) %
+                                                         Program::MaxFetchShaderCacheEntries);
+    }
+
+    auto& entry = program.fetch_shader_cache[slot];
+    entry.address = code;
+    entry.code.assign(code, code + word_count);
+    entry.parsed = std::move(parsed);
+    entry.revision = program.next_fetch_shader_revision++;
+    if (program.next_fetch_shader_revision == 0) {
+        program.next_fetch_shader_revision = 1;
+        program.fetch_shader_cache.clear();
+        return GetCachedFetchShader(program);
+    }
+    return {.parsed = &entry.parsed, .revision = entry.revision};
+}
+
+struct StageRawDependencyKey {
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    u64 fetch_shader_revision{};
+
+    bool operator==(const StageRawDependencyKey&) const noexcept = default;
+};
+
+[[nodiscard]] StageRawDependencyKey MakeRawDependencyKey(
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data,
+    u64 fetch_shader_revision) {
+    StageRawDependencyKey key{};
+    std::ranges::copy(user_data, key.user_data.begin());
+    key.fetch_shader_revision = fetch_shader_revision;
+    return key;
+}
+
+struct GraphicsDependencyKey {
+    u64 fixed_generation{};
+    std::array<StageRawDependencyKey, MaxShaderStages> stage_keys{};
+    std::array<VAddr, MaxShaderStages> stage_bases{};
+    u32 active_mask{};
+
+    bool operator==(const GraphicsDependencyKey&) const noexcept = default;
+};
+
+struct StageOptimizationEntry {
+    bool valid{};
+    Stage stage{};
+    LogicalStage logical_stage{};
+    u64 program_hash{};
+    VAddr program_base{};
+    StageRawDependencyKey raw_dependency{};
+    Shader::RuntimeInfo runtime_info{};
+    Shader::Backend::Bindings start{};
+    PipelineCache::Result result{};
+    ResolvedStageResources resolved{};
+};
+
+constexpr u8 InvalidStageOptimizationSlot = std::numeric_limits<u8>::max();
+
+struct StageOptimizationSet {
+    std::array<StageOptimizationEntry, Program::MaxPermutations> entries{};
+    u8 next{};
+    u8 current{InvalidStageOptimizationSlot};
+};
+
+} // namespace
+
+struct PipelineCache::OptimizationState {
+    GraphicsDependencyKey graphics_dependency{};
+    GraphicsPipelineKey graphics_key{};
+    const GraphicsPipeline* graphics_pipeline{};
+    bool graphics_valid{};
+    bool graphics_cacheable{};
+    std::array<StageOptimizationSet, MaxShaderStages> stage_sets{};
 };
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
@@ -256,7 +489,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
+      optimization{std::make_unique<OptimizationState>()} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -321,6 +555,80 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+    auto& opt = *optimization;
+
+    const auto build_dependency = [&]() -> std::optional<GraphicsDependencyKey> {
+        GraphicsDependencyKey dependency{};
+        dependency.fixed_generation = liverpool->GraphicsPipelineGeneration();
+        for (u32 logical_index = 0; logical_index < MaxShaderStages; ++logical_index) {
+            if (!infos[logical_index]) {
+                continue;
+            }
+            const auto& stage_set = opt.stage_sets[logical_index];
+            if (stage_set.current == InvalidStageOptimizationSlot) {
+                return std::nullopt;
+            }
+            const auto& stage_cache = stage_set.entries[stage_set.current];
+            if (!stage_cache.valid) {
+                return std::nullopt;
+            }
+            const auto* shader_program =
+                liverpool->regs.ProgramForStage(static_cast<u32>(stage_cache.stage));
+            if (!shader_program || !shader_program->Address<u32*>()) {
+                return std::nullopt;
+            }
+            const VAddr program_base = shader_program->Address<VAddr>();
+            const auto program_it = program_cache.find(stage_cache.program_hash);
+            if (program_it == program_cache.end() ||
+                !BuildSpecializationPlan(*program_it.value()) ||
+                program_base != stage_cache.program_base) {
+                return std::nullopt;
+            }
+
+            auto& program = *program_it.value();
+            RefreshDynamicProgramData(program.info, program_base, shader_program->user_data);
+            const auto cached_fetch_shader = GetCachedFetchShader(program);
+            if (!cached_fetch_shader.IsUsable(program.info)) {
+                return std::nullopt;
+            }
+            ResolveStageResources(program.info, cached_fetch_shader.parsed,
+                                  program.resolved_resources);
+            if (!EqualResolvedResources(stage_cache.resolved, program.resolved_resources)) {
+                return std::nullopt;
+            }
+
+            dependency.active_mask |= 1U << logical_index;
+            dependency.stage_bases[logical_index] = program_base;
+            dependency.stage_keys[logical_index] =
+                MakeRawDependencyKey(shader_program->user_data, cached_fetch_shader.revision);
+        }
+        return dependency;
+    };
+
+    if (opt.graphics_valid && opt.graphics_cacheable && opt.graphics_pipeline &&
+        liverpool->GraphicsPipelineGeneration() == opt.graphics_dependency.fixed_generation) {
+        const auto dependency = build_dependency();
+        if (dependency && *dependency == opt.graphics_dependency) {
+            return opt.graphics_pipeline;
+        }
+    }
+
+    const auto* pipeline = ResolveGraphicsPipelineSlow();
+    opt.graphics_pipeline = pipeline;
+    opt.graphics_key = graphics_key;
+    opt.graphics_valid = pipeline != nullptr;
+    opt.graphics_cacheable = pipeline && CanReuseGraphicsPipeline();
+    if (opt.graphics_cacheable) {
+        if (const auto dependency = build_dependency()) {
+            opt.graphics_dependency = *dependency;
+        } else {
+            opt.graphics_cacheable = false;
+        }
+    }
+    return pipeline;
+}
+
+const GraphicsPipeline* PipelineCache::ResolveGraphicsPipelineSlow() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
@@ -348,6 +656,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         fetch_shader.reset();
     }
     return it->second.get();
+}
+
+bool PipelineCache::CanReuseGraphicsPipeline() const {
+    for (const auto* info : infos) {
+        if (!info) {
+            continue;
+        }
+        const auto program_it = program_cache.find(info->pgm_hash);
+        if (program_it == program_cache.end() || !program_it.value()->specialization_plan_ready ||
+            !program_it.value()->specialization_plan_cacheable) {
+            return false;
+        }
+    }
+    return true;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -576,12 +898,15 @@ bool PipelineCache::RefreshGraphicsStages() {
     if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
+        ASSERT_MSG(vs_info->resolved_vertex_buffers.size() == fetch_shader->attributes.size(),
+                   "Resolved vertex buffer count does not match fetch shader attributes: {} != {}",
+                   vs_info->resolved_vertex_buffers.size(), fetch_shader->attributes.size());
         u32 vertex_binding = 0;
         for (const auto& attrib : fetch_shader->attributes) {
-            const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
+            const auto buffer = vs_info->resolved_vertex_buffers[vertex_binding];
             key.vertex_buffer_formats[vertex_binding++] =
                 Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
         }
@@ -635,14 +960,106 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    const auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    auto& opt = *optimization;
+    const u32 stage_index = static_cast<u32>(l_stage);
+    auto& cache_set = opt.stage_sets[stage_index];
+    cache_set.current = InvalidStageOptimizationSlot;
+    const auto start = binding;
+
+    auto program_it = program_cache.find(params.hash);
+    const bool cacheable =
+        program_it != program_cache.end() && BuildSpecializationPlan(*program_it.value());
+
+    std::optional<StageRawDependencyKey> raw_dependency;
+    CachedFetchShader cached_fetch_shader{};
+    if (cacheable) {
+        auto& program = *program_it.value();
+        RefreshDynamicProgramData(program.info, params);
+        cached_fetch_shader = GetCachedFetchShader(program);
+        if (cached_fetch_shader.IsUsable(program.info)) {
+            ResolveStageResources(program.info, cached_fetch_shader.parsed,
+                                  program.resolved_resources);
+            raw_dependency = MakeRawDependencyKey(params.user_data, cached_fetch_shader.revision);
+            for (u8 slot = 0; slot < cache_set.entries.size(); ++slot) {
+                auto& candidate = cache_set.entries[slot];
+                const bool basic_key_matches =
+                    candidate.valid && candidate.stage == stage &&
+                    candidate.logical_stage == l_stage && candidate.program_hash == params.hash &&
+                    candidate.program_base == params.Base() && candidate.start == start &&
+                    candidate.runtime_info == runtime_info;
+                if (basic_key_matches && candidate.raw_dependency == *raw_dependency &&
+                    EqualResolvedResources(candidate.resolved, program.resolved_resources)) {
+                    program.info.AddBindings(binding);
+                    cache_set.current = slot;
+                    return candidate.result;
+                }
+            }
+        }
+    }
+
+    const auto result = GetProgramSlow(stage, l_stage, params, runtime_info, binding);
+    program_it = program_cache.find(params.hash);
+    const bool can_store =
+        program_it != program_cache.end() && BuildSpecializationPlan(*program_it.value());
+    if (!can_store) {
+        return result;
+    }
+
+    auto& program = *program_it.value();
+    RefreshDynamicProgramData(program.info, params);
+    cached_fetch_shader = GetCachedFetchShader(program);
+    if (!cached_fetch_shader.IsUsable(program.info)) {
+        return result;
+    }
+    raw_dependency = MakeRawDependencyKey(params.user_data, cached_fetch_shader.revision);
+
+    u8 target_slot = InvalidStageOptimizationSlot;
+    for (u8 slot = 0; slot < cache_set.entries.size(); ++slot) {
+        if (!cache_set.entries[slot].valid) {
+            target_slot = slot;
+            break;
+        }
+    }
+    if (target_slot == InvalidStageOptimizationSlot) {
+        target_slot = cache_set.next;
+        cache_set.next = static_cast<u8>((cache_set.next + 1) % cache_set.entries.size());
+    }
+
+    auto& target = cache_set.entries[target_slot];
+    target = StageOptimizationEntry{
+        .valid = true,
+        .stage = stage,
+        .logical_stage = l_stage,
+        .program_hash = params.hash,
+        .program_base = params.Base(),
+        .raw_dependency = *raw_dependency,
+        .runtime_info = runtime_info,
+        .start = start,
+        .result = result,
+        .resolved = program.resolved_resources,
+    };
+    program.resolved_resources.Bind(program.info);
+    cache_set.current = target_slot;
+    return result;
+}
+
+PipelineCache::Result PipelineCache::GetProgramSlow(Stage stage, LogicalStage l_stage,
+                                                    const Shader::ShaderParams& params,
+                                                    Shader::RuntimeInfo runtime_info,
+                                                    Shader::Backend::Bindings& binding) {
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
         const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        RefreshDynamicProgramData(program->info, params);
+        const auto cached_fetch_shader = GetCachedFetchShader(*program);
+        ResolveStageResources(program->info, cached_fetch_shader.parsed,
+                              program->resolved_resources);
+        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start,
+                                                cached_fetch_shader.parsed);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -653,10 +1070,11 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
     auto& program = it_pgm.value();
     auto& info = program->info;
-    info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    RefreshDynamicProgramData(info, params);
+    const auto cached_fetch_shader = GetCachedFetchShader(*program);
+    ResolveStageResources(info, cached_fetch_shader.parsed, program->resolved_resources);
+    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding,
+                                            cached_fetch_shader.parsed);
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
@@ -682,6 +1100,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    optimization->graphics_valid = false;
+    optimization->graphics_pipeline = nullptr;
+    for (auto& stage_set : optimization->stage_sets) {
+        stage_set.current = InvalidStageOptimizationSlot;
+        for (auto& entry : stage_set.entries) {
+            entry.valid = false;
+        }
+    }
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

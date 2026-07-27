@@ -114,6 +114,7 @@ private:
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    VertexInputs<Shader::Gcn::VertexAttribute> vertex_input_plan;
 };
 
 struct ClipDistanceShaderKey {

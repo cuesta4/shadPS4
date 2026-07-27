@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -48,6 +50,10 @@ public:
         return cpu_addr;
     }
 
+    [[nodiscard]] bool HasAnyGpuModifiedPages() const noexcept {
+        return gpu_any_modified.load(std::memory_order_acquire);
+    }
+
     static constexpr size_t SanitizeAddress(size_t address) {
         return static_cast<size_t>(std::max<s64>(static_cast<s64>(address), 0LL));
     }
@@ -88,10 +94,20 @@ public:
         }
 
         RegionBits& bits = GetRegionBits<type>();
+        if constexpr (type == Type::GPU && enable) {
+            // Publish the conservative aggregate before mutating the bitset. A lock-free negative
+            // query must never observe a stale false value after an update starts.
+            gpu_any_modified.store(true, std::memory_order_release);
+        }
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
+            if constexpr (type == Type::GPU) {
+                // Clearing may publish false only after the bitset proves that no GPU-dirty page
+                // remains in this manager.
+                gpu_any_modified.store(bits.Any(), std::memory_order_release);
+            }
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
@@ -126,8 +142,11 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                gpu_any_modified.store(bits.Any(), std::memory_order_release);
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                    UpdateProtection<false, true>();
+                }
             }
         }
 
@@ -153,8 +172,7 @@ public:
         }
 
         const RegionBits& bits = GetRegionBits<type>();
-        RegionBits test(bits, start_page, end_page);
-        return test.Any();
+        return bits.AnyInRange(start_page, end_page);
     }
 
     LockType lock;
@@ -188,6 +206,7 @@ private:
     VAddr cpu_addr = 0;
     RegionBits cpu;
     RegionBits gpu;
+    std::atomic_bool gpu_any_modified{false};
     RegionBits writeable;
     RegionBits readable;
 };

@@ -120,6 +120,12 @@ struct Info : InfoPersistent {
     std::vector<u32> flattened_ud_buf;
     PersistentSrtInfo srt_info;
 
+    std::span<const AmdGpu::Buffer> resolved_buffers;
+    std::span<const AmdGpu::Image> resolved_images;
+    std::span<const AmdGpu::Sampler> resolved_samplers;
+    std::span<const AmdGpu::Image> resolved_fmasks;
+    std::span<const AmdGpu::Buffer> resolved_vertex_buffers;
+
     AttributeFlags loads{};
     AttributeFlags stores{};
 

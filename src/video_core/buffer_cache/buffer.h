@@ -7,6 +7,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include "common/incremental_id.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
@@ -116,6 +117,10 @@ public:
         return lru_id;
     }
 
+    u64 Uid() const noexcept {
+        return uid;
+    }
+
     vk::Buffer Handle() const noexcept {
         return buffer;
     }
@@ -158,6 +163,7 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
+    u64 uid = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
@@ -167,6 +173,9 @@ public:
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
     vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+
+private:
+    static Common::IncrementalIdProvider<u64> global_uid;
 };
 
 class StreamBuffer : public Buffer {
@@ -179,6 +188,11 @@ public:
 
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
+
+    /// Returns the ring-buffer generation. It changes whenever allocations wrap to offset zero.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -209,6 +223,7 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
+    u64 generation{1};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

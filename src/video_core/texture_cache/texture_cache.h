@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -99,16 +102,28 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    [[nodiscard]] bool TryReuseImage(ImageId image_id, u64 image_uid, u64 expected_topology_epoch);
+
+    [[nodiscard]] u64 TopologyEpoch() const noexcept {
+        return topology_epoch.load(std::memory_order_relaxed);
+    }
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
+    void PrepareTexture(ImageId image_id, const ImageDesc& desc);
+
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
+    void PrepareRenderTarget(ImageId image_id, const ImageDesc& desc);
+
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the depth target with specified properties
+    void PrepareDepthTarget(ImageId image_id, const ImageDesc& desc);
+
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
@@ -321,6 +336,29 @@ private:
     void GarbageCollectSamplers();
 
 private:
+    struct ExactImageCacheKey {
+        VAddr guest_address{};
+        u32 guest_size{};
+        Extent3D size{};
+        SubresourceExtent resources{};
+        vk::Format pixel_format{vk::Format::eUndefined};
+        AmdGpu::ImageType type{};
+        bool exact_format{};
+
+        bool operator==(const ExactImageCacheKey&) const = default;
+    };
+
+    struct ExactImageCacheEntry {
+        ExactImageCacheKey key{};
+        ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        bool valid{};
+    };
+
+    static constexpr size_t ExactImageCacheSize = 256;
+    static_assert(std::has_single_bit(ExactImageCacheSize));
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
@@ -341,6 +379,8 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    std::atomic<u64> topology_epoch{1};
+    std::array<ExactImageCacheEntry, ExactImageCacheSize> exact_image_cache{};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
