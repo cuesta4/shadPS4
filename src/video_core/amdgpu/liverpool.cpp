@@ -3,6 +3,12 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstring>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
@@ -19,6 +25,112 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+namespace {
+
+struct GraphicsRegisterRange {
+    u32 first;
+    u32 last;
+};
+
+#define GRAPHICS_REG_RANGE(field)                                                                  \
+    GraphicsRegisterRange {                                                                        \
+        static_cast<u32>(offsetof(Regs, field) / sizeof(u32)),                                     \
+            static_cast<u32>((offsetof(Regs, field) + sizeof(((Regs*)nullptr)->field)) /           \
+                             sizeof(u32))                                                          \
+    }
+
+constexpr std::array GraphicsPipelineRegisterRanges = {
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, ps_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, ps_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, vs_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, vs_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, gs_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, gs_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, es_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, es_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, hs_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, hs_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GraphicsRegisterRange{
+        static_cast<u32>(offsetof(Regs, ls_program) / sizeof(u32)),
+        static_cast<u32>((offsetof(Regs, ls_program) + offsetof(ShaderProgram, user_data)) /
+                         sizeof(u32))},
+    GRAPHICS_REG_RANGE(depth_buffer),
+    GRAPHICS_REG_RANGE(depth_render_override),
+    GRAPHICS_REG_RANGE(clipper_control),
+    GRAPHICS_REG_RANGE(polygon_control),
+    GRAPHICS_REG_RANGE(color_control),
+    GRAPHICS_REG_RANGE(color_shader_mask),
+    GRAPHICS_REG_RANGE(color_target_mask),
+    GRAPHICS_REG_RANGE(color_export_format),
+    GRAPHICS_REG_RANGE(color_buffers),
+    GRAPHICS_REG_RANGE(blend_control),
+    GRAPHICS_REG_RANGE(stage_enable),
+    GRAPHICS_REG_RANGE(vs_output_control),
+    GRAPHICS_REG_RANGE(vs_output_config),
+    GRAPHICS_REG_RANGE(shader_pos_format),
+    GRAPHICS_REG_RANGE(vgt_instance_step_rate_0),
+    GRAPHICS_REG_RANGE(vgt_instance_step_rate_1),
+    GRAPHICS_REG_RANGE(vgt_esgs_ring_itemsize),
+    GRAPHICS_REG_RANGE(vgt_gsvs_ring_itemsize),
+    GRAPHICS_REG_RANGE(ls_hs_config),
+    GRAPHICS_REG_RANGE(tess_config),
+    GraphicsRegisterRange{static_cast<u32>(offsetof(Regs, stage_enable) / sizeof(u32) - 7),
+                          static_cast<u32>(offsetof(Regs, stage_enable) / sizeof(u32) - 6)},
+    GRAPHICS_REG_RANGE(vgt_gs_instance_cnt),
+    GRAPHICS_REG_RANGE(vgt_gs_out_prim_type),
+    GRAPHICS_REG_RANGE(vgt_gs_vert_itemsize),
+    GRAPHICS_REG_RANGE(vgt_gs_mode),
+    GRAPHICS_REG_RANGE(vgt_strmout_config),
+    GRAPHICS_REG_RANGE(ps_input_ena),
+    GraphicsRegisterRange{static_cast<u32>(offsetof(Regs, ps_input_addr) / sizeof(u32)),
+                          static_cast<u32>((offsetof(Regs, z_export_format) +
+                                            sizeof(((Regs*)nullptr)->z_export_format)) /
+                                           sizeof(u32))},
+    GRAPHICS_REG_RANGE(depth_shader_control),
+    GRAPHICS_REG_RANGE(ps_inputs),
+    GRAPHICS_REG_RANGE(primitive_type),
+};
+
+#undef GRAPHICS_REG_RANGE
+
+consteval auto BuildGraphicsPipelineRegisterMask() {
+    std::array<u64, (Regs::NumRegs + 63) / 64> mask{};
+    for (const auto& range : GraphicsPipelineRegisterRanges) {
+        for (u32 index = range.first; index < range.last; ++index) {
+            mask[index / 64] |= 1ULL << (index % 64);
+        }
+    }
+    return mask;
+}
+
+constexpr auto GraphicsPipelineRegisterMask = BuildGraphicsPipelineRegisterMask();
+
+[[nodiscard]] bool RegistersDiffer(const u32* lhs, const u32* rhs, u32 word_count) {
+    if (word_count == 1) {
+        return *lhs != *rhs;
+    }
+    if (word_count == 2) {
+        u64 lhs_pair{};
+        u64 rhs_pair{};
+        std::memcpy(&lhs_pair, lhs, sizeof(lhs_pair));
+        std::memcpy(&rhs_pair, rhs, sizeof(rhs_pair));
+        return lhs_pair != rhs_pair;
+    }
+    return std::memcmp(lhs, rhs, static_cast<size_t>(word_count) * sizeof(u32)) != 0;
+}
+
+} // namespace
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -215,6 +327,48 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+void Liverpool::WriteGraphicsRegisters(u32 first_register, const u32* payload, u32 word_count) {
+    ASSERT(first_register <= Regs::NumRegs && word_count <= Regs::NumRegs - first_register);
+    if (word_count == 0) {
+        return;
+    }
+
+    u32* const destination = &regs.reg_array[first_register];
+    const size_t byte_count = static_cast<size_t>(word_count) * sizeof(u32);
+    if (std::memcmp(destination, payload, byte_count) == 0) {
+        return;
+    }
+
+    bool pipeline_state_changed = false;
+    u32 processed = 0;
+    while (processed < word_count && !pipeline_state_changed) {
+        const u32 register_index = first_register + processed;
+        const u32 bit_offset = register_index & 63U;
+        const u32 chunk_size = std::min<u32>(word_count - processed, 64U - bit_offset);
+        u64 relevant = GraphicsPipelineRegisterMask[register_index / 64] >> bit_offset;
+        if (chunk_size != 64) {
+            relevant &= (1ULL << chunk_size) - 1;
+        }
+        while (relevant != 0) {
+            const u32 run_offset = std::countr_zero(relevant);
+            const u32 run_size = std::countr_one(relevant >> run_offset);
+            pipeline_state_changed = RegistersDiffer(destination + processed + run_offset,
+                                                     payload + processed + run_offset, run_size);
+            if (pipeline_state_changed) {
+                break;
+            }
+            const u64 run_mask = run_size == 64 ? ~0ULL : ((1ULL << run_size) - 1) << run_offset;
+            relevant &= ~run_mask;
+        }
+        processed += chunk_size;
+    }
+
+    std::memcpy(destination, payload, byte_count);
+    if (pipeline_state_changed) {
+        ++graphics_pipeline_generation;
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -304,13 +458,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                ++graphics_pipeline_generation;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                WriteGraphicsRegisters(reg_addr, payload, count - 1);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -318,7 +473,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                WriteGraphicsRegisters(reg_addr, payload, count - 1);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -397,19 +552,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
                 } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
+                    WriteGraphicsRegisters(Regs::ShRegWordOffset + set_data->reg_offset,
+                                           reinterpret_cast<const u32*>(header + 2), count - 1);
                 }
                 break;
             }
             case PM4ItOpcode::SetUconfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
+                WriteGraphicsRegisters(Regs::UconfigRegWordOffset + set_data->reg_offset,
+                                       reinterpret_cast<const u32*>(header + 2), count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                if (!warned_set_predication) {
+                    warned_set_predication = true;
+                    LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                }
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -669,7 +827,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
-                LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
+                LOG_TRACE(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {

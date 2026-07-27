@@ -132,6 +132,10 @@ public:
         return mapped_queues[curr_qid].cs_state;
     }
 
+    [[nodiscard]] u64 GraphicsPipelineGeneration() const noexcept {
+        return graphics_pipeline_generation;
+    }
+
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;
@@ -185,6 +189,7 @@ private:
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+    void WriteGraphicsRegisters(u32 first_register, const u32* payload, u32 word_count);
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -201,6 +206,8 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    u64 graphics_pipeline_generation{1};
+    bool warned_set_predication{};
 
     struct ConstantEngine {
         void Reset() {

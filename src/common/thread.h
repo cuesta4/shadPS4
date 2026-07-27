@@ -6,6 +6,9 @@
 #pragma once
 
 #include <chrono>
+#include <string>
+#include <string_view>
+
 #include "common/types.h"
 
 namespace Common {
@@ -48,5 +51,6 @@ public:
 };
 
 std::string GetCurrentThreadName();
+std::string_view GetCurrentThreadNameView();
 
 } // namespace Common

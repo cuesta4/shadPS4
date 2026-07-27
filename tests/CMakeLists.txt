@@ -13,6 +13,16 @@ set(TEST_TARGETS
     shadps4_settings_test
     shadps4_ngs2_test
     shadps4_gcn_test
+    shadps4_common_test
+)
+
+set(COMMON_TEST_SOURCES
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+
+    # Tests
+    common/test_bit_array.cpp
+    common/test_logging.cpp
 )
 
 set(SETTINGS_TEST_SOURCES
@@ -160,6 +170,7 @@ set(GCN_TEST_SOURCES
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+add_executable(shadps4_common_test ${COMMON_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -198,6 +209,11 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
     half::half
+)
+target_link_libraries(shadps4_common_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    spdlog::spdlog
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR

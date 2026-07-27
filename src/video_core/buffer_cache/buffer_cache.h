@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <memory>
+#include <span>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -64,6 +69,26 @@ public:
         bool has_stream_leap = false;
     };
 
+    enum class StreamCopySource : u8 {
+        Guest,
+        Host,
+        Zero,
+    };
+
+    struct StreamCopyRequest {
+        StreamCopySource source_type{};
+        VAddr guest_address{};
+        const u8* host_address{};
+        u32 size{};
+        u64 alignment{1};
+        bool deduplicate{true};
+    };
+
+    struct StreamCopyResult {
+        Buffer* buffer{};
+        u64 offset{};
+    };
+
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          AmdGpu::Liverpool* liverpool, TextureCache& texture_cache,
@@ -109,13 +134,11 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
-    /// Binds host vertex buffers for the current draw.
-    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
-                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    void PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipeline, bool bind_index_buffer,
+                                   u32 index_offset);
 
-    /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset,
-                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    void FinalizeVertexIndexBuffers(
+        boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -127,6 +150,14 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {});
+
+    void BeginStreamCopyBatch() noexcept;
+
+    [[nodiscard]] u16 QueueStreamCopy(const StreamCopyRequest& request);
+
+    void FinalizeStreamCopyBatch();
+
+    [[nodiscard]] const StreamCopyResult& GetStreamCopyResult(u16 index) const;
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
@@ -142,6 +173,14 @@ public:
 
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
+
+    [[nodiscard]] bool IsBufferCacheEntryValid(BufferId id, u64 uid, VAddr address, u64 size) const;
+
+    [[nodiscard]] u64 GetBufferUid(BufferId id) const;
+
+    [[nodiscard]] u64 TopologyEpoch() const noexcept {
+        return topology_epoch.load(std::memory_order_relaxed);
+    }
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -199,6 +238,13 @@ private:
 
     void DeleteBuffer(BufferId buffer_id);
 
+    void ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requests,
+                                std::span<StreamCopyResult> results);
+
+    struct StreamCopyScratch;
+    struct StreamSliceReuseState;
+    struct VertexIndexState;
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
@@ -221,6 +267,16 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    std::atomic<u64> topology_epoch{1};
+
+    static constexpr size_t MaxStreamCopyRequests = 128;
+    std::array<StreamCopyRequest, MaxStreamCopyRequests> stream_copy_requests{};
+    std::array<StreamCopyResult, MaxStreamCopyRequests> stream_copy_results{};
+    u16 stream_copy_request_count{};
+    bool stream_copy_finalized{};
+    std::unique_ptr<StreamCopyScratch> stream_copy_scratch;
+    std::unique_ptr<StreamSliceReuseState> stream_slice_reuse;
+    std::unique_ptr<VertexIndexState> vertex_index_state;
 };
 
 } // namespace VideoCore

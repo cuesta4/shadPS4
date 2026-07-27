@@ -36,7 +36,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    if (scheduler.UpdatePushConstantCache(IsCompute(), *pipeline_layout, &push_data,
+                                          sizeof(push_data))) {
+        cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    }
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -45,6 +48,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        if (bind_point == vk::PipelineBindPoint::eGraphics) {
+            scheduler.NotifyGraphicsPushDescriptorSet();
+        }
         return;
     }
 

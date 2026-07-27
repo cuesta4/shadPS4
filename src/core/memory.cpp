@@ -1,6 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
+#include <immintrin.h>
+#endif
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -14,6 +25,114 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
+
+namespace {
+
+constexpr size_t SparseCopyPlanCacheSize = 64;
+constexpr size_t SparseCopyPlanMaxRuns = 4;
+constexpr size_t NonTemporalCopyThreshold = 8 * 1024;
+static_assert(std::has_single_bit(SparseCopyPlanCacheSize));
+
+struct SparseCopyPlan {
+    const MemoryManager* owner{};
+    VAddr source{};
+    u64 generation{};
+    u32 size{};
+    u8 run_count{};
+    u8 mapped_mask{};
+    bool valid{};
+    std::array<u32, SparseCopyPlanMaxRuns> run_sizes{};
+};
+
+thread_local std::array<SparseCopyPlan, SparseCopyPlanCacheSize> sparse_copy_plan_cache{};
+
+[[nodiscard]] size_t SparseCopyPlanIndex(VAddr source, u64 size) noexcept {
+    u64 value = (source >> 4) ^ (source >> 29) ^ (size * 0x9E3779B185EBCA87ULL);
+    value ^= value >> 32;
+    return static_cast<size_t>(value) & (SparseCopyPlanCacheSize - 1);
+}
+
+[[nodiscard]] bool CopyMappedBytes(const u8* source, u8* destination, size_t size,
+                                   bool allow_non_temporal) noexcept {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
+    if (allow_non_temporal && size >= NonTemporalCopyThreshold && size % 64 == 0 &&
+        (reinterpret_cast<uintptr_t>(destination) & 63U) == 0) {
+        size_t offset = 0;
+        const size_t vector_size = size & ~size_t{31};
+        for (; offset < vector_size; offset += 32) {
+            const __m256i value =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(source + offset));
+            _mm256_stream_si256(reinterpret_cast<__m256i*>(destination + offset), value);
+        }
+        if (offset != size) {
+            std::memcpy(destination + offset, source + offset, size - offset);
+        }
+        return true;
+    }
+
+    if (size <= 256) {
+        size_t offset = 0;
+        for (; offset + 32 <= size; offset += 32) {
+            const __m256i value =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(source + offset));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset), value);
+        }
+        if (offset != size) {
+            std::memcpy(destination + offset, source + offset, size - offset);
+        }
+        return false;
+    }
+#else
+    (void)allow_non_temporal;
+#endif
+    std::memcpy(destination, source, size);
+    return false;
+}
+
+[[nodiscard]] bool ZeroBytes(u8* destination, size_t size, bool allow_non_temporal) noexcept {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
+    const __m256i zero = _mm256_setzero_si256();
+    if (allow_non_temporal && size >= NonTemporalCopyThreshold && size % 64 == 0 &&
+        (reinterpret_cast<uintptr_t>(destination) & 63U) == 0) {
+        size_t offset = 0;
+        const size_t vector_size = size & ~size_t{31};
+        for (; offset < vector_size; offset += 32) {
+            _mm256_stream_si256(reinterpret_cast<__m256i*>(destination + offset), zero);
+        }
+        if (offset != size) {
+            std::memset(destination + offset, 0, size - offset);
+        }
+        return true;
+    }
+
+    if (size <= 256) {
+        size_t offset = 0;
+        for (; offset + 32 <= size; offset += 32) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + offset), zero);
+        }
+        if (offset != size) {
+            std::memset(destination + offset, 0, size - offset);
+        }
+        return false;
+    }
+#else
+    (void)allow_non_temporal;
+#endif
+    std::memset(destination, 0, size);
+    return false;
+}
+
+void FinishNonTemporalCopies(bool used_non_temporal) noexcept {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
+    if (used_non_temporal) {
+        _mm_sfence();
+    }
+#else
+    (void)used_non_temporal;
+#endif
+}
+
+} // namespace
 
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
@@ -132,24 +251,124 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     rasterizer->MapMemory(address, size);
 }
 
-void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
-    std::shared_lock lk{mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+void MemoryManager::CopySparseMemory(VAddr source, u8* destination, u64 size) {
+    const SparseCopyRequest request{
+        .source = source,
+        .destination = destination,
+        .size = size,
+    };
+    CopySparseMemoryBatch(std::span<const SparseCopyRequest>{&request, 1}, size);
+}
 
-    auto vma = FindVMA(virtual_addr);
-    while (size) {
-        u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
-        if (vma->second.IsMapped()) {
-            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
-        } else {
-            std::memset(dest, 0, copy_size);
-        }
-        size -= copy_size;
-        virtual_addr += copy_size;
-        dest += copy_size;
-        ++vma;
+void MemoryManager::CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests,
+                                          u64 total_size) {
+    if (requests.empty()) {
+        return;
     }
+
+    std::shared_lock lk{mutex};
+    bool used_non_temporal = false;
+    const bool allow_non_temporal = total_size >= NonTemporalCopyThreshold;
+
+    const auto copy_reference = [this](VAddr source, u8* destination, u64 size) {
+        auto vma = FindVMA(source);
+        while (size != 0) {
+            const u64 copy_size = std::min<u64>(vma->second.size - (source - vma->first), size);
+            if (vma->second.IsMapped()) {
+                std::memcpy(destination, std::bit_cast<const u8*>(source), copy_size);
+            } else {
+                std::memset(destination, 0, copy_size);
+            }
+            size -= copy_size;
+            source += copy_size;
+            destination += copy_size;
+            ++vma;
+        }
+    };
+
+    const auto build_plan = [this](VAddr source, u64 size, SparseCopyPlan& plan) {
+        if (size > std::numeric_limits<u32>::max()) {
+            return false;
+        }
+
+        plan = {};
+        plan.owner = this;
+        plan.source = source;
+        plan.generation = mapping_generation;
+        plan.size = static_cast<u32>(size);
+        plan.valid = true;
+
+        auto vma = FindVMA(source);
+        u64 remaining = size;
+        while (remaining != 0) {
+            const u64 run_size = std::min<u64>(vma->second.size - (source - vma->first), remaining);
+            const bool mapped = vma->second.IsMapped();
+            if (plan.run_count != 0 &&
+                (((plan.mapped_mask >> (plan.run_count - 1)) & 1U) != 0) == mapped) {
+                const u64 merged_size =
+                    static_cast<u64>(plan.run_sizes[plan.run_count - 1]) + run_size;
+                if (merged_size > std::numeric_limits<u32>::max()) {
+                    return false;
+                }
+                plan.run_sizes[plan.run_count - 1] = static_cast<u32>(merged_size);
+            } else {
+                if (plan.run_count == SparseCopyPlanMaxRuns) {
+                    return false;
+                }
+                plan.run_sizes[plan.run_count] = static_cast<u32>(run_size);
+                if (mapped) {
+                    plan.mapped_mask |= static_cast<u8>(1U << plan.run_count);
+                }
+                ++plan.run_count;
+            }
+            remaining -= run_size;
+            source += run_size;
+            ++vma;
+        }
+        return true;
+    };
+
+    for (const auto& request : requests) {
+        if (request.size == 0) {
+            continue;
+        }
+        ASSERT(request.destination != nullptr);
+        ASSERT_MSG(IsValidMapping(request.source), "Attempted to access invalid address {:#x}",
+                   request.source);
+
+        SparseCopyPlan* plan = nullptr;
+        if (request.size <= std::numeric_limits<u32>::max()) {
+            auto& cached =
+                sparse_copy_plan_cache[SparseCopyPlanIndex(request.source, request.size)];
+            if (cached.valid && cached.owner == this && cached.source == request.source &&
+                cached.size == request.size && cached.generation == mapping_generation) {
+                plan = &cached;
+            } else if (build_plan(request.source, request.size, cached)) {
+                plan = &cached;
+            }
+        }
+
+        if (plan == nullptr) {
+            copy_reference(request.source, request.destination, request.size);
+            continue;
+        }
+
+        VAddr source = request.source;
+        u8* destination = request.destination;
+        for (u32 run_index = 0; run_index < plan->run_count; ++run_index) {
+            const u32 run_size = plan->run_sizes[run_index];
+            if (((plan->mapped_mask >> run_index) & 1U) != 0) {
+                used_non_temporal |= CopyMappedBytes(std::bit_cast<const u8*>(source), destination,
+                                                     run_size, allow_non_temporal);
+            } else {
+                used_non_temporal |= ZeroBytes(destination, run_size, allow_non_temporal);
+            }
+            source += run_size;
+            destination += run_size;
+        }
+    }
+
+    FinishNonTemporalCopies(used_non_temporal);
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
@@ -449,6 +668,7 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
 
     // Merge this VMA with similar nearby areas
     MergeAdjacent(vma_map, new_vma_handle);
+    ++mapping_generation;
 
     lk2.unlock();
     if (IsValidGpuMapping(mapped_addr, size)) {
@@ -496,6 +716,7 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.name = name;
     new_vma.type = type;
     new_vma.phys_areas.clear();
+    ++mapping_generation;
     return new_vma_handle;
 }
 
@@ -878,6 +1099,8 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
         remaining_size -= size_in_vma;
     }
 
+    ++mapping_generation;
+
     // Unmap from address space
     impl.Unmap(virtual_addr, size);
     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
@@ -970,6 +1193,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.disallow_merge = false;
     vma.name = "";
     MergeAdjacent(vma_map, new_it);
+    ++mapping_generation;
 
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
         // Unmap the memory region.

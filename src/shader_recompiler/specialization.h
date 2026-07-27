@@ -94,12 +94,13 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_,
+                        const std::optional<Gcn::FetchShaderData>* fetch_shader_hint = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        fetch_shader_data = Gcn::ParseFetchShader(info_);
+        fetch_shader_data = fetch_shader_hint ? *fetch_shader_hint : Gcn::ParseFetchShader(info_);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
-            ForEachSharp(vs_attribs, fetch_shader_data->attributes,
+            ForEachSharp(vs_attribs, fetch_shader_data->attributes, info_.resolved_vertex_buffers,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
                              if (const auto step_rate = desc.GetStepRate();
@@ -115,7 +116,7 @@ struct StageSpecialization {
                          });
         }
         u32 binding{};
-        ForEachSharp(binding, buffers, info->buffers,
+        ForEachSharp(binding, buffers, info->buffers, info->resolved_buffers,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
                          spec.is_storage = desc.IsStorage(sharp);
@@ -132,7 +133,7 @@ struct StageSpecialization {
                              spec.element_size = sharp.element_size;
                          }
                      });
-        ForEachSharp(binding, images, info->images,
+        ForEachSharp(binding, images, info->images, info->resolved_images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
@@ -144,14 +145,14 @@ struct StageSpecialization {
                              spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
-                         spec.num_bindings = desc.NumBindings(*info);
+                         spec.num_bindings = desc.NumBindings(sharp);
                      });
-        ForEachSharp(binding, fmasks, info->fmasks,
+        ForEachSharp(binding, fmasks, info->fmasks, info->resolved_fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
                          spec.height = sharp.height;
                      });
-        ForEachSharp(samplers, info->samplers,
+        ForEachSharp(samplers, info->samplers, info->resolved_samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
@@ -166,10 +167,12 @@ struct StageSpecialization {
         }
     }
 
-    void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
-        for (const auto& desc : desc_list) {
+    void ForEachSharp(auto& spec_list, auto& desc_list, const auto& resolved_sharps, auto&& func) {
+        const bool use_resolved = resolved_sharps.size() == desc_list.size();
+        for (u32 index = 0; index < desc_list.size(); ++index) {
+            const auto& desc = desc_list[index];
             auto& spec = spec_list.emplace_back();
-            const auto sharp = desc.GetSharp(*info);
+            const auto sharp = use_resolved ? resolved_sharps[index] : desc.GetSharp(*info);
             if (!sharp) {
                 continue;
             }
@@ -177,10 +180,13 @@ struct StageSpecialization {
         }
     }
 
-    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
-        for (const auto& desc : desc_list) {
+    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, const auto& resolved_sharps,
+                      auto&& func) {
+        const bool use_resolved = resolved_sharps.size() == desc_list.size();
+        for (u32 index = 0; index < desc_list.size(); ++index) {
+            const auto& desc = desc_list[index];
             auto& spec = spec_list.emplace_back();
-            const auto sharp = desc.GetSharp(*info);
+            const auto sharp = use_resolved ? resolved_sharps[index] : desc.GetSharp(*info);
             if (!sharp) {
                 binding++;
                 continue;
@@ -195,11 +201,7 @@ struct StageSpecialization {
     }
 
     bool operator==(const StageSpecialization& other) const {
-        if (!Valid()) {
-            return false;
-        }
-
-        if (vs_attribs != other.vs_attribs) {
+        if (!Valid() || !other.Valid()) {
             return false;
         }
 
@@ -207,11 +209,18 @@ struct StageSpecialization {
             return false;
         }
 
-        if (fetch_shader_data != other.fetch_shader_data) {
+        if (vs_attribs.size() != other.vs_attribs.size() ||
+            buffers.size() != other.buffers.size() || images.size() != other.images.size() ||
+            fmasks.size() != other.fmasks.size() || samplers.size() != other.samplers.size()) {
             return false;
         }
 
-        if (fmasks != other.fmasks) {
+        if (bitset != other.bitset) {
+            return false;
+        }
+
+        if (vs_attribs != other.vs_attribs || fetch_shader_data != other.fetch_shader_data ||
+            fmasks != other.fmasks) {
             return false;
         }
 
@@ -219,7 +228,7 @@ struct StageSpecialization {
         // bindings still may change as they depend on previously processed FS. The check below
         // handles this case and prevents generation of redundant permutations. This is also safe
         // for other types of shaders with no bindings.
-        if (bitset.none() && other.bitset.none()) {
+        if (bitset.none()) {
             return true;
         }
 
@@ -227,24 +236,9 @@ struct StageSpecialization {
             return false;
         }
 
-        u32 binding{};
-        for (u32 i = 0; i < buffers.size(); i++) {
-            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
-                return false;
-            }
-        }
-        for (u32 i = 0; i < images.size(); i++) {
-            if (other.bitset[binding++] && images[i] != other.images[i]) {
-                return false;
-            }
-        }
-
-        for (u32 i = 0; i < samplers.size(); i++) {
-            if (samplers[i] != other.samplers[i]) {
-                return false;
-            }
-        }
-        return true;
+        // Inactive entries are value-initialized by ForEachSharp and preserved by serialization,
+        // so the matching bitset makes whole-vector comparison equivalent to skipping them.
+        return buffers == other.buffers && images == other.images && samplers == other.samplers;
     }
 
     void Serialize(Serialization::Archive& ar) const;

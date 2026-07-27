@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <utility>
+
+#include <boost/container/static_vector.hpp>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -22,6 +30,126 @@ static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
+struct BufferCache::StreamCopyScratch {
+    static constexpr size_t HashTableSize = 256;
+    static constexpr u16 NoCanonicalCopy = std::numeric_limits<u16>::max();
+    static_assert(std::has_single_bit(HashTableSize));
+
+    struct CanonicalCopy {
+        StreamCopyRequest request{};
+        u64 relative_offset{};
+    };
+
+    struct RequestMap {
+        u16 canonical{NoCanonicalCopy};
+        u32 source_offset{};
+    };
+
+    struct HashSlot {
+        u16 generation{};
+        u16 canonical{};
+    };
+
+    std::array<CanonicalCopy, MaxStreamCopyRequests> canonical_copies{};
+    std::array<RequestMap, MaxStreamCopyRequests> request_map{};
+    std::array<HashSlot, HashTableSize> hash_table{};
+    std::array<Core::MemoryManager::SparseCopyRequest, MaxStreamCopyRequests> guest_copies{};
+    u16 hash_generation{1};
+};
+
+struct BufferCache::StreamSliceReuseState {
+    static constexpr size_t WayCount = 2;
+    static constexpr size_t SetCount = 64;
+    static constexpr size_t EntryCount = WayCount * SetCount;
+    static_assert(std::has_single_bit(SetCount));
+
+    struct Entry {
+        VAddr address{};
+        u64 generation{};
+        u64 tick{};
+        u32 size{};
+        u32 offset{};
+        bool valid{};
+    };
+
+    struct Set {
+        std::array<Entry, WayCount> ways{};
+        u8 next_replacement{};
+    };
+
+    std::array<Set, SetCount> sets{};
+    std::unique_ptr<u8[]> shadow =
+        std::make_unique_for_overwrite<u8[]>(EntryCount * CACHING_PAGESIZE);
+    std::array<u8, CACHING_PAGESIZE> scratch{};
+
+    [[nodiscard]] u8* Shadow(size_t set_index, size_t way) noexcept {
+        return shadow.get() + (set_index * WayCount + way) * CACHING_PAGESIZE;
+    }
+};
+
+struct BufferCache::VertexIndexState {
+    static constexpr u16 NoStreamCopy = std::numeric_limits<u16>::max();
+
+    struct BufferRange {
+        VAddr base_address{};
+        VAddr end_address{};
+        vk::Buffer vk_buffer{};
+        Buffer* buffer{};
+        u64 offset{};
+        u32 binding_mask{};
+        u32 size{};
+        u16 stream_index{NoStreamCopy};
+        bool was_gpu_modified{};
+
+        [[nodiscard]] size_t GetSize() const {
+            return end_address - base_address;
+        }
+    };
+
+    struct IndexBinding {
+        Buffer* buffer{};
+        VAddr address{};
+        u64 offset{};
+        u32 size{};
+        u16 stream_index{NoStreamCopy};
+        vk::IndexType type{vk::IndexType::eUint32};
+        bool was_gpu_modified{};
+    };
+
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
+    Vulkan::VertexInputs<BufferRange> ranges;
+    Vulkan::VertexInputs<BufferRange> ranges_merged;
+    IndexBinding index{};
+    bool bind_index_buffer{};
+    bool prepared{};
+
+    u64 emitted_tick{std::numeric_limits<u64>::max()};
+    bool vertex_input_valid{};
+    bool vertex_buffers_valid{};
+    bool index_buffer_valid{};
+    u32 emitted_attribute_count{};
+    u32 emitted_binding_count{};
+    u32 emitted_buffer_count{};
+    std::array<vk::VertexInputAttributeDescription2EXT, Vulkan::MaxVertexBufferCount>
+        emitted_attributes{};
+    std::array<vk::VertexInputBindingDescription2EXT, Vulkan::MaxVertexBufferCount>
+        emitted_bindings{};
+    std::array<vk::Buffer, Vulkan::MaxVertexBufferCount> emitted_buffers{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> emitted_offsets{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> emitted_sizes{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> emitted_strides{};
+    std::array<vk::Buffer, Vulkan::MaxVertexBufferCount> host_buffers{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_offsets{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_sizes{};
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_strides{};
+    vk::Buffer emitted_index_buffer{};
+    vk::DeviceSize emitted_index_offset{};
+    vk::IndexType emitted_index_type{vk::IndexType::eUint32};
+};
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
@@ -40,6 +168,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    stream_copy_scratch = std::make_unique<StreamCopyScratch>();
+    stream_slice_reuse = std::make_unique<StreamSliceReuseState>();
+    vertex_index_state = std::make_unique<VertexIndexState>();
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -65,6 +196,233 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() = default;
+
+void BufferCache::BeginStreamCopyBatch() noexcept {
+    stream_copy_request_count = 0;
+    stream_copy_finalized = false;
+    vertex_index_state->prepared = false;
+}
+
+u16 BufferCache::QueueStreamCopy(const StreamCopyRequest& request) {
+    ASSERT(!stream_copy_finalized);
+    ASSERT(stream_copy_request_count < MaxStreamCopyRequests);
+    ASSERT(request.size != 0);
+    ASSERT(request.alignment != 0 && std::has_single_bit(request.alignment));
+    ASSERT(request.source_type == StreamCopySource::Guest ||
+           request.source_type == StreamCopySource::Host ||
+           request.source_type == StreamCopySource::Zero);
+    ASSERT(request.source_type != StreamCopySource::Host || request.host_address != nullptr);
+    const u16 index = stream_copy_request_count++;
+    stream_copy_requests[index] = request;
+    return index;
+}
+
+void BufferCache::FinalizeStreamCopyBatch() {
+    ASSERT(!stream_copy_finalized);
+    if (stream_copy_request_count != 0) {
+        ExecuteStreamCopyBatch(
+            std::span<const StreamCopyRequest>{stream_copy_requests.data(),
+                                               stream_copy_request_count},
+            std::span<StreamCopyResult>{stream_copy_results.data(), stream_copy_request_count});
+    }
+    stream_copy_finalized = true;
+}
+
+const BufferCache::StreamCopyResult& BufferCache::GetStreamCopyResult(u16 index) const {
+    ASSERT(stream_copy_finalized);
+    ASSERT(index < stream_copy_request_count);
+    return stream_copy_results[index];
+}
+
+void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requests,
+                                         std::span<StreamCopyResult> results) {
+    ASSERT(requests.size() == results.size());
+    ASSERT(requests.size() <= MaxStreamCopyRequests);
+    if (requests.empty()) {
+        return;
+    }
+
+    auto& scratch = *stream_copy_scratch;
+    if (++scratch.hash_generation == 0) {
+        for (auto& slot : scratch.hash_table) {
+            slot.generation = 0;
+        }
+        scratch.hash_generation = 1;
+    }
+
+    const auto source_key = [](const StreamCopyRequest& request) noexcept -> u64 {
+        switch (request.source_type) {
+        case StreamCopySource::Guest:
+            return request.guest_address;
+        case StreamCopySource::Host:
+            return reinterpret_cast<uintptr_t>(request.host_address);
+        case StreamCopySource::Zero:
+            return 0;
+        }
+        std::unreachable();
+    };
+    const auto equivalent = [&](const StreamCopyRequest& lhs, const StreamCopyRequest& rhs) {
+        return lhs.source_type == rhs.source_type && lhs.size == rhs.size &&
+               source_key(lhs) == source_key(rhs);
+    };
+    const auto hash_request = [&](const StreamCopyRequest& request) {
+        u64 value = source_key(request) ^ (static_cast<u64>(request.size) << 17) ^
+                    (static_cast<u64>(request.source_type) << 61);
+        value ^= value >> 29;
+        value *= 0x9E3779B185EBCA87ULL;
+        value ^= value >> 32;
+        return static_cast<size_t>(value) & (StreamCopyScratch::HashTableSize - 1);
+    };
+
+    if (requests.size() == 1) {
+        const auto& request = requests.front();
+        const auto [destination, offset] = stream_buffer.Map(request.size, request.alignment);
+        ASSERT(destination != nullptr);
+        switch (request.source_type) {
+        case StreamCopySource::Guest:
+            memory->CopySparseMemory(request.guest_address, destination, request.size);
+            break;
+        case StreamCopySource::Host:
+            std::memcpy(destination, request.host_address, request.size);
+            break;
+        case StreamCopySource::Zero:
+            std::memset(destination, 0, request.size);
+            break;
+        }
+        stream_buffer.Commit();
+        results.front() = {.buffer = &stream_buffer, .offset = offset};
+        return;
+    }
+
+    u16 canonical_count = 0;
+    const bool use_hash = requests.size() > 4;
+    for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
+        const auto& request = requests[request_index];
+        auto& mapping = scratch.request_map[request_index];
+        mapping = {};
+
+        s32 canonical_index = -1;
+        if (request.deduplicate && request.source_type != StreamCopySource::Zero) {
+            if (use_hash) {
+                size_t slot_index = hash_request(request);
+                for (size_t probe = 0; probe < StreamCopyScratch::HashTableSize; ++probe) {
+                    const auto& slot = scratch.hash_table[slot_index];
+                    if (slot.generation != scratch.hash_generation) {
+                        break;
+                    }
+                    if (equivalent(scratch.canonical_copies[slot.canonical].request, request)) {
+                        canonical_index = slot.canonical;
+                        break;
+                    }
+                    slot_index = (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
+                }
+            } else {
+                for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
+                    if (equivalent(scratch.canonical_copies[candidate].request, request)) {
+                        canonical_index = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (canonical_index < 0) {
+                const u64 request_start = source_key(request);
+                for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
+                    auto& canonical = scratch.canonical_copies[candidate].request;
+                    if (!canonical.deduplicate || canonical.source_type != request.source_type ||
+                        canonical.source_type == StreamCopySource::Zero) {
+                        continue;
+                    }
+                    const u64 canonical_start = source_key(canonical);
+                    if (request_start < canonical_start) {
+                        continue;
+                    }
+                    const u64 source_offset = request_start - canonical_start;
+                    if (source_offset > canonical.size ||
+                        request.size > canonical.size - source_offset ||
+                        source_offset % request.alignment != 0) {
+                        continue;
+                    }
+                    canonical.alignment = std::max(canonical.alignment, request.alignment);
+                    canonical_index = candidate;
+                    mapping.source_offset = static_cast<u32>(source_offset);
+                    break;
+                }
+            }
+        }
+
+        if (canonical_index < 0) {
+            canonical_index = canonical_count++;
+            auto& canonical = scratch.canonical_copies[canonical_index];
+            canonical = {.request = request, .relative_offset = 0};
+            if (use_hash && request.deduplicate && request.source_type != StreamCopySource::Zero) {
+                size_t slot_index = hash_request(request);
+                while (scratch.hash_table[slot_index].generation == scratch.hash_generation) {
+                    slot_index = (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
+                }
+                scratch.hash_table[slot_index] = {
+                    .generation = scratch.hash_generation,
+                    .canonical = static_cast<u16>(canonical_index),
+                };
+            }
+        } else {
+            auto& canonical = scratch.canonical_copies[canonical_index].request;
+            canonical.alignment = std::max(canonical.alignment, request.alignment);
+        }
+        mapping.canonical = static_cast<u16>(canonical_index);
+    }
+
+    u64 total_size = 0;
+    u64 max_alignment = 1;
+    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+        auto& canonical = scratch.canonical_copies[canonical_index];
+        max_alignment = std::max(max_alignment, canonical.request.alignment);
+        total_size = Common::AlignUp(total_size, canonical.request.alignment);
+        canonical.relative_offset = total_size;
+        total_size += canonical.request.size;
+    }
+
+    const auto [destination, base_offset] = stream_buffer.Map(total_size, max_alignment);
+    ASSERT(destination != nullptr);
+
+    u16 guest_copy_count = 0;
+    u64 guest_copy_size = 0;
+    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+        const auto& canonical = scratch.canonical_copies[canonical_index];
+        u8* const copy_destination = destination + canonical.relative_offset;
+        switch (canonical.request.source_type) {
+        case StreamCopySource::Guest:
+            scratch.guest_copies[guest_copy_count++] = Core::MemoryManager::SparseCopyRequest{
+                .source = canonical.request.guest_address,
+                .destination = copy_destination,
+                .size = canonical.request.size,
+            };
+            guest_copy_size += canonical.request.size;
+            break;
+        case StreamCopySource::Host:
+            std::memcpy(copy_destination, canonical.request.host_address, canonical.request.size);
+            break;
+        case StreamCopySource::Zero:
+            std::memset(copy_destination, 0, canonical.request.size);
+            break;
+        }
+    }
+    memory->CopySparseMemoryBatch(
+        std::span<const Core::MemoryManager::SparseCopyRequest>{scratch.guest_copies.data(),
+                                                                guest_copy_count},
+        guest_copy_size);
+    stream_buffer.Commit();
+
+    for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
+        const auto& mapping = scratch.request_map[request_index];
+        ASSERT(mapping.canonical != StreamCopyScratch::NoCanonicalCopy);
+        const auto& canonical = scratch.canonical_copies[mapping.canonical];
+        results[request_index] = {
+            .buffer = &stream_buffer,
+            .offset = base_offset + canonical.relative_offset + mapping.source_offset,
+        };
+    }
+}
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
@@ -137,135 +495,272 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
 }
 
-void BufferCache::BindVertexBuffers(
-    const Vulkan::GraphicsPipeline& pipeline,
-    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipeline,
+                                            bool bind_index_buffer, u32 index_offset) {
+    auto& state = *vertex_index_state;
     const auto& regs = liverpool->regs;
-    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
-    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+
+    state.attributes.clear();
+    state.bindings.clear();
+    state.divisors.clear();
+    state.guest_buffers.clear();
+    state.ranges.clear();
+    state.ranges_merged.clear();
+    state.index = {};
+    state.bind_index_buffer = bind_index_buffer;
+    state.prepared = true;
+
+    pipeline.GetVertexInputs(state.attributes, state.bindings, state.divisors, state.guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
-    if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
-    }
-
-    if (bindings.empty()) {
-        // If there are no bindings, there is nothing further to do.
-        return;
-    }
-
-    struct BufferRange {
-        VAddr base_address;
-        VAddr end_address;
-        vk::Buffer vk_buffer;
-        u64 offset;
-
-        [[nodiscard]] size_t GetSize() const {
-            return end_address - base_address;
-        }
-    };
-
-    // Build list of ranges covering the requested buffers
-    Vulkan::VertexInputs<BufferRange> ranges{};
-    for (const auto& buffer : guest_buffers) {
+    for (u32 binding_index = 0; binding_index < state.guest_buffers.size(); ++binding_index) {
+        const auto& buffer = state.guest_buffers[binding_index];
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+            state.ranges.emplace_back(VertexIndexState::BufferRange{
+                .base_address = buffer.base_address,
+                .end_address = buffer.base_address + buffer.GetSize(),
+                .binding_mask = 1U << binding_index,
+            });
         }
     }
 
-    // Merge connecting ranges together
-    Vulkan::VertexInputs<BufferRange> ranges_merged{};
-    if (!ranges.empty()) {
-        std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
-            return lhv.base_address < rhv.base_address;
-        });
-        ranges_merged.emplace_back(ranges[0]);
-        for (auto range : ranges) {
-            auto& prev_range = ranges_merged.back();
-            if (prev_range.end_address < range.base_address) {
-                ranges_merged.emplace_back(range);
+    if (!state.ranges.empty()) {
+        const auto less_by_address = [](const auto& lhs, const auto& rhs) {
+            return lhs.base_address < rhs.base_address;
+        };
+        if (state.ranges.size() <= 8) {
+            for (u32 range_index = 1; range_index < state.ranges.size(); ++range_index) {
+                auto range = state.ranges[range_index];
+                u32 insert_index = range_index;
+                while (insert_index != 0 &&
+                       less_by_address(range, state.ranges[insert_index - 1])) {
+                    state.ranges[insert_index] = state.ranges[insert_index - 1];
+                    --insert_index;
+                }
+                state.ranges[insert_index] = range;
+            }
+        } else {
+            std::ranges::sort(state.ranges, less_by_address);
+        }
+        state.ranges_merged.emplace_back(state.ranges.front());
+        for (u32 range_index = 1; range_index < state.ranges.size(); ++range_index) {
+            const auto& range = state.ranges[range_index];
+            auto& previous = state.ranges_merged.back();
+            if (previous.end_address < range.base_address) {
+                state.ranges_merged.emplace_back(range);
             } else {
-                prev_range.end_address = std::max(prev_range.end_address, range.end_address);
+                previous.end_address = std::max(previous.end_address, range.end_address);
+                previous.binding_mask |= range.binding_mask;
             }
         }
     }
 
-    // Map buffers for merged ranges
-    for (auto& range : ranges_merged) {
+    for (auto& range : state.ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
-        range.vk_buffer = buffer->buffer;
-        range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        ASSERT(size <= std::numeric_limits<u32>::max());
+        range.size = static_cast<u32>(size);
+        range.was_gpu_modified = IsRegionGpuModified(range.base_address, size);
+        if (!range.was_gpu_modified && size <= CACHING_PAGESIZE) {
+            range.stream_index = QueueStreamCopy(StreamCopyRequest{
+                .source_type = StreamCopySource::Guest,
+                .guest_address = range.base_address,
+                .size = range.size,
+                .alignment = instance.UniformMinAlignment(),
+            });
+        }
+    }
+
+    if (!bind_index_buffer) {
+        return;
+    }
+
+    auto& index = state.index;
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    index.type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+    index.address = regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    index.size = regs.num_indices * index_size;
+    index.was_gpu_modified = IsRegionGpuModified(index.address, index.size);
+    if (index.size != 0 && !index.was_gpu_modified && index.size <= CACHING_PAGESIZE) {
+        index.stream_index = QueueStreamCopy(StreamCopyRequest{
+            .source_type = StreamCopySource::Guest,
+            .guest_address = index.address,
+            .size = index.size,
+            .alignment = std::max<u64>(index_size, instance.UniformMinAlignment()),
+        });
+    }
+}
+
+void BufferCache::FinalizeVertexIndexBuffers(
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    auto& state = *vertex_index_state;
+    ASSERT(state.prepared);
+    ASSERT(stream_copy_finalized);
+
+    for (auto& range : state.ranges_merged) {
+        if (range.stream_index != VertexIndexState::NoStreamCopy) {
+            const auto& result = GetStreamCopyResult(range.stream_index);
+            range.buffer = result.buffer;
+            range.vk_buffer = result.buffer->Handle();
+            range.offset = result.offset;
+        } else {
+            const BufferId buffer_id = FindBuffer(range.base_address, range.size);
+            range.buffer = &slot_buffers[buffer_id];
+            SynchronizeBuffer(*range.buffer, range.base_address, range.size, false, false);
+            range.vk_buffer = range.buffer->Handle();
+            range.offset = range.buffer->Offset(range.base_address);
+        }
+        ASSERT(range.buffer != nullptr);
+        if (range.was_gpu_modified) {
             if (auto barrier =
-                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
-                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                    range.buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                             vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
                 barriers.emplace_back(*barrier);
             }
         }
     }
 
-    // Bind vertex buffers
-    Vulkan::VertexInputs<vk::Buffer> host_buffers;
-    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
-    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
-    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            const auto host_buffer_info =
-                std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return buffer.base_address >= range.base_address &&
-                           buffer.base_address < range.end_address;
-                });
-            ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
-                                   host_buffer_info->base_address);
+    auto& index = state.index;
+    if (state.bind_index_buffer) {
+        if (index.size == 0) {
+            const auto [buffer, offset] = ObtainBuffer(index.address, 0, false);
+            index.buffer = buffer;
+            index.offset = offset;
+        } else if (index.stream_index != VertexIndexState::NoStreamCopy) {
+            const auto& result = GetStreamCopyResult(index.stream_index);
+            index.buffer = result.buffer;
+            index.offset = result.offset;
         } else {
-            host_buffers.emplace_back(VK_NULL_HANDLE);
-            host_offsets.push_back(0);
+            const BufferId buffer_id = FindBuffer(index.address, index.size);
+            index.buffer = &slot_buffers[buffer_id];
+            SynchronizeBuffer(*index.buffer, index.address, index.size, false, false);
+            index.offset = index.buffer->Offset(index.address);
         }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
-    }
-
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
-    if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
-    } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
-    }
-}
-
-void BufferCache::BindIndexBuffer(
-    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
-    const auto& regs = liverpool->regs;
-
-    // Figure out index type and size.
-    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
-    const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
-    const VAddr index_address =
-        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
-
-    // Bind index buffer.
-    const u32 index_buffer_size = regs.num_indices * index_size;
-    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    if (IsRegionGpuModified(index_address, index_buffer_size)) {
-        if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
-                                                 vk::PipelineStageFlagBits2::eIndexInput)) {
-            barriers.emplace_back(*barrier);
+        ASSERT(index.buffer != nullptr);
+        if (index.was_gpu_modified) {
+            if (auto barrier = index.buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
+                                                        vk::PipelineStageFlagBits2::eIndexInput)) {
+                barriers.emplace_back(*barrier);
+            }
         }
     }
+
+    const u64 current_tick = scheduler.CurrentTick();
+    if (state.emitted_tick != current_tick) {
+        state.emitted_tick = current_tick;
+        state.vertex_input_valid = false;
+        state.vertex_buffers_valid = false;
+        state.index_buffer_valid = false;
+    }
+
+    const auto attributes_equal = [](const auto& lhs, const auto& rhs, u32 rhs_count) {
+        if (lhs.size() != rhs_count) {
+            return false;
+        }
+        for (u32 i = 0; i < rhs_count; ++i) {
+            const auto& left = lhs[i];
+            const auto& right = rhs[i];
+            if (left.location != right.location || left.binding != right.binding ||
+                left.format != right.format || left.offset != right.offset) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto bindings_equal = [](const auto& lhs, const auto& rhs, u32 rhs_count) {
+        if (lhs.size() != rhs_count) {
+            return false;
+        }
+        for (u32 i = 0; i < rhs_count; ++i) {
+            const auto& left = lhs[i];
+            const auto& right = rhs[i];
+            if (left.binding != right.binding || left.stride != right.stride ||
+                left.inputRate != right.inputRate || left.divisor != right.divisor) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    if (instance.IsVertexInputDynamicState() &&
+        (!state.vertex_input_valid ||
+         !attributes_equal(state.attributes, state.emitted_attributes,
+                           state.emitted_attribute_count) ||
+         !bindings_equal(state.bindings, state.emitted_bindings, state.emitted_binding_count))) {
+        cmdbuf.setVertexInputEXT(state.bindings, state.attributes);
+        state.emitted_attribute_count = static_cast<u32>(state.attributes.size());
+        state.emitted_binding_count = static_cast<u32>(state.bindings.size());
+        std::ranges::copy(state.attributes, state.emitted_attributes.begin());
+        std::ranges::copy(state.bindings, state.emitted_bindings.begin());
+        state.vertex_input_valid = true;
+    }
+
+    if (!state.bindings.empty()) {
+        const u32 num_buffers = static_cast<u32>(state.guest_buffers.size());
+        auto& host_buffers = state.host_buffers;
+        auto& host_offsets = state.host_offsets;
+        auto& host_sizes = state.host_sizes;
+        auto& host_strides = state.host_strides;
+        for (u32 i = 0; i < num_buffers; ++i) {
+            const auto& buffer = state.guest_buffers[i];
+            host_buffers[i] = VK_NULL_HANDLE;
+            host_offsets[i] = 0;
+            host_sizes[i] = buffer.GetSize();
+            host_strides[i] = buffer.GetStride();
+        }
+
+        for (const auto& range : state.ranges_merged) {
+            u32 binding_mask = range.binding_mask;
+            while (binding_mask != 0) {
+                const u32 binding_index = std::countr_zero(binding_mask);
+                binding_mask &= binding_mask - 1;
+                const auto& buffer = state.guest_buffers[binding_index];
+                host_buffers[binding_index] = range.vk_buffer;
+                host_offsets[binding_index] =
+                    range.offset + buffer.base_address - range.base_address;
+            }
+        }
+
+        const auto values_equal = [num_buffers](const auto& lhs, const auto& rhs) {
+            return std::equal(lhs.begin(), lhs.begin() + num_buffers, rhs.begin());
+        };
+        const bool same_buffers = state.vertex_buffers_valid &&
+                                  state.emitted_buffer_count == num_buffers &&
+                                  values_equal(host_buffers, state.emitted_buffers) &&
+                                  values_equal(host_offsets, state.emitted_offsets) &&
+                                  (instance.IsVertexInputDynamicState() ||
+                                   (values_equal(host_sizes, state.emitted_sizes) &&
+                                    values_equal(host_strides, state.emitted_strides)));
+        if (!same_buffers) {
+            if (instance.IsVertexInputDynamicState()) {
+                cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+            } else {
+                cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
+                                          host_sizes.data(), host_strides.data());
+            }
+            state.emitted_buffer_count = num_buffers;
+            std::copy_n(host_buffers.begin(), num_buffers, state.emitted_buffers.begin());
+            std::copy_n(host_offsets.begin(), num_buffers, state.emitted_offsets.begin());
+            std::copy_n(host_sizes.begin(), num_buffers, state.emitted_sizes.begin());
+            std::copy_n(host_strides.begin(), num_buffers, state.emitted_strides.begin());
+            state.vertex_buffers_valid = true;
+        }
+    }
+
+    if (state.bind_index_buffer) {
+        const vk::Buffer handle = index.buffer->Handle();
+        if (!state.index_buffer_valid || state.emitted_index_buffer != handle ||
+            state.emitted_index_offset != index.offset || state.emitted_index_type != index.type) {
+            cmdbuf.bindIndexBuffer(handle, index.offset, index.type);
+            state.emitted_index_buffer = handle;
+            state.emitted_index_offset = index.offset;
+            state.emitted_index_type = index.type;
+            state.index_buffer_valid = true;
+        }
+    }
+
+    state.prepared = false;
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -383,8 +878,60 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
+        if (size == 0) {
+            const u64 offset =
+                stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            return {&stream_buffer, static_cast<u32>(offset)};
+        }
+
+        auto& reuse = *stream_slice_reuse;
+        u64 hash = device_addr ^ (static_cast<u64>(size) << 32);
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdULL;
+        hash ^= hash >> 33;
+        const size_t set_index = static_cast<size_t>(hash) & (StreamSliceReuseState::SetCount - 1);
+        auto& set = reuse.sets[set_index];
+
+        memory->CopySparseMemory(device_addr, reuse.scratch.data(), size);
+        StreamSliceReuseState::Entry* replacement{};
+        size_t replacement_way{};
+        for (size_t way = 0; way < StreamSliceReuseState::WayCount; ++way) {
+            auto& entry = set.ways[way];
+            if (entry.valid && entry.address == device_addr && entry.size == size) {
+                if (entry.generation == stream_buffer.Generation() &&
+                    entry.tick == scheduler.CurrentTick() &&
+                    std::memcmp(reuse.Shadow(set_index, way), reuse.scratch.data(), size) == 0) {
+                    return {&stream_buffer, entry.offset};
+                }
+                replacement = &entry;
+                replacement_way = way;
+                break;
+            }
+            if (!entry.valid && replacement == nullptr) {
+                replacement = &entry;
+                replacement_way = way;
+            }
+        }
+        if (replacement == nullptr) {
+            replacement_way = set.next_replacement;
+            set.next_replacement = (set.next_replacement + 1) % StreamSliceReuseState::WayCount;
+            replacement = &set.ways[replacement_way];
+        }
+
+        const auto [destination, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        ASSERT(destination != nullptr);
+        std::memcpy(destination, reuse.scratch.data(), size);
+        stream_buffer.Commit();
+        std::memcpy(reuse.Shadow(set_index, replacement_way), reuse.scratch.data(), size);
+        *replacement = {
+            .address = device_addr,
+            .generation = stream_buffer.Generation(),
+            .tick = scheduler.CurrentTick(),
+            .size = size,
+            .offset = static_cast<u32>(offset),
+            .valid = true,
+        };
+        return {&stream_buffer, static_cast<u32>(offset)};
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
@@ -428,6 +975,19 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::IsBufferCacheEntryValid(BufferId id, u64 uid, VAddr address, u64 size) const {
+    if (!id || !slot_buffers.is_allocated(id)) {
+        return false;
+    }
+    const auto& buffer = slot_buffers[id];
+    return !buffer.is_deleted && buffer.Uid() == uid && buffer.IsInBounds(address, size);
+}
+
+u64 BufferCache::GetBufferUid(BufferId id) const {
+    ASSERT(id && slot_buffers.is_allocated(id));
+    return slot_buffers[id].Uid();
 }
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
@@ -596,10 +1156,12 @@ void BufferCache::ProcessFaultBuffer() {
 
 void BufferCache::Register(BufferId buffer_id) {
     ChangeRegister<true>(buffer_id);
+    ++topology_epoch;
 }
 
 void BufferCache::Unregister(BufferId buffer_id) {
     ChangeRegister<false>(buffer_id);
+    ++topology_epoch;
 }
 
 template <bool insert>

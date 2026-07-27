@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <limits>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -99,10 +101,12 @@ private:
 
     bool FilterDraw();
 
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
+    void PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void FinalizeBuffers(Shader::PushData& push_data, bool stream_only);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    void BindPipelineResources(const Pipeline* pipeline);
+    void CaptureDescriptorImageState(const Pipeline* pipeline);
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -138,13 +142,88 @@ private:
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
+    Pipeline::DescriptorWrites partial_set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
 
-    using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
-    boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
+    struct PendingBufferBinding {
+        const Shader::BufferResource* desc{};
+        VideoCore::BufferId buffer_id{};
+        AmdGpu::Buffer sharp{};
+        u64 size{};
+        u64 alignment{};
+        u32 unified_binding{};
+        u32 buffer_binding{};
+        u32 set_write_index{};
+        u16 stream_index{std::numeric_limits<u16>::max()};
+        VideoCore::BufferCache::StreamCopySource stream_source{};
+        bool is_storage{};
+        bool finalized{};
+    };
+    boost::container::static_vector<PendingBufferBinding, Shader::NUM_BUFFERS>
+        pending_buffer_bindings;
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+
+    struct CachedBufferBinding {
+        const Shader::Info* owner{};
+        AmdGpu::Buffer sharp{};
+        VideoCore::BufferId buffer_id{};
+        u64 buffer_uid{};
+        u64 topology_epoch{};
+        u64 size{};
+        bool valid{};
+    };
+    std::array<std::array<CachedBufferBinding, Shader::NUM_BUFFERS>, MaxShaderStages>
+        cached_buffer_bindings{};
+
+    struct CachedImageBinding {
+        const Shader::Info* owner{};
+        AmdGpu::Image sharp{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        VideoCore::TextureCache::ImageDesc resolved_desc{};
+        bool valid{};
+    };
+    std::array<std::array<CachedImageBinding, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_image_bindings{};
+
+    struct CachedImageView {
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        vk::Image backing_image{};
+        vk::ImageView image_view{};
+        VideoCore::ImageViewInfo info{};
+        bool valid{};
+    };
+    std::array<std::array<CachedImageView, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_texture_views{};
+    std::array<CachedImageView, AmdGpu::NUM_COLOR_BUFFERS> cached_color_target_views{};
+    CachedImageView cached_depth_target_view{};
+
+    struct DescriptorImageWriteState {
+        u32 binding{};
+        u32 array_element{};
+        u32 count{};
+        u32 first_info{};
+        vk::DescriptorType type{};
+    };
+
+    struct DescriptorImageState {
+        const Pipeline* pipeline{};
+        vk::CommandBuffer command_buffer{};
+        u64 push_descriptor_epoch{};
+        boost::container::static_vector<DescriptorImageWriteState,
+                                        Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
+            writes;
+        boost::container::static_vector<vk::DescriptorImageInfo,
+                                        Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
+            infos;
+        bool valid{};
+    } descriptor_image_state;
+
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 };

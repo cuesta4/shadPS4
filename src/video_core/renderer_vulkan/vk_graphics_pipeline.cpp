@@ -38,6 +38,11 @@ GraphicsPipeline::GraphicsPipeline(
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    if (fetch_shader) {
+        for (const auto& attribute : fetch_shader->attributes) {
+            vertex_input_plan.emplace_back(attribute);
+        }
+    }
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -400,13 +405,17 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (vertex_input_plan.empty()) {
         return;
     }
     const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
-    for (const auto& attrib : fetch_shader->attributes) {
+    ASSERT_MSG(vs_info.resolved_vertex_buffers.size() == vertex_input_plan.size(),
+               "Resolved vertex buffer count does not match vertex input plan: {} != {}",
+               vs_info.resolved_vertex_buffers.size(), vertex_input_plan.size());
+    for (u32 attribute_index = 0; attribute_index < vertex_input_plan.size(); ++attribute_index) {
+        const auto& attrib = vertex_input_plan[attribute_index];
         const auto step_rate = attrib.GetStepRate();
-        const auto buffer = attrib.GetSharp(vs_info);
+        const auto buffer = vs_info.resolved_vertex_buffers[attribute_index];
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,
@@ -455,10 +464,18 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->l_stage)];
-        for (const auto& buffer : stage->buffers) {
+        if (!preloading) {
+            ASSERT_MSG(stage->resolved_buffers.size() == stage->buffers.size(),
+                       "Resolved buffer count does not match shader resources: {} != {}",
+                       stage->resolved_buffers.size(), stage->buffers.size());
+            ASSERT_MSG(stage->resolved_images.size() == stage->images.size(),
+                       "Resolved image count does not match shader resources: {} != {}",
+                       stage->resolved_images.size(), stage->images.size());
+        }
+        for (u32 buffer_index = 0; buffer_index < stage->buffers.size(); ++buffer_index) {
+            const auto& buffer = stage->buffers[buffer_index];
             const auto sharp =
-                preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+                preloading ? AmdGpu::Buffer{} : stage->resolved_buffers[buffer_index];
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
@@ -467,8 +484,10 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                 .stageFlags = stage_bit,
             });
         }
-        for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+        for (u32 image_index = 0; image_index < stage->images.size(); ++image_index) {
+            const auto& image = stage->images[image_index];
+            const u32 num_bindings = image.NumBindings(
+                preloading ? AmdGpu::Image{} : stage->resolved_images[image_index]);
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

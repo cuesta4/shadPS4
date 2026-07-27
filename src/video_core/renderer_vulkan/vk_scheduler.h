@@ -3,11 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include "common/assert.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -393,6 +397,53 @@ public:
         return master_semaphore.CurrentTick();
     }
 
+    /// Returns a monotonic epoch incremented whenever graphics push-descriptor state is disturbed
+    /// in the guest command buffer. Cached partial pushes use this to reject stale state.
+    [[nodiscard]] u64 GraphicsPushDescriptorEpoch() const noexcept {
+        return graphics_push_descriptor_epoch;
+    }
+
+    /// Records a graphics push-descriptor write in the guest command buffer.
+    void NotifyGraphicsPushDescriptorSet() noexcept {
+        ++graphics_push_descriptor_epoch;
+    }
+
+    /// Returns true when the supplied push-constant bytes differ from the state already emitted
+    /// for this bind point in the current command buffer.
+    [[nodiscard]] bool UpdatePushConstantCache(bool is_compute, vk::PipelineLayout layout,
+                                               const void* data, size_t size) noexcept {
+        ASSERT(size <= PushConstantCache::Capacity);
+        auto& cache = push_constant_caches[is_compute ? 1U : 0U];
+        const u64 tick = CurrentTick();
+        if (cache.valid && cache.command_buffer == current_cmdbuf && cache.layout == layout &&
+            cache.tick == tick && cache.size == size &&
+            std::memcmp(cache.bytes.data(), data, size) == 0) {
+            return false;
+        }
+        cache.valid = true;
+        cache.command_buffer = current_cmdbuf;
+        cache.layout = layout;
+        cache.tick = tick;
+        cache.size = size;
+        std::memcpy(cache.bytes.data(), data, size);
+        return true;
+    }
+
+    /// Binds a graphics pipeline only when it differs from the state already recorded in the
+    /// current guest command buffer.
+    void BindGraphicsPipeline(vk::Pipeline pipeline) {
+        const u64 tick = CurrentTick();
+        if (graphics_pipeline_valid && graphics_pipeline_command_buffer == current_cmdbuf &&
+            graphics_pipeline_tick == tick && graphics_pipeline == pipeline) {
+            return;
+        }
+        current_cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        graphics_pipeline_valid = true;
+        graphics_pipeline_command_buffer = current_cmdbuf;
+        graphics_pipeline_tick = tick;
+        graphics_pipeline = pipeline;
+    }
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         if (master_semaphore.IsFree(tick)) {
@@ -433,11 +484,27 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
+    struct PushConstantCache {
+        static constexpr size_t Capacity = 128;
+        std::array<std::byte, Capacity> bytes{};
+        vk::CommandBuffer command_buffer{};
+        vk::PipelineLayout layout{};
+        u64 tick{};
+        size_t size{};
+        bool valid{};
+    };
+
     const Instance& instance;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    u64 graphics_push_descriptor_epoch{};
+    std::array<PushConstantCache, 2> push_constant_caches{};
+    vk::CommandBuffer graphics_pipeline_command_buffer{};
+    vk::Pipeline graphics_pipeline{};
+    u64 graphics_pipeline_tick{};
+    bool graphics_pipeline_valid{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

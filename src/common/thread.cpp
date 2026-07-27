@@ -5,6 +5,7 @@
 
 #include <ctime>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "core/libraries/kernel/threads/pthread.h"
@@ -37,6 +38,10 @@
 #endif
 
 namespace Common {
+
+namespace {
+thread_local std::string current_thread_name;
+}
 
 #ifdef __APPLE__
 
@@ -174,6 +179,7 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 // Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
+    current_thread_name = name;
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
@@ -189,6 +195,7 @@ void SetThreadName(void* thread, const char* name) {
 // MinGW with the POSIX threading model does not support pthread_setname_np
 #if !defined(_WIN32) || defined(_MSC_VER)
 void SetCurrentThreadName(const char* name) {
+    current_thread_name = name;
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
@@ -218,6 +225,7 @@ void SetThreadName(void* thread, const char* name) {
 
 #if defined(_WIN32)
 void SetCurrentThreadName(const char* name) {
+    current_thread_name = name;
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
@@ -249,22 +257,34 @@ void AccurateTimer::End() {
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
 }
 
-std::string GetCurrentThreadName() {
+std::string_view GetCurrentThreadNameView() {
     using namespace Libraries::Kernel;
     if (g_curthread && !g_curthread->name.empty()) {
         return g_curthread->name;
     }
+    if (!current_thread_name.empty()) {
+        return current_thread_name;
+    }
 #ifdef _WIN32
-    PWSTR name;
-    GetThreadDescription(GetCurrentThread(), &name);
-    return Common::UTF16ToUTF8(name);
+    PWSTR name = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &name)) && name != nullptr) {
+        current_thread_name = Common::UTF16ToUTF8(name);
+        LocalFree(name);
+    }
 #else
     char name[256];
-    if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {
-        return "<unknown name>";
+    if (pthread_getname_np(pthread_self(), name, sizeof(name)) == 0) {
+        current_thread_name = name;
     }
-    return std::string{name};
 #endif
+    if (current_thread_name.empty()) {
+        current_thread_name = "<unknown name>";
+    }
+    return current_thread_name;
+}
+
+std::string GetCurrentThreadName() {
+    return std::string{GetCurrentThreadNameView()};
 }
 
 } // namespace Common
