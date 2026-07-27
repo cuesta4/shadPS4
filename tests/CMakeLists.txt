@@ -14,6 +14,7 @@ set(TEST_TARGETS
     shadps4_ngs2_test
     shadps4_gcn_test
     shadps4_common_test
+    shadps4_cache_storage_test
 )
 
 set(COMMON_TEST_SOURCES
@@ -23,7 +24,6 @@ set(COMMON_TEST_SOURCES
     # Tests
     common/test_bit_array.cpp
     common/test_logging.cpp
-)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -171,6 +171,13 @@ add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
 add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
 add_executable(shadps4_common_test ${COMMON_TEST_SOURCES})
+add_executable(shadps4_cache_storage_test
+    ${CMAKE_SOURCE_DIR}/src/video_core/cache_archive.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/host_shader_cache.cpp
+    test_cache_archive.cpp
+    test_host_shader_cache.cpp
+    test_cache_task_queue.cpp
+)
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -215,6 +222,7 @@ target_link_libraries(shadps4_common_test PRIVATE
     fmt::fmt
     spdlog::spdlog
 )
+target_link_libraries(shadps4_cache_storage_test PRIVATE GTest::gtest_main miniz::miniz)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
