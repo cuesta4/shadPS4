@@ -17,6 +17,7 @@ set(TEST_TARGETS
     shadps4_cache_storage_test
     shadps4_video_core_test
     shadps4_aliasing_test
+    shadps4_presentation_queue_test
 )
 
 set(COMMON_TEST_SOURCES
@@ -192,6 +193,7 @@ add_executable(shadps4_cache_storage_test
 )
 add_executable(shadps4_video_core_test ${VIDEO_CORE_TEST_SOURCES})
 add_executable(shadps4_aliasing_test ${ALIASING_TEST_SOURCES})
+add_executable(shadps4_presentation_queue_test test_presentation_queue.cpp)
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -248,6 +250,7 @@ target_link_libraries(shadps4_aliasing_test PRIVATE
     Vulkan::Headers
     spdlog::spdlog
 )
+target_link_libraries(shadps4_presentation_queue_test PRIVATE GTest::gtest_main)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
