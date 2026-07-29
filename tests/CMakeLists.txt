@@ -49,6 +49,7 @@ set(SETTINGS_TEST_SOURCES
     test_emulator_settings.cpp
     # Windows static guest red-zone protection
     test_windows_guest_red_zone_protection_settings.cpp
+    test_storage_config.cpp
 )
 
 set(NGS2_TEST_SOURCES
@@ -206,6 +207,7 @@ target_link_libraries(shadps4_settings_test PRIVATE
     fmt::fmt
     nlohmann_json::nlohmann_json
     toml11::toml11
+    Boost::headers
     SDL3::SDL3
     spdlog::spdlog
 )
