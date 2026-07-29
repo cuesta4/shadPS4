@@ -13,7 +13,7 @@ public:
     static void SetupSettings();
 
     void Draw() override;
-    bool ShouldKeepDrawing() override;
+    bool NeedsRender() const override;
 
     // Must be inside a window
     static void DrawNullGpuNotice();
