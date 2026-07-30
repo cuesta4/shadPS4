@@ -34,6 +34,7 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    Aliased = 1 << 4,     ///< Image shares its guest storage with another compatible image
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
@@ -186,6 +187,7 @@ public:
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
     std::shared_ptr<ImageReadbackToken> readback_token;
+    u64 alias_generation{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
