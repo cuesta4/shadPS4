@@ -179,8 +179,6 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
-    // Initial SDL discovery precedes the emulated kernel clock, so defer its first report.
-    controllers.TryOpenSDLControllers(Input::StatePublication::Suppress);
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -189,34 +187,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
 WindowSDL::~WindowSDL() = default;
 
-void WindowSDL::SetIcon(const std::filesystem::path& path) {
-    if (!std::filesystem::exists(path)) {
-        LOG_WARNING(Core, "Could not find icon file '{}', using default icon.",
-                    fmt::UTF(path.u8string()));
+void WindowSDL::SetIcon(std::span<const u8> png_data) {
+    if (png_data.empty()) {
+        LOG_WARNING(Core, "No window icon data available, using default icon.");
         SetDefaultWindowIcon(window);
         return;
     }
-
-    Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read,
-                            Common::FS::FileType::BinaryFile,
-                            Common::FS::FileShareFlag::ShareReadWrite};
-    if (!file.IsOpen()) {
-        LOG_ERROR(Core, "Failed to open window icon file '{}'.", fmt::UTF(path.u8string()));
-        SetDefaultWindowIcon(window);
-        return;
-    }
-
-    const u64 fileSize = file.GetSize();
-    std::vector<u8> buf(fileSize);
-    const size_t bytesRead = file.ReadRaw<u8>(buf.data(), fileSize);
-    file.Close();
-    if (bytesRead < fileSize) {
-        LOG_ERROR(Core, "Failed to read window icon file '{}'.", fmt::UTF(path.u8string()));
-        SetDefaultWindowIcon(window);
-        return;
-    }
-
-    SetWindowIcon(window, buf);
+    SetWindowIcon(window, std::vector<u8>(png_data.begin(), png_data.end()));
 }
 
 void WindowSDL::WaitEvent() {

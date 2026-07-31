@@ -3,13 +3,10 @@
 
 #pragma once
 
-#include <array>
-#include <condition_variable>
+#include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
-#include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
@@ -29,7 +26,10 @@ struct Liverpool;
 namespace VideoCore {
 
 class BufferCache;
+class Buffer;
 class PageManager;
+class ReadbackTracker;
+struct PendingImageDownload;
 
 class TextureCache {
     // Default values for garbage collection
@@ -129,16 +129,7 @@ public:
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id, bool synchronize_alias = false) {
-        std::scoped_lock lock{mutex};
-        Image& image = slot_images[image_id];
-        TrackImage(image_id);
-        TouchImage(image);
-        RefreshImage(image);
-        if (synchronize_alias) {
-            SynchronizeAlias(image_id);
-        }
-    }
+    void UpdateImage(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -276,14 +267,14 @@ public:
     }
 
 private:
-    struct PendingImageDownload {
-        ImageId image_id;
-        VAddr guest_address;
-        u8* data;
-        u64 offset;
-        u32 size;
+    struct AliasState;
+    enum class AliasAccess {
+        Read,
+        ReadWrite,
     };
-    using PendingImageDownloads = boost::container::small_vector<PendingImageDownload, 8>;
+
+    void PrepareImageAccess(ImageId image_id, AliasAccess access, bool queue_download = false);
+    void UpdateImageImpl(ImageId image_id);
 
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -301,23 +292,9 @@ private:
         }
     }
 
-    /// Records an image copy into the download buffer.
-    bool ScheduleImageDownload(ImageId image_id, PendingImageDownloads& downloads);
-
-    /// Publishes completed image copies to CPU-visible guest memory.
-    void QueueImageDownloads(PendingImageDownloads&& downloads);
-
-    /// Copies image memory back to CPU.
-    bool DownloadImageMemory(ImageId image_id, bool sync = false);
-
-    /// Publishes one completed image copy and releases its CPU read watch.
-    void CommitImageDownload(const PendingImageDownload& download);
-
-    bool TrackCpuReadback(ImageId image_id);
-    void UntrackCpuReadback(ImageId image_id);
-
-    /// Thread function for copying downloaded images out to CPU memory.
-    void DownloadedImagesThread(const std::stop_token& token);
+    [[nodiscard]] PendingImageDownload ScheduleImageDownload(Image& image, Buffer& buffer, u8* data,
+                                                             u64 buffer_offset);
+    void DownloadImageMemory(ImageId image_id);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
@@ -340,11 +317,23 @@ private:
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
-    /// Copies newer contents from an independently-backed image at the same guest address.
+    void InvalidateAlias(Image& image);
+
     void SynchronizeAlias(ImageId image_id);
 
-    /// Records a GPU write and schedules conservative writeback for small aliased allocations.
-    void MarkGpuWrite(ImageId image_id);
+    [[nodiscard]] bool CommitAliasWriter(AliasState& state);
+
+    void CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent);
+
+    void PublishAliasWrite(ImageId image_id);
+
+    template <typename Func>
+    void ForEachAlias(const Image& image, Func&& func);
+
+    [[nodiscard]] bool IsLiveImage(ImageId image_id, u64 image_uid) const {
+        return image_id && slot_images.is_allocated(image_id) &&
+               slot_images[image_id].image_uid == image_uid;
+    }
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
@@ -369,6 +358,7 @@ private:
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
+    std::shared_ptr<ReadbackTracker> readback_tracker;
     BlitHelper blit_helper;
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
@@ -403,15 +393,24 @@ private:
     tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
     struct AliasState {
-        ImageId writer{};
+        // Backing contains the complete shared-memory view; writer is an uncommitted write.
+        u64 backing_uid{};
         u64 writer_uid{};
-        bool has_alias{};
-        bool download_pending{};
+        u64 download_uid{};
+        ImageId backing{};
+        ImageId writer{};
+        ImageId download{};
+        u32 members{};
+
+        void ResetAuthority() {
+            const u32 member_count = members;
+            *this = {};
+            members = member_count;
+        }
     };
     tsl::robin_map<VAddr, AliasState> alias_states;
     boost::container::small_vector<VAddr, 4> pending_alias_downloads;
     u64 alias_generation{};
-    tsl::robin_map<VAddr, u32> cpu_readback_page_refs;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

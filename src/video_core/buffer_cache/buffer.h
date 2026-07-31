@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 #include "common/types.h"
+#include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/buffer_cache/buffer_access.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -149,6 +150,9 @@ public:
 
     void Fill(u64 offset, u32 num_bytes, u32 value);
 
+    /// Makes a completed download range visible to the CPU.
+    void Invalidate(u64 offset, u64 size);
+
 public:
     VAddr cpu_addr = 0;
     bool is_picked{};
@@ -187,7 +191,13 @@ public:
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
-        std::memcpy(data, reinterpret_cast<const void*>(src), size);
+        auto* memory = Core::Memory::Instance();
+        const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
+        if (memory->IsValidMapping(src_vaddr)) {
+            memory->CopySparseMemory(src_vaddr, data, size);
+        } else {
+            std::memcpy(data, reinterpret_cast<const void*>(src), size);
+        }
         Commit();
         return offset;
     }

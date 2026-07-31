@@ -1301,11 +1301,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         texture_cache.PrepareDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
-        const auto [image_view_handle, view_range] =
-            ResolveRenderTargetView(render_target_plan.depth_view, image_id, image, desc);
-        const auto slice = view_range.base.layer;
-        const bool is_depth_clear = regs.depth_render_control.depth_clear_enable ||
-                                    texture_cache.IsMetaCleared(htile_address, slice);
+
+        const auto slice = image_view.info.range.base.layer;
+        const bool is_depth_clear =
+            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
+             regs.depth_control.depth_write_enable) ||
+            texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);

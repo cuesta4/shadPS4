@@ -17,11 +17,6 @@
 
 namespace Input {
 
-enum class StatePublication {
-    Suppress,
-    Publish,
-};
-
 enum class Axis {
     LeftX = 0,
     LeftY = 1,
@@ -152,10 +147,6 @@ public:
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);
 
-    static void CalculateOrientation(const Libraries::Pad::OrbisFVector3& angularVelocity,
-                                     float deltaTime,
-                                     const Libraries::Pad::OrbisFQuaternion& lastOrientation,
-                                     Libraries::Pad::OrbisFQuaternion& orientation);
     void SetControllerCustomColor(s32 i, u8 r, u8 g, u8 b) {
         // reset to ensure the next function always runs, even if there already was a preexisting
         // override colour before

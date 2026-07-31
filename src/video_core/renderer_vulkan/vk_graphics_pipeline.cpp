@@ -6,6 +6,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -263,6 +264,19 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
+            .pName = "main",
+        });
+    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_emulation) {
+        if (!preloading) {
+            const auto vs_runtime_info =
+                runtime_infos[static_cast<u32>(Shader::LogicalStage::Vertex)].vs_info;
+
+            sdata.fragment =
+                Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs_runtime_info.outputs);
+        }
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .module = CompileSPV(sdata.fragment, instance.GetDevice()),
             .pName = "main",
         });
     }

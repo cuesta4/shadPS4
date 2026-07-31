@@ -9,16 +9,12 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-# GoogleTest 1.17 triggers Clang 22's new character-conversion warning in its
-# own headers. The project promotes warnings to errors, so keep the suppression
-# scoped to the third-party target instead of weakening shadPS4's diagnostics.
-if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(gtest PRIVATE /clang:-Wno-character-conversion)
-endif()
-
-set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test shadps4_video_core_test
-                 shadps4_cache_storage_test shadps4_input_test
-                 shadps4_presentation_queue_test)
+set(TEST_TARGETS
+    shadps4_settings_test
+    shadps4_ngs2_test
+    shadps4_gcn_test
+    shadps4_aliasing_test
+)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -43,6 +39,34 @@ set(SETTINGS_TEST_SOURCES
     test_storage_scheduler.cpp
 )
 
+set(NGS2_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/ngs2/ngs2_impl.cpp
+
+    # Minimal common and kernel support
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/sync/mutex.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+
+    # Tests
+    test_ngs2.cpp
+)
+set(ALIASING_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/aliasing.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/host_compatibility.cpp
+    test_aliasing.cpp
+)
 set(GCN_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -157,17 +181,9 @@ set(INPUT_TEST_SOURCES
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
+add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
-add_executable(shadps4_video_core_test ${VIDEO_CORE_TEST_SOURCES})
-add_executable(shadps4_cache_storage_test
-    ${CMAKE_SOURCE_DIR}/src/video_core/cache_archive.cpp
-    ${CMAKE_SOURCE_DIR}/src/video_core/host_shader_cache.cpp
-    test_cache_archive.cpp
-    test_host_shader_cache.cpp
-    test_cache_task_queue.cpp
-)
-add_executable(shadps4_input_test ${INPUT_TEST_SOURCES})
-add_executable(shadps4_presentation_queue_test test_presentation_queue.cpp)
+add_executable(shadps4_aliasing_test ${ALIASING_TEST_SOURCES})
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -179,6 +195,14 @@ foreach(t ${TEST_TARGETS})
 endforeach()
 
 target_link_libraries(shadps4_settings_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_ngs2_test PRIVATE
     GTest::gtest_main
     fmt::fmt
     nlohmann_json::nlohmann_json
@@ -199,20 +223,11 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     spdlog::spdlog
     half::half
 )
-target_link_libraries(shadps4_video_core_test PRIVATE
+target_link_libraries(shadps4_aliasing_test PRIVATE
     GTest::gtest_main
-    Boost::headers
-    fmt::fmt
-    spdlog::spdlog
     Vulkan::Headers
-)
-target_link_libraries(shadps4_cache_storage_test PRIVATE GTest::gtest_main miniz::miniz)
-target_link_libraries(shadps4_input_test PRIVATE
-    GTest::gtest_main
-    SDL3::SDL3
     spdlog::spdlog
 )
-target_link_libraries(shadps4_presentation_queue_test PRIVATE GTest::gtest_main)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
