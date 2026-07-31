@@ -51,6 +51,7 @@ private:
                      SettingsCategory category);
 
     void AddSettingCheckbox(std::string name, bool& value);
+    void AddSettingInputInt(std::string name, int& value, std::string unit = {});
     void AddSettingSliderInt(std::string name, int& value, int min, int max);
     void AddSettingSliderFloat(std::string name, float& value, int min, int max, int precision);
     void AddSettingCombo(std::string name, int& value, std::vector<std::string> options);
@@ -156,6 +157,7 @@ private:
     // Experimental tab
     int readbacksModeSetting;
     bool readbackLinearImagesSetting;
+    bool gpuSyncFastPathsSetting;
     bool directMemoryAccessSetting;
     bool devkitConsoleSetting;
     bool neoModeSetting;
@@ -163,7 +165,11 @@ private:
     bool connectedNetworkSetting;
     bool pipelineCacheEnabledSetting;
     bool pipelineCacheArchiveSetting;
+    bool highDrawCallOptimizationSetting;
     int extraDmemSetting;
+    int app0ReadBandwidthSetting;
+    bool app0ReadDisableTimeStretchingSetting;
+    bool app0ReadUnlimitedSequentialReadSpeedSetting;
     int vblankFrequencySetting;
 };
 

@@ -81,6 +81,9 @@ public:
     /// Unmaps specified virtual memory area.
     void Unmap(VAddr virtual_addr, u64 size);
 
+    /// Marks the contents of a physical backing range as discardable.
+    void DiscardPhysical(PAddr phys_addr, u64 size);
+
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 

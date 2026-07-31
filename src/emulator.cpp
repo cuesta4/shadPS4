@@ -32,6 +32,7 @@
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/storage_scheduler.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_trophy.h"
@@ -80,6 +81,20 @@ void Emulator::Shutdown() {
     std::scoped_lock l{exit_mutex};
     if (exit_done) {
         return;
+    }
+    if (Core::FileSys::GetApp0StorageScheduler().IsEnabled()) {
+        const auto storage_stats = Core::FileSys::GetApp0StorageScheduler().GetStats();
+        LOG_DEBUG(
+            Kernel_Fs,
+            "app0 HDD summary: bytes={} chunks={} sequential={} positioned={} modeled_wait_ms={} "
+            "oversleep_ms={} host_overrun_ms={} host_wait_ms={} prefetched={} demand={} "
+            "max_staging={} max_queue={}",
+            storage_stats.bytes_read, storage_stats.chunks, storage_stats.sequential_chunks,
+            storage_stats.positioned_chunks, storage_stats.modeled_wait_ns / 1'000'000,
+            storage_stats.timer_oversleep_ns / 1'000'000, storage_stats.host_overrun_ns / 1'000'000,
+            storage_stats.host_wait_ns / 1'000'000, storage_stats.prefetched_chunks,
+            storage_stats.demand_chunks, storage_stats.max_staging_buffers,
+            storage_stats.max_queue_depth);
     }
     Common::Log::Flush();
     if (controllers) {
@@ -400,6 +415,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
+    const auto storage_config = Core::FileSys::GetApp0StorageScheduler().Configure({
+        .bandwidth_mibps = EmulatorSettings.GetApp0ReadBandwidthMiBps(),
+        .disable_time_stretching = EmulatorSettings.IsApp0ReadDisableTimeStretching(),
+        .unlimited_sequential_read_speed =
+            EmulatorSettings.IsApp0ReadUnlimitedSequentialReadSpeed(),
+    });
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
@@ -442,6 +463,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
     LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
+    LOG_INFO(Config, "Storage app0ReadBandwidthMiBps: {}", storage_config.bandwidth_mibps);
+    LOG_INFO(Config, "Storage app0ReadDisableTimeStretching: {}",
+             storage_config.disable_time_stretching);
+    LOG_INFO(Config, "Storage app0ReadUnlimitedSequentialReadSpeed: {}",
+             storage_config.unlimited_sequential_read_speed);
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
     LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
 #ifdef _WIN32
@@ -451,6 +477,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
+    LOG_INFO(Config, "GPU gpuSyncFastPaths: {}",
+             EmulatorSettings.IsGpuSyncFastPathsEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
     LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
     LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
@@ -577,9 +605,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(mount_download_dir, "/download0");
 
-    const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
+    const std::filesystem::path mount_captures_dir{R"(D:\CAPTURES\RenderDoc)"};
     if (!std::filesystem::exists(mount_captures_dir)) {
-        std::filesystem::create_directory(mount_captures_dir);
+        std::filesystem::create_directories(mount_captures_dir);
     }
     VideoCore::SetOutputDir(mount_captures_dir, id);
 

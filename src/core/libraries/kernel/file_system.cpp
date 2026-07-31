@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <string_view>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
@@ -21,6 +26,7 @@
 #include "core/file_sys/directories/normal_directory.h"
 #include "core/file_sys/directories/pfs_directory.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/storage_scheduler.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -130,6 +136,9 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
 
     bool read_only = false;
     file->m_guest_name = path;
+    file->storage_class = path == "/app0" || path.starts_with("/app0/")
+                              ? Core::FileSys::StorageClass::App0
+                              : Core::FileSys::StorageClass::Native;
     file->m_host_name = mnt->GetHostPath(file->m_guest_name, &read_only);
     bool exists = mnt->Exists(file->m_guest_name);
 
@@ -246,6 +255,10 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         }
     }
 
+    if (file->type == Core::FileSys::FileType::Regular) {
+        file->m_size = file->f.GetSize();
+    }
+
     file->is_opened = true;
     return handle;
 }
@@ -264,8 +277,7 @@ s32 PS4_SYSV_ABI sceKernelOpen(const char* path, s32 flags, /* SceKernelMode*/ u
 
 s32 PS4_SYSV_ABI close(s32 fd) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto* file = h->GetFile(fd);
-    if (file == nullptr) {
+    if (fd < 0) {
         *__Error() = POSIX_EBADF;
         return -1;
     }
@@ -280,8 +292,6 @@ s32 PS4_SYSV_ABI close(s32 fd) {
     }
     file->is_opened = false;
     LOG_INFO(Kernel_Fs, "Closing {}", file->m_guest_name);
-    // FIXME: Lock file mutex before deleting it?
-    h->DeleteHandle(fd);
     return ORBIS_OK;
 }
 
@@ -356,15 +366,95 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     return bytes;
 }
 
+// Returns the errno for an invalid iovec array, or 0 when it is acceptable.
+s32 IovecError(const OrbisKernelIovec* iov, s32 iovcnt) {
+    if (iovcnt < 0) {
+        return POSIX_EINVAL;
+    }
+    if (iov == nullptr && iovcnt != 0) {
+        return POSIX_EFAULT;
+    }
+    return 0;
+}
+
+Core::FileSys::StorageReadSpans MakeReadSpans(const OrbisKernelIovec* iov, s32 iovcnt, u64 limit) {
+    Core::FileSys::StorageReadSpans spans;
+    if (iovcnt <= 0) {
+        return spans;
+    }
+    spans.reserve(iovcnt);
+    for (s32 index = 0; index < iovcnt && limit != 0; ++index) {
+        const u64 size = std::min<u64>(iov[index].iov_len, limit);
+        spans.push_back({iov[index].iov_base, size});
+        limit -= size;
+    }
+    return spans;
+}
+
+s64 ReadRegularScheduled(const std::shared_ptr<Core::FileSys::File>& file,
+                         const OrbisKernelIovec* iov, s32 iovcnt, std::optional<u64> offset) {
+    auto& scheduler = Core::FileSys::GetApp0StorageScheduler();
+    u64 read_offset{};
+    u64 readable{};
+    {
+        std::scoped_lock lock{file->m_mutex};
+        const s64 current = offset ? static_cast<s64>(*offset) : file->f.Tell();
+        if (current < 0) {
+            *__Error() = POSIX_EIO;
+            return -1;
+        }
+        read_offset = static_cast<u64>(current);
+        const u64 file_size = file->m_size;
+        u64 requested{};
+        for (s32 index = 0; index < iovcnt; ++index) {
+            if (iov[index].iov_base == nullptr && iov[index].iov_len != 0) {
+                *__Error() = POSIX_EFAULT;
+                return -1;
+            }
+            if (iov[index].iov_len > std::numeric_limits<u64>::max() - requested) {
+                *__Error() = POSIX_EINVAL;
+                return -1;
+            }
+            requested += iov[index].iov_len;
+        }
+        readable = read_offset < file_size ? std::min(requested, file_size - read_offset) : 0;
+        // Reserve the range before releasing the file lock so concurrent reads cannot claim it.
+        if (!offset && !file->f.Seek(static_cast<s64>(read_offset + readable))) {
+            *__Error() = POSIX_EIO;
+            return -1;
+        }
+    }
+
+    auto spans = MakeReadSpans(iov, iovcnt, readable);
+    const s64 result = scheduler.ReadBlocking(file, spans, read_offset);
+    if (!offset && result != static_cast<s64>(readable)) {
+        std::scoped_lock lock{file->m_mutex};
+        const auto reserved_end = static_cast<s64>(read_offset + readable);
+        // Do not overwrite a position changed by another operation while this read was pending.
+        if (file->f.Tell() == reserved_end) {
+            file->f.Seek(static_cast<s64>(read_offset + std::max<s64>(result, 0)));
+        }
+    }
+    if (result < 0) {
+        *__Error() = POSIX_EIO;
+        return -1;
+    }
+    return result;
+}
+
 s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
+    if (const s32 error = IovecError(iov, iovcnt); error != 0) {
+        *__Error() = error;
+        return -1;
+    }
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto* file = h->GetFile(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;
     }
 
-    std::scoped_lock lk{file->m_mutex};
+    std::unique_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->readv(iov, iovcnt);
         if (result < 0) {
@@ -384,6 +474,11 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
     if (file->IsWriteOnly()) {
         *__Error() = POSIX_EBADF;
         return -1;
+    }
+
+    if (Core::FileSys::ShouldScheduleAppRead(*file)) {
+        lk.unlock();
+        return ReadRegularScheduled(file, iov, iovcnt, std::nullopt);
     }
 
     s64 total_read = 0;
@@ -520,13 +615,13 @@ s64 PS4_SYSV_ABI sceKernelLseek(s32 fd, s64 offset, s32 whence) {
 
 s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto* file = h->GetFile(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;
     }
 
-    std::scoped_lock lk{file->m_mutex};
+    std::unique_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->read(buf, nbytes);
         if (result < 0) {
@@ -549,6 +644,11 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
     if (file->IsWriteOnly()) {
         *__Error() = POSIX_EBADF;
         return -1;
+    }
+    if (Core::FileSys::ShouldScheduleAppRead(*file)) {
+        lk.unlock();
+        const OrbisKernelIovec iov{buf, nbytes};
+        return ReadRegularScheduled(file, &iov, 1, std::nullopt);
     }
 
     return ReadFile(file, buf, nbytes);
@@ -919,7 +1019,7 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
     fs::copy(src_path, dst_path,
              fs::copy_options::overwrite_existing | fs::copy_options::recursive);
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto file = h->GetFile(src_path);
+    auto* file = h->GetFile(src_path);
     if (file) {
         Common::FS::FileAccessMode access_mode = Common::FS::FileAccessMode::ReadWrite;
         if (auto* host = file->GetHostFile()) {
@@ -951,15 +1051,19 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         *__Error() = POSIX_EINVAL;
         return -1;
     }
+    if (const s32 error = IovecError(iov, iovcnt); error != 0) {
+        *__Error() = error;
+        return -1;
+    }
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
-    auto* file = h->GetFile(fd);
+    auto file = h->GetFileShared(fd);
     if (file == nullptr) {
         *__Error() = POSIX_EBADF;
         return -1;
     }
 
-    std::scoped_lock lk{file->m_mutex};
+    std::unique_lock lk{file->m_mutex};
     if (file->type == Core::FileSys::FileType::Device) {
         s64 result = file->device->preadv(iov, iovcnt, offset);
         if (result < 0) {

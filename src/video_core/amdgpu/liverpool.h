@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -93,6 +95,53 @@ public:
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
+    }
+
+    // Monotonically increasing revisions for graphics-pipeline-affecting state. Dynamic context
+    // registers that provably do not enter the graphics pipeline key are ignored. Shader user data
+    // has a separate structural revision because the pipeline cache revalidates specialization
+    // before reuse.
+    enum class GraphicsPipelineRevisionClass : u8 {
+        None,
+        Config,
+        Context,
+        ShaderStructural,
+        ShaderUserData,
+        Uconfig,
+    };
+
+    [[nodiscard]] u64 GraphicsPipelineRevision() const noexcept {
+        return graphics_pipeline_revision.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 GraphicsPipelineStructuralRevision() const noexcept {
+        return graphics_pipeline_structural_revision.load(std::memory_order_relaxed);
+    }
+
+    void UpdateGraphicsRegisters(void* dst, const void* src, size_t num_bytes,
+                                 GraphicsPipelineRevisionClass revision_class) noexcept {
+        if (!high_draw_call_optimization) {
+            std::memcpy(dst, src, num_bytes);
+            return;
+        }
+        if (num_bytes == 0 || std::memcmp(dst, src, num_bytes) == 0) {
+            return;
+        }
+        std::memcpy(dst, src, num_bytes);
+        if (revision_class != GraphicsPipelineRevisionClass::None) {
+            graphics_pipeline_revision.fetch_add(1, std::memory_order_relaxed);
+            if (revision_class != GraphicsPipelineRevisionClass::ShaderUserData) {
+                graphics_pipeline_structural_revision.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void InvalidateGraphicsPipelineRevision() noexcept {
+        if (!high_draw_call_optimization) {
+            return;
+        }
+        graphics_pipeline_revision.fetch_add(1, std::memory_order_relaxed);
+        graphics_pipeline_structural_revision.fetch_add(1, std::memory_order_relaxed);
     }
 
     template <bool wait_done = false>
@@ -221,7 +270,11 @@ private:
     } cblock{};
 
     Vulkan::Rasterizer* rasterizer{};
+    const bool high_draw_call_optimization;
+    const bool gpu_sync_fast_paths;
     Libraries::VideoOut::VideoOutPort* vo_port{};
+    std::atomic<u64> graphics_pipeline_revision{1};
+    std::atomic<u64> graphics_pipeline_structural_revision{1};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};

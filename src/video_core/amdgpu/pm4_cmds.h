@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <utility>
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"
@@ -934,22 +935,22 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+    void SignalFence(auto&& write_mem, auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            write_mem(Address<void*>(), DataDWord(), sizeof(u32));
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            write_mem(Address<void*>(), DataQWord(), sizeof(u64));
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            write_mem(Address<void*>(), GetGpuClock64(), sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            write_mem(Address<void*>(), GetGpuPerfCounter(), sizeof(u64));
             break;
         }
         case DataSelect::GdsMemStore: {
@@ -976,6 +977,15 @@ struct PM4CmdReleaseMem {
             UNREACHABLE();
         }
         }
+    }
+
+    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+        SignalFence(
+            [](void* address, const u64 data, const u32 num_bytes) {
+                std::memcpy(address, &data, num_bytes);
+            },
+            std::forward<decltype(signal_irq)>(signal_irq),
+            std::forward<decltype(gds_to_mem)>(gds_to_mem));
     }
 };
 

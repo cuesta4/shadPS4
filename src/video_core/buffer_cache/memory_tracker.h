@@ -23,7 +23,8 @@ public:
     static constexpr size_t MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
+    explicit MemoryTracker(PageManager& tracker_, bool high_draw_call_optimization_)
+        : tracker{&tracker_}, high_draw_call_optimization{high_draw_call_optimization_} {}
     ~MemoryTracker() = default;
 
     /// Returns true if a region has been modified from the CPU
@@ -38,7 +39,10 @@ public:
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(
-            query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
+            query_cpu_addr, query_size, [this](RegionManager* manager, u64 offset, size_t size) {
+                if (high_draw_call_optimization && !manager->HasAnyGpuModifiedPages()) {
+                    return false;
+                }
                 std::scoped_lock lk{manager->lock};
                 return manager->template IsRegionModified<Type::GPU>(offset, size);
             });
@@ -175,7 +179,7 @@ private:
             manager_pool.emplace_back();
             auto& last_pool = manager_pool.back();
             for (size_t i = 0; i < MANAGER_POOL_SIZE; i++) {
-                std::construct_at(&last_pool[i], tracker, 0);
+                std::construct_at(&last_pool[i], tracker, 0, high_draw_call_optimization);
                 free_managers.push_back(&last_pool[i]);
             }
         }
@@ -187,6 +191,7 @@ private:
     }
 
     PageManager* tracker;
+    const bool high_draw_call_optimization;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};

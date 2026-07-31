@@ -87,7 +87,8 @@ class GameController {
 public:
     GameController();
     virtual ~GameController() = default;
-    void ConnectController(SDL_Gamepad* pad);
+    void ConnectController(SDL_Gamepad* pad,
+                           StatePublication publication = StatePublication::Publish);
     void DisconnectController();
 
     State ReadState();
@@ -141,7 +142,7 @@ public:
         }
         return controllers[i];
     }
-    void TryOpenSDLControllers();
+    void TryOpenSDLControllers(StatePublication publication = StatePublication::Publish);
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);
