@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
+#include "common/vector_bytes.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -16,6 +19,18 @@
 
 namespace VideoCore {
 
+namespace {
+
+[[nodiscard]] size_t StreamSliceReuseHash(const VAddr address, const u32 size) {
+    u64 value = address ^ (static_cast<u64>(size) << 32);
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    return static_cast<size_t>(value);
+}
+
+} // namespace
+
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
@@ -25,8 +40,9 @@ static constexpr size_t DeviceBufferSize = 128_MB;
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
+    : instance{instance_}, scheduler{scheduler_},
+      high_draw_call_optimization{EmulatorSettings.IsHighDrawCallOptimization()},
+      liverpool{liverpool_}, memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
@@ -39,16 +55,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
 
-    memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    memory_tracker = std::make_unique<MemoryTracker>(tracker, high_draw_call_optimization);
+    if (high_draw_call_optimization) {
+        stream_slice_reuse_shadow_storage =
+            std::make_unique_for_overwrite<u8[]>(StreamSliceReuseShadowSize);
+    }
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
-
-    // Ensure the first slot is used for the null buffer
-    const auto null_id =
-        slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
-    ASSERT(null_id.index == 0);
-    const vk::Buffer& null_buffer = slot_buffers[null_id].buffer;
-    Vulkan::SetObjectName(instance.GetDevice(), null_buffer, "Null Buffer");
 
     // Set up garbage collection parameters
     if (!instance.CanReportMemoryUsage()) {
@@ -124,6 +137,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
+        download_buffer.InvalidateCpuCache(offset, total_size_bytes);
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
@@ -144,7 +158,15 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
 }
 
-void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
+void BufferCache::ResetCachedBindings() {
+    vertex_input_emission_valid = false;
+    vertex_buffers_emission_valid = false;
+    index_buffer_emission_valid = false;
+}
+
+void BufferCache::BindVertexBuffers(
+    const Vulkan::GraphicsPipeline& pipeline,
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     const auto& regs = liverpool->regs;
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -154,9 +176,24 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
     if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
+        const bool enabled = high_draw_call_optimization;
+        if (!enabled) {
+            vertex_input_emission_valid = false;
+        }
         const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        const bool skip_vertex_input = enabled && vertex_input_emission_valid &&
+                                       vertex_input_cmdbuf == cmdbuf &&
+                                       Common::EqualVectorBytes(emitted_attributes, attributes) &&
+                                       Common::EqualVectorBytes(emitted_bindings, bindings);
+        if (!skip_vertex_input) {
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            if (enabled) {
+                vertex_input_emission_valid = true;
+                vertex_input_cmdbuf = cmdbuf;
+                Common::CopyVector(emitted_attributes, attributes);
+                Common::CopyVector(emitted_bindings, bindings);
+            }
+        }
     }
 
     if (bindings.empty()) {
@@ -206,6 +243,13 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
+        if (IsRegionGpuModified(range.base_address, size)) {
+            if (auto barrier =
+                    buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                       vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                barriers.emplace_back(*barrier);
+            }
+        }
     }
 
     // Bind vertex buffers
@@ -213,8 +257,6 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
     Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
     Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
     Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    const auto null_buffer =
-        instance.IsNullDescriptorSupported() ? VK_NULL_HANDLE : GetBuffer(NULL_BUFFER_ID).Handle();
     for (const auto& buffer : guest_buffers) {
         if (buffer.GetSize() > 0) {
             const auto host_buffer_info =
@@ -227,24 +269,48 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
             host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                    host_buffer_info->base_address);
         } else {
-            host_buffers.emplace_back(null_buffer);
+            host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
         host_sizes.push_back(buffer.GetSize());
         host_strides.push_back(buffer.GetStride());
     }
 
+    // Vertex buffer bindings persist within a command buffer; skip the call when the exact same
+    // set was already bound on this command buffer. Changed guest data lands at a new stream
+    // offset, so identical handles and offsets imply identical contents.
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
+    const bool sizes_and_strides_relevant = !instance.IsVertexInputDynamicState();
+    const bool skip_bind =
+        high_draw_call_optimization && vertex_buffers_emission_valid &&
+        emitted_vertex_buffers_cmdbuf == cmdbuf &&
+        Common::EqualVectorBytes(emitted_host_buffers, host_buffers) &&
+        Common::EqualVectorBytes(emitted_host_offsets, host_offsets) &&
+        (!sizes_and_strides_relevant ||
+         (Common::EqualVectorBytes(emitted_host_sizes, host_sizes) &&
+          Common::EqualVectorBytes(emitted_host_strides, host_strides)));
+    if (skip_bind) {
+        return;
+    }
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    if (high_draw_call_optimization) {
+        vertex_buffers_emission_valid = true;
+        emitted_vertex_buffers_cmdbuf = cmdbuf;
+        Common::CopyVector(emitted_host_buffers, host_buffers);
+        Common::CopyVector(emitted_host_offsets, host_offsets);
+        Common::CopyVector(emitted_host_sizes, host_sizes);
+        Common::CopyVector(emitted_host_strides, host_strides);
+    }
 }
 
-void BufferCache::BindIndexBuffer(u32 index_offset) {
+void BufferCache::BindIndexBuffer(
+    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
@@ -257,8 +323,30 @@ void BufferCache::BindIndexBuffer(u32 index_offset) {
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    if (IsRegionGpuModified(index_address, index_buffer_size)) {
+        if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
+                                                 vk::PipelineStageFlagBits2::eIndexInput)) {
+            barriers.emplace_back(*barrier);
+        }
+    }
+    // Like vertex buffers, the index binding persists within a command buffer; identical
+    // handle/offset/type means the exact same data is already bound.
     const auto cmdbuf = scheduler.CommandBuffer();
+    const bool skip_bind = high_draw_call_optimization && index_buffer_emission_valid &&
+                           emitted_index_cmdbuf == cmdbuf &&
+                           emitted_index_buffer == vk_buffer->Handle() &&
+                           emitted_index_offset == offset && emitted_index_type == index_type;
+    if (skip_bind) {
+        return;
+    }
     cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    if (high_draw_call_optimization) {
+        index_buffer_emission_valid = true;
+        emitted_index_cmdbuf = cmdbuf;
+        emitted_index_buffer = vk_buffer->Handle();
+        emitted_index_offset = offset;
+        emitted_index_type = index_type;
+    }
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
@@ -372,13 +460,76 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
+std::pair<Buffer*, u32> BufferCache::ObtainStreamSlice(VAddr device_addr, u32 size) {
+    if (!high_draw_call_optimization) {
+        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        return {&stream_buffer, static_cast<u32>(offset)};
+    }
+
+    // Repeated draws often re-upload identical guest data. Keep a small 2-way cache of recently
+    // copied slices plus a shadow copy of the guest bytes; when the same address/size pair still
+    // holds identical data within the same tick and ring generation, reuse the previous offset.
+    const size_t set_index =
+        StreamSliceReuseHash(device_addr, size) % stream_slice_reuse_cache.size();
+    auto& cache_set = stream_slice_reuse_cache[set_index];
+    const void* const guest_data = reinterpret_cast<const void*>(device_addr);
+    const auto shadow_for_way = [&](size_t way) {
+        return stream_slice_reuse_shadow_storage.get() +
+               (set_index * StreamSliceReuseWayCount + way) * static_cast<size_t>(CACHING_PAGESIZE);
+    };
+    StreamSliceReuseEntry* cached_slice{};
+    size_t cached_way{};
+
+    for (size_t way = 0; way < StreamSliceReuseWayCount; ++way) {
+        auto& candidate = cache_set.ways[way];
+        if (!candidate.valid || candidate.address != device_addr || candidate.size != size) {
+            continue;
+        }
+        if (candidate.generation == stream_buffer.Generation() &&
+            candidate.tick == scheduler.CurrentTick() &&
+            std::memcmp(shadow_for_way(way), guest_data, size) == 0) {
+            return {&stream_buffer, candidate.offset};
+        }
+        cached_slice = &candidate;
+        cached_way = way;
+        break;
+    }
+
+    if (cached_slice == nullptr) {
+        for (size_t way = 0; way < StreamSliceReuseWayCount; ++way) {
+            if (!cache_set.ways[way].valid) {
+                cached_slice = &cache_set.ways[way];
+                cached_way = way;
+                break;
+            }
+        }
+        if (cached_slice == nullptr) {
+            cached_way = cache_set.next_replacement;
+            cache_set.next_replacement =
+                (cache_set.next_replacement + 1) % StreamSliceReuseWayCount;
+            cached_slice = &cache_set.ways[cached_way];
+        }
+    }
+
+    const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+    std::memcpy(shadow_for_way(cached_way), guest_data, size);
+    *cached_slice = StreamSliceReuseEntry{
+        .address = device_addr,
+        .size = size,
+        .generation = stream_buffer.Generation(),
+        .tick = scheduler.CurrentTick(),
+        .offset = static_cast<u32>(offset),
+        .valid = true,
+    };
+    return {&stream_buffer, static_cast<u32>(offset)};
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size) &&
         IsRegionCpuModified(device_addr, size)) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
+        return ObtainStreamSlice(device_addr, size);
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
@@ -425,9 +576,8 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
-    if (device_addr == 0) {
-        return NULL_BUFFER_ID;
-    }
+    ASSERT(device_addr != 0);
+    texture_cache.MaterializeForBufferAccess(device_addr, size);
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {
@@ -849,14 +999,16 @@ void BufferCache::RunGarbageCollector() {
     int max_deletions = aggressive ? 64 : 32;
     const auto clean_up = [&](BufferId buffer_id) {
         if (max_deletions == 0) {
-            return;
+            return true;
         }
         --max_deletions;
         Buffer& buffer = slot_buffers[buffer_id];
         // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
         DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes(), true);
         DeleteBuffer(buffer_id);
+        return max_deletions == 0;
     };
+    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {

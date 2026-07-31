@@ -32,6 +32,7 @@
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
 #include "core/file_sys/fs.h"
+#include "core/file_sys/storage_scheduler.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_trophy.h"
@@ -57,6 +58,8 @@ Frontend::WindowSDL* g_window = nullptr;
 
 namespace Core {
 
+std::mutex exit_mutex{};
+
 Emulator::Emulator() {
     // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
@@ -68,9 +71,39 @@ Emulator::Emulator() {
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
+    std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
 }
 
 Emulator::~Emulator() {}
+
+void Emulator::Shutdown() {
+    static bool exit_done = false;
+    std::scoped_lock l{exit_mutex};
+    if (exit_done) {
+        return;
+    }
+    if (Core::FileSys::GetApp0StorageScheduler().IsEnabled()) {
+        const auto storage_stats = Core::FileSys::GetApp0StorageScheduler().GetStats();
+        LOG_DEBUG(
+            Kernel_Fs,
+            "app0 HDD summary: bytes={} chunks={} sequential={} positioned={} modeled_wait_ms={} "
+            "oversleep_ms={} host_overrun_ms={} host_wait_ms={} prefetched={} demand={} "
+            "max_staging={} max_queue={}",
+            storage_stats.bytes_read, storage_stats.chunks, storage_stats.sequential_chunks,
+            storage_stats.positioned_chunks, storage_stats.modeled_wait_ns / 1'000'000,
+            storage_stats.timer_oversleep_ns / 1'000'000, storage_stats.host_overrun_ns / 1'000'000,
+            storage_stats.host_wait_ns / 1'000'000, storage_stats.prefetched_chunks,
+            storage_stats.demand_chunks, storage_stats.max_staging_buffers,
+            storage_stats.max_queue_depth);
+    }
+    Common::Log::Flush();
+    if (controllers) {
+        controllers->ResetLightbarColors();
+        // need to give SDL time to do this before the runtime exits
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    exit_done = true;
+}
 
 s32 ReadCompiledSdkVersion(const std::filesystem::path& file) {
     Core::Loader::Elf elf;
@@ -102,8 +135,15 @@ std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& npbind_p
     }
 
     auto np_comm_ids = npbind.GetNpCommIds();
-    if (!std::filesystem::exists(trophy_dir) || np_comm_ids.empty()) {
-        LOG_WARNING(Common_Filesystem, "Cannot extract game trophies");
+    if (np_comm_ids.empty()) {
+        LOG_WARNING(Common_Filesystem, "No NPCommIDs in npbind.dat");
+        return trophy_index_map;
+    }
+    auto& game_info = Common::ElfInfo::Instance();
+    game_info.SetNpCommIds(np_comm_ids);
+
+    if (!std::filesystem::exists(trophy_dir)) {
+        LOG_WARNING(Common_Filesystem, "Game does not contain a trophy directory");
         return trophy_index_map;
     }
 
@@ -128,10 +168,15 @@ std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& npbind_p
                 continue;
             }
 
-            // Extract the actual trophies if they're no extracted yet
+            // Add the relevant trophies to our trophy index map.
+            // This currently assumes the order of NPCommIDs matches the order of trophies.
             std::string np_comm_id = np_comm_ids[trophy_index];
+            trophy_index_map[trophy_index] = np_comm_id;
+            LOG_DEBUG(Loader, "Mapped trophy index {} to NPCommID: {}", trophy_index, np_comm_id);
+
+            // Extract the actual trophies if they're no extracted yet
             const auto& trophy_output_dir =
-                Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "trophy" / np_comm_id;
+                Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) / np_comm_id;
             if (!std::filesystem::exists(trophy_output_dir)) {
                 TRP trp;
                 if (!trp.Extract(entry, np_comm_id, trophy_output_dir)) {
@@ -153,11 +198,6 @@ std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& npbind_p
                                                user_trophy_file, discard);
                 }
             }
-
-            // Add the relevant trophies to our trophy index map.
-            // This currently assumes the order of NPCommIDs matches the order of trophies.
-            trophy_index_map[trophy_index] = np_comm_id;
-            LOG_DEBUG(Loader, "Mapped trophy index {} to NPCommID: {}", trophy_index, np_comm_id);
         }
     }
     return trophy_index_map;
@@ -252,6 +292,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         }
     }
 
+    EmulatorSettings.Load(id);
+    const auto storage_config = Core::FileSys::GetApp0StorageScheduler().Configure({
+        .bandwidth_mibps = EmulatorSettings.GetApp0ReadBandwidthMiBps(),
+        .disable_time_stretching = EmulatorSettings.IsApp0ReadDisableTimeStretching(),
+        .unlimited_sequential_read_speed =
+            EmulatorSettings.IsApp0ReadUnlimitedSequentialReadSpeed(),
+    });
+    // Switch to configured log
+    Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
+                                                                          : "shad_log.txt");
+
     auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
     const auto eboot_path = mnt->GetHostPath(guest_eboot_path);
 
@@ -271,12 +322,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     game_info.game_folder = game_folder;
-    EmulatorSettings.Load(id);
-
-    Common::Log::Shutdown();
-    // Initialize logging as soon as possible
-    Common::Log::Setup((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
-                                                                         : "shad_log.txt");
 
     if (!std::filesystem::exists(file)) {
         LOG_CRITICAL(Loader, "eboot.bin does not exist: {}",
@@ -297,6 +342,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
     LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
+    LOG_INFO(Config, "Storage app0ReadBandwidthMiBps: {}", storage_config.bandwidth_mibps);
+    LOG_INFO(Config, "Storage app0ReadDisableTimeStretching: {}",
+             storage_config.disable_time_stretching);
+    LOG_INFO(Config, "Storage app0ReadUnlimitedSequentialReadSpeed: {}",
+             storage_config.unlimited_sequential_read_speed);
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
     LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
 #ifdef _WIN32
@@ -306,6 +356,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
+    LOG_INFO(Config, "GPU gpuSyncFastPaths: {}",
+             EmulatorSettings.IsGpuSyncFastPathsEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
     LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
     LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
@@ -408,6 +460,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     g_window = window.get();
 
+    std::filesystem::path icon_path = mnt->GetHostPath("/app0/sce_sys/icon0.png");
+    window->SetIcon(icon_path);
+
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir);
     mnt->Mount(mount_data_dir, "/data");
 
@@ -428,9 +483,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(mount_download_dir, "/download0");
 
-    const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
+    const std::filesystem::path mount_captures_dir{R"(D:\CAPTURES\RenderDoc)"};
     if (!std::filesystem::exists(mount_captures_dir)) {
-        std::filesystem::create_directory(mount_captures_dir);
+        std::filesystem::create_directories(mount_captures_dir);
     }
     VideoCore::SetOutputDir(mount_captures_dir, id);
 

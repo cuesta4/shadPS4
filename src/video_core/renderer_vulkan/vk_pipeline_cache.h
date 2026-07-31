@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <optional>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -45,8 +48,31 @@ struct Program {
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
+    struct FastPath {
+        bool valid{};
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        std::vector<u32> flattened_ud_buf{};
+        vk::ShaderModule module{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_data{};
+        u64 perm_hash{};
+        size_t perm_idx{};
+    };
+
+    struct FetchShaderCacheEntry {
+        bool valid{};
+        const u32* code{};
+        std::vector<u32> code_snapshot{};
+        std::optional<Shader::Gcn::FetchShaderData> data{};
+    };
+
+    static constexpr size_t FetchShaderCacheSize = 8;
+
     Shader::Info info;
     ModuleList modules{};
+    FastPath fast_path{};
+    std::array<FetchShaderCacheEntry, FetchShaderCacheSize> fetch_shader_cache{};
+    size_t next_fetch_shader_cache{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -78,6 +104,10 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline();
 
+    void InvalidateGraphicsPipelineFastPath() noexcept {
+        graphics_pipeline_l1_valid = false;
+    }
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
@@ -98,6 +128,7 @@ public:
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
+    bool TryRefreshGraphicsStagesForDynamicUserData(const GraphicsPipeline* pipeline);
     bool RefreshComputeKey();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
@@ -109,13 +140,24 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
 
+    std::optional<Result> TryReuseGraphicsProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                                  const Shader::ShaderParams& params,
+                                                  Shader::Backend::Bindings& binding);
+    const std::optional<Shader::Gcn::FetchShaderData>* GetCachedFetchShaderData(
+        Program& program, Shader::Info& info, Shader::Stage stage);
+    void RememberGraphicsProgram(Shader::LogicalStage l_stage, size_t program_hash,
+                                 Program* program, size_t perm_idx);
+
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
 
+    const GraphicsPipeline* GetGraphicsPipelineSlow();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
+    const bool high_draw_call_optimization;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
@@ -132,6 +174,24 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    // Conservative graphics-pipeline reuse for high draw-call workloads.
+    static constexpr u64 GraphicsPipelineRevisionValidationPeriod = 4096;
+    bool graphics_pipeline_l1_valid{};
+    bool graphics_pipeline_l1_disabled_due_to_mismatch{};
+    bool graphics_pipeline_dynamic_ud_disabled_due_to_mismatch{};
+    u64 graphics_pipeline_l1_revision{};
+    u64 graphics_pipeline_l1_structural_revision{};
+    const GraphicsPipeline* graphics_pipeline_l1_pipeline{};
+    u64 graphics_pipeline_l1_validation_sequence{};
+    u64 graphics_pipeline_dynamic_ud_validation_sequence{};
+
+    struct GraphicsStageReuseEntry {
+        bool valid{};
+        size_t program_hash{};
+        Program* program{};
+        size_t perm_idx{};
+    };
+    std::array<GraphicsStageReuseEntry, MaxShaderStages> graphics_stage_reuse{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

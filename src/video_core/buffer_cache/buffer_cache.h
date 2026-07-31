@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <memory>
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -27,8 +30,6 @@ class GraphicsPipeline;
 namespace VideoCore {
 
 using BufferId = Common::SlotId;
-
-static constexpr BufferId NULL_BUFFER_ID{0};
 
 class TextureCache;
 class MemoryTracker;
@@ -112,10 +113,12 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
     /// Binds host vertex buffers for the current draw.
-    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline);
+    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
+                           boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
     /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset);
+    void BindIndexBuffer(u32 index_offset,
+                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -154,6 +157,9 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// Invalidates command-buffer-local cached dynamic vertex input state.
+    void ResetCachedBindings();
 
 private:
     template <typename Func>
@@ -199,8 +205,13 @@ private:
 
     void DeleteBuffer(BufferId buffer_id);
 
+    /// Copies a small read-only slice into the stream buffer, reusing the previous copy when the
+    /// guest data has not changed since it was uploaded within the same tick.
+    std::pair<Buffer*, u32> ObtainStreamSlice(VAddr device_addr, u32 size);
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
+    const bool high_draw_call_optimization;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
@@ -220,6 +231,48 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
+    bool vertex_input_emission_valid{};
+    vk::CommandBuffer vertex_input_cmdbuf{};
+    boost::container::static_vector<vk::VertexInputAttributeDescription2EXT, 32>
+        emitted_attributes{};
+    boost::container::static_vector<vk::VertexInputBindingDescription2EXT, 32> emitted_bindings{};
+
+    bool vertex_buffers_emission_valid{};
+    vk::CommandBuffer emitted_vertex_buffers_cmdbuf{};
+    boost::container::static_vector<vk::Buffer, 32> emitted_host_buffers{};
+    boost::container::static_vector<vk::DeviceSize, 32> emitted_host_offsets{};
+    boost::container::static_vector<vk::DeviceSize, 32> emitted_host_sizes{};
+    boost::container::static_vector<vk::DeviceSize, 32> emitted_host_strides{};
+
+    bool index_buffer_emission_valid{};
+    vk::CommandBuffer emitted_index_cmdbuf{};
+    vk::Buffer emitted_index_buffer{};
+    u32 emitted_index_offset{};
+    vk::IndexType emitted_index_type{};
+
+    struct StreamSliceReuseEntry {
+        VAddr address{};
+        u32 size{};
+        u64 generation{};
+        u64 tick{};
+        u32 offset{};
+        bool valid{};
+    };
+    static constexpr size_t StreamSliceReuseWayCount = 2;
+    static constexpr size_t StreamSliceReuseSlotCount = 8192;
+    static constexpr size_t StreamSliceReuseSetCount =
+        StreamSliceReuseSlotCount / StreamSliceReuseWayCount;
+    static constexpr size_t StreamSliceReuseShadowSize =
+        StreamSliceReuseSlotCount * static_cast<size_t>(CACHING_PAGESIZE);
+
+    struct StreamSliceReuseSet {
+        std::array<StreamSliceReuseEntry, StreamSliceReuseWayCount> ways{};
+        u8 next_replacement{};
+    };
+
+    std::array<StreamSliceReuseSet, StreamSliceReuseSetCount> stream_slice_reuse_cache{};
+    std::unique_ptr<u8[]> stream_slice_reuse_shadow_storage{};
+
     PageTable page_table;
 };
 

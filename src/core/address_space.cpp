@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <mutex>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -194,7 +195,7 @@ struct AddressSpace::Impl {
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
+                                            PAGE_EXECUTE_READWRITE, SEC_RESERVE, BackingSize,
                                             nullptr, nullptr, 0);
 
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
@@ -204,10 +205,10 @@ struct AddressSpace::Impl {
                                                       PAGE_NOACCESS, nullptr, 0));
         ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
 
-        // Map backing placeholder. This will commit the pages
-        void* const ret =
-            MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
-                           MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
+        // Keep one non-executable canonical view. SEC_RESERVE lets us commit physical pages only
+        // when the guest actually maps them instead of charging the full backing size up front.
+        void* const ret = MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
+                                         MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
         ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
     }
 
@@ -240,6 +241,13 @@ struct AddressSpace::Impl {
         void* ptr = nullptr;
         if (phys_addr != -1) {
             HANDLE backing = fd != -1 ? reinterpret_cast<HANDLE>(fd) : backing_handle;
+            if (fd == -1) {
+                void* const committed =
+                    VirtualAlloc(backing_base + phys_addr, size, MEM_COMMIT, PAGE_READWRITE);
+                ASSERT_MSG(committed == backing_base + phys_addr,
+                           "Failed to commit physical backing at {:#x}, size {:#x}: {}", phys_addr,
+                           size, Common::GetLastErrorMsg());
+            }
             if (fd != -1 && prot == PAGE_READONLY) {
                 // Allocate the memory for the mapping
                 DWORD resultvar;
@@ -571,7 +579,31 @@ struct AddressSpace::Impl {
         return reserved_regions;
     }
 
+    void DiscardPhysical(PAddr phys_addr, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical discard is out of bounds");
+        void* const address = backing_base + phys_addr;
+        const DWORD discard_error = DiscardVirtualMemory(address, size);
+        if (discard_error == ERROR_SUCCESS) {
+            return;
+        }
+
+        // DiscardVirtualMemory may reject a shared page-file view on older Windows revisions.
+        // MEM_RESET has the same content-invalidating contract for such mappings.
+        if (VirtualAlloc(address, size, MEM_RESET, PAGE_READWRITE) != nullptr) {
+            return;
+        }
+        const DWORD reset_error = GetLastError();
+        std::call_once(discard_failure_once, [=] {
+            LOG_WARNING(Kernel_Vmm,
+                        "Unable to discard physical backing pages (DiscardVirtualMemory={}, "
+                        "MEM_RESET={})",
+                        discard_error, reset_error);
+        });
+    }
+
     std::mutex mutex;
+    std::once_flag discard_failure_once;
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
@@ -792,7 +824,27 @@ struct AddressSpace::Impl {
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
+    void DiscardPhysical(PAddr phys_addr, u64 size) {
+        ASSERT_MSG(phys_addr <= BackingSize && size <= BackingSize - phys_addr,
+                   "Physical discard is out of bounds");
+        void* const address = backing_base + phys_addr;
+#ifdef MADV_REMOVE
+        if (madvise(address, size, MADV_REMOVE) == 0) {
+            return;
+        }
+#endif
+        if (madvise(address, size, MADV_DONTNEED) == 0) {
+            return;
+        }
+        const int error = errno;
+        std::call_once(discard_failure_once, [=] {
+            LOG_WARNING(Kernel_Vmm, "Unable to discard physical backing pages: {}",
+                        strerror(error));
+        });
+    }
+
     int backing_fd;
+    std::once_flag discard_failure_once;
     u8* backing_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
@@ -839,6 +891,10 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
 
 void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
     impl->Unmap(virtual_addr, size);
+}
+
+void AddressSpace::DiscardPhysical(PAddr phys_addr, u64 size) {
+    impl->DiscardPhysical(phys_addr, size);
 }
 
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {

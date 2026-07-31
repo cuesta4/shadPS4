@@ -32,6 +32,7 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    CpuReadTracked = 1 << 4, ///< CPU reads fault until GPU contents are materialized
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
@@ -77,8 +78,6 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
 };
-
-constexpr Common::SlotId NULL_IMAGE_ID{0};
 
 class BlitHelper;
 
@@ -178,6 +177,10 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    // Monotonic version of the contents represented by this independent VkImage. Images that
+    // alias the same guest allocation may not be Vulkan-compatible views of one another, so the
+    // texture cache uses this to propagate the newest contents on demand.
+    u64 alias_generation{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

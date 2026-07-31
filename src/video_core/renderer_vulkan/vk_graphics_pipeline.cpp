@@ -7,7 +7,10 @@
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/attribute.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -16,6 +19,36 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
+
+namespace {
+
+u64 BuildAuxTessPreviousStageOutputMask(const Shader::Info* vs_info,
+                                        const Shader::FragmentRuntimeInfo& fs_info) {
+    if (!vs_info) {
+        return 0;
+    }
+
+    u64 mask = 0;
+    if (fs_info.clip_distance_emulation &&
+        vs_info->stores.GetAny(Shader::IR::Attribute::ClipDistance)) {
+        mask |= 1ull;
+    }
+
+    for (u32 i = 0; i < Shader::IR::NumParams; ++i) {
+        const auto param = Shader::IR::Attribute::Param0 + static_cast<int>(i);
+        if (!vs_info->stores.GetAny(param)) {
+            continue;
+        }
+        const u32 location =
+            Shader::Backend::SPIRV::AuxTessAttributeLocation(i, fs_info.clip_distance_emulation);
+        if (location < 64u) {
+            mask |= 1ull << location;
+        }
+    }
+    return mask;
+}
+
+} // Anonymous namespace
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -194,7 +227,11 @@ GraphicsPipeline::GraphicsPipeline(
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            const auto* vs_info = infos[u32(Shader::LogicalStage::Vertex)];
+            const u64 previous_stage_output_mask =
+                BuildAuxTessPreviousStageOutputMask(vs_info, fs_info);
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info,
+                                                                       previous_stage_output_mask);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -275,31 +312,48 @@ GraphicsPipeline::GraphicsPipeline(
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend_controls[i];
+        const auto target_format = key.color_buffers[i].num_format;
+        BlendEquation color_equation{
+            .src_factor = control.color_src_factor,
+            .function = control.color_func,
+            .dst_factor = control.color_dst_factor,
+        };
+        BlendEquation alpha_equation{
+            .src_factor =
+                control.separate_alpha_blend ? control.alpha_src_factor : control.color_src_factor,
+            .function = control.separate_alpha_blend ? control.alpha_func : control.color_func,
+            .dst_factor =
+                control.separate_alpha_blend ? control.alpha_dst_factor : control.color_dst_factor,
+        };
 
-        const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
-        const auto color_blend = LiverpoolToVK::BlendOp(control.color_func);
-
-        const auto src_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
-                                   : src_color;
-        const auto dst_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
-                                   : dst_color;
-        const auto alpha_blend =
-            control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
-
-        const auto color_scaled_min_max =
-            (color_blend == vk::BlendOp::eMin || color_blend == vk::BlendOp::eMax) &&
-            (src_color != vk::BlendFactor::eOne || dst_color != vk::BlendFactor::eOne);
-        const auto alpha_scaled_min_max =
-            (alpha_blend == vk::BlendOp::eMin || alpha_blend == vk::BlendOp::eMax) &&
-            (src_alpha != vk::BlendFactor::eOne || dst_alpha != vk::BlendFactor::eOne);
-        if (color_scaled_min_max || alpha_scaled_min_max) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Unimplemented use of min/max blend op with blend factor not equal to one.");
+        const auto color_rewrite = RewriteScaledMinMaxBlend(color_equation, target_format);
+        const auto alpha_rewrite = RewriteScaledMinMaxBlend(alpha_equation, target_format);
+        const bool writes_color = bool(key.write_masks[i] & (vk::ColorComponentFlagBits::eR |
+                                                             vk::ColorComponentFlagBits::eG |
+                                                             vk::ColorComponentFlagBits::eB));
+        const bool writes_alpha = bool(key.write_masks[i] & vk::ColorComponentFlagBits::eA);
+        if (control.enable &&
+            ((writes_color && color_rewrite == BlendRewriteResult::Unsupported) ||
+             (writes_alpha && alpha_rewrite == BlendRewriteResult::Unsupported))) {
+            LOG_WARNING(Render_Vulkan,
+                        "Scaled MIN/MAX blend for attachment {} cannot be represented by Vulkan "
+                        "fixed-function blending (format={}, color={}/{}/{}, alpha={}/{}/{}, "
+                        "color_written={}, alpha_written={})",
+                        i, static_cast<u32>(target_format),
+                        static_cast<u32>(color_equation.src_factor),
+                        static_cast<u32>(color_equation.function),
+                        static_cast<u32>(color_equation.dst_factor),
+                        static_cast<u32>(alpha_equation.src_factor),
+                        static_cast<u32>(alpha_equation.function),
+                        static_cast<u32>(alpha_equation.dst_factor), writes_color, writes_alpha);
         }
+
+        auto src_color = LiverpoolToVK::BlendFactor(color_equation.src_factor);
+        auto dst_color = LiverpoolToVK::BlendFactor(color_equation.dst_factor);
+        const auto color_blend = LiverpoolToVK::BlendOp(color_equation.function);
+        const auto src_alpha = LiverpoolToVK::BlendFactor(alpha_equation.src_factor);
+        const auto dst_alpha = LiverpoolToVK::BlendFactor(alpha_equation.dst_factor);
+        const auto alpha_blend = LiverpoolToVK::BlendOp(alpha_equation.function);
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,

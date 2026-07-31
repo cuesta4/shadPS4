@@ -93,10 +93,13 @@ struct StageSpecialization {
     Backend::Bindings start{};
 
     StageSpecialization() = default;
-    StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+    StageSpecialization(
+        const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+        Backend::Bindings start_,
+        const std::optional<Gcn::FetchShaderData>* pre_parsed_fetch_shader_data = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        fetch_shader_data = Gcn::ParseFetchShader(info_);
+        fetch_shader_data = pre_parsed_fetch_shader_data != nullptr ? *pre_parsed_fetch_shader_data
+                                                                    : Gcn::ParseFetchShader(info_);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data->attributes,
@@ -194,6 +197,165 @@ struct StageSpecialization {
 
     [[nodiscard]] bool Valid() const {
         return info != nullptr;
+    }
+
+    /**
+     * Checks whether the currently bound resources are structurally compatible with this cached
+     * specialization without constructing a temporary StageSpecialization object.
+     *
+     * Dynamic addresses are intentionally ignored in the same way as operator==(): only fields
+     * that can change the generated shader permutation are compared. This is safe to use only after
+     * Info::RefreshFlatBuf() has refreshed indirect SRT-backed descriptors.
+     */
+    [[nodiscard]] bool Matches(
+        const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+        Backend::Bindings start_,
+        const std::optional<Gcn::FetchShaderData>* pre_parsed_fetch_shader_data = nullptr) const {
+        if (!Valid()) {
+            return false;
+        }
+
+        const auto current_fetch_shader_data = pre_parsed_fetch_shader_data != nullptr
+                                                   ? *pre_parsed_fetch_shader_data
+                                                   : Gcn::ParseFetchShader(info_);
+
+        if (runtime_info != runtime_info_) {
+            return false;
+        }
+        if (fetch_shader_data != current_fetch_shader_data) {
+            return false;
+        }
+
+        if (info_.stage == Stage::Vertex && current_fetch_shader_data) {
+            if (vs_attribs.size() != current_fetch_shader_data->attributes.size()) {
+                return false;
+            }
+            for (u32 i = 0; i < current_fetch_shader_data->attributes.size(); ++i) {
+                const auto& desc = current_fetch_shader_data->attributes[i];
+                const auto sharp = desc.GetSharp(info_);
+                VsAttribSpecialization current{};
+                if (sharp) {
+                    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+                    if (const auto step_rate = desc.GetStepRate();
+                        step_rate != InstanceIdType::None) {
+                        current.divisor = step_rate == InstanceIdType::OverStepRate0
+                                              ? runtime_info_.vs_info.step_rate_0
+                                              : (step_rate == InstanceIdType::OverStepRate1
+                                                     ? runtime_info_.vs_info.step_rate_1
+                                                     : 1);
+                    }
+                    current.num_class = profile_.support_legacy_vertex_attributes
+                                            ? AmdGpu::NumberClass{}
+                                            : AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+                    current.dst_select = sharp.DstSelect();
+                }
+                if (current != vs_attribs[i]) {
+                    return false;
+                }
+            }
+        } else if (!vs_attribs.empty()) {
+            return false;
+        }
+
+        if (fmasks.size() != info_.fmasks.size()) {
+            return false;
+        }
+        for (u32 i = 0; i < info_.fmasks.size(); ++i) {
+            const auto& desc = info_.fmasks[i];
+            const auto sharp = desc.GetSharp(info_);
+            FMaskSpecialization current{};
+            if (sharp) {
+                current.width = sharp.width;
+                current.height = sharp.height;
+            }
+            if (current != fmasks[i]) {
+                return false;
+            }
+        }
+
+        if (buffers.size() != info_.buffers.size() || images.size() != info_.images.size() ||
+            samplers.size() != info_.samplers.size()) {
+            return false;
+        }
+
+        std::bitset<MaxStageResources> current_bitset{};
+        u32 binding{};
+        for (u32 i = 0; i < info_.buffers.size(); ++i) {
+            const auto& desc = info_.buffers[i];
+            const auto sharp = desc.GetSharp(info_);
+            BufferSpecialization current{};
+            if (sharp) {
+                current_bitset.set(binding);
+                current.stride = sharp.GetStride();
+                current.is_storage = desc.IsStorage(sharp);
+                current.is_formatted = desc.is_formatted;
+                current.swizzle_enable = sharp.swizzle_enable;
+                if (current.is_formatted) {
+                    current.data_format = static_cast<u32>(sharp.GetDataFmt());
+                    current.num_format = static_cast<u32>(sharp.GetNumberFmt());
+                    current.dst_select = sharp.DstSelect();
+                    current.num_conversion = sharp.GetNumberConversion();
+                }
+                if (current.swizzle_enable) {
+                    current.index_stride = sharp.index_stride;
+                    current.element_size = sharp.element_size;
+                }
+            }
+            // Mirror operator==(): the newly observed resource controls whether its
+            // specialization fields participate in the comparison.
+            if (current_bitset[binding] && current != buffers[i]) {
+                return false;
+            }
+            ++binding;
+        }
+
+        for (u32 i = 0; i < info_.images.size(); ++i) {
+            const auto& desc = info_.images[i];
+            const auto sharp = desc.GetSharp(info_);
+            ImageSpecialization current{};
+            if (sharp) {
+                current_bitset.set(binding);
+                current.type = sharp.GetViewType(desc.is_array);
+                current.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
+                current.is_storage = desc.is_written;
+                current.is_cube = sharp.IsCube();
+                if (current.is_storage) {
+                    current.dst_select = sharp.DstSelect();
+                } else {
+                    current.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
+                }
+                current.num_conversion = sharp.GetNumberConversion();
+                current.num_bindings = desc.NumBindings(info_);
+            }
+            if (current_bitset[binding] && current != images[i]) {
+                return false;
+            }
+            ++binding;
+        }
+
+        // Preserve the existing operator==() semantics for stages without buffer/image bindings.
+        if (current_bitset.none() && bitset.none()) {
+            return true;
+        }
+
+        if (start != start_) {
+            return false;
+        }
+
+        for (u32 i = 0; i < info_.samplers.size(); ++i) {
+            const auto& desc = info_.samplers[i];
+            const auto sharp = desc.GetSharp(info_);
+            SamplerSpecialization current{};
+            if (sharp) {
+                current.force_unnormalized = sharp.force_unnormalized;
+                current.force_degamma = sharp.force_degamma;
+            }
+            if (current != samplers[i]) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     bool operator==(const StageSpecialization& other) const {

@@ -193,6 +193,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
+        ++generation;
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);
@@ -209,13 +210,8 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 }
 
 void StreamBuffer::Commit() {
-    if (!is_coherent) {
-        if (usage == MemoryUsage::Download) {
-            vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset,
-                                    mapped_size);
-        } else {
-            vmaFlushAllocation(instance->GetAllocator(), buffer.allocation, offset, mapped_size);
-        }
+    if (!is_coherent && usage != MemoryUsage::Download) {
+        vmaFlushAllocation(instance->GetAllocator(), buffer.allocation, offset, mapped_size);
     }
 
     offset += mapped_size;
@@ -233,6 +229,13 @@ void StreamBuffer::Commit() {
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
     watch.tick = scheduler->CurrentTick();
+}
+
+void StreamBuffer::InvalidateCpuCache(const u64 offset, const u64 size) {
+    ASSERT(usage == MemoryUsage::Download);
+    if (!is_coherent) {
+        vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset, size);
+    }
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {

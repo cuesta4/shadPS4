@@ -256,7 +256,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
         mapping_end = mapping_start + size;
     }
 
-    if (dmem_area == dmem_map.end()) {
+    if (dmem_area == dmem_map.end() || mapping_end > search_end) {
         // There are no suitable mappings in this range
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
@@ -273,7 +273,8 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 
 s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     // Basic bounds checking
-    if (phys_addr > total_direct_size || (is_checked && phys_addr + size > total_direct_size)) {
+    if (phys_addr > total_direct_size ||
+        (is_checked && size > total_direct_size - phys_addr)) {
         LOG_ERROR(Kernel_Vmm, "phys_addr {:#x}, size {:#x} goes outside dmem map", phys_addr, size);
         if (is_checked) {
             return ORBIS_KERNEL_ERROR_ENOENT;
@@ -284,13 +285,9 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     std::scoped_lock lk{unmap_mutex};
     // If this is a checked free, then all direct memory in range must be allocated.
     std::vector<std::pair<PAddr, u64>> free_list;
-    u64 remaining_size = size;
+    const PAddr release_end = phys_addr + std::min<u64>(size, total_direct_size - phys_addr);
     auto phys_handle = FindDmemArea(phys_addr);
-    for (; phys_handle != dmem_map.end(); phys_handle++) {
-        if (remaining_size == 0) {
-            // Done searching
-            break;
-        }
+    for (; phys_handle != dmem_map.end() && phys_handle->second.base < release_end; ++phys_handle) {
         auto& dmem_area = phys_handle->second;
         if (dmem_area.dma_type == PhysicalMemoryType::Free) {
             if (is_checked) {
@@ -304,13 +301,9 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 
         // Store physical address and size to release
         const PAddr current_phys_addr = std::max<PAddr>(phys_addr, phys_handle->first);
-        const u64 start_in_dma = current_phys_addr - phys_handle->first;
         const u64 size_in_dma =
-            std::min<u64>(remaining_size, phys_handle->second.size - start_in_dma);
+            std::min<PAddr>(release_end, dmem_area.GetEnd()) - current_phys_addr;
         free_list.emplace_back(current_phys_addr, size_in_dma);
-
-        // Track remaining size to free
-        remaining_size -= size_in_dma;
     }
 
     // Release any dmem mappings that reference this physical block.
@@ -320,12 +313,12 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
             continue;
         }
         for (auto& [offset_in_vma, phys_mapping] : mapping.phys_areas) {
-            if (phys_addr + size > phys_mapping.base &&
-                phys_addr < phys_mapping.base + phys_mapping.size) {
-                const u64 phys_offset =
-                    std::max<u64>(phys_mapping.base, phys_addr) - phys_mapping.base;
-                const VAddr addr_in_vma = mapping.base + offset_in_vma + phys_offset;
-                const u64 unmap_size = std::min<u64>(phys_mapping.size - phys_offset, size);
+            const PAddr overlap_start = std::max(phys_mapping.base, phys_addr);
+            const PAddr overlap_end = std::min(phys_mapping.GetEnd(), release_end);
+            if (overlap_start < overlap_end) {
+                const VAddr addr_in_vma =
+                    mapping.base + offset_in_vma + overlap_start - phys_mapping.base;
+                const u64 unmap_size = overlap_end - overlap_start;
 
                 // Unmapping might erase from vma_map. We can't do it here.
                 remove_list.emplace_back(addr_in_vma, unmap_size);
@@ -358,6 +351,10 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 
         // Merge the new dmem_area with dmem_map
         MergeAdjacent(dmem_map, dmem_handle);
+
+        // No direct-memory alias remains after the release. Invalidate the old contents and let
+        // the host return those physical backing pages to the system.
+        impl.DiscardPhysical(phys_addr, size);
     }
 
     return ORBIS_OK;
@@ -546,8 +543,11 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
     if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
         // Perform necessary error checking for Fixed & NoOverwrite case
-        ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-                   virtual_addr);
+        if (!IsValidMapping(virtual_addr, size)) {
+            LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map",
+                      virtual_addr, size);
+            return ORBIS_KERNEL_ERROR_ENOMEM;
+        }
         auto vma = FindVMA(virtual_addr)->second;
         auto remaining_size = vma.base + vma.size - virtual_addr;
         if (!vma.IsFree() || remaining_size < size) {
@@ -721,8 +721,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
-        ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-                   virtual_addr);
+        if (!IsValidMapping(virtual_addr, size)) {
+            LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map",
+                      virtual_addr, size);
+            return ORBIS_KERNEL_ERROR_ENOMEM;
+        }
         auto vma = FindVMA(virtual_addr)->second;
 
         auto remaining_size = vma.base + vma.size - virtual_addr;
@@ -785,6 +788,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     std::scoped_lock lk2{mutex};
 
     // Loop through all vmas in the area, unmap them.
+    std::vector<std::pair<PAddr, u64>> discard_list;
     u64 remaining_size = size;
     VAddr current_addr = virtual_addr;
     while (remaining_size != 0) {
@@ -811,6 +815,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
                 const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
                 auto& new_dmem_area = new_dmem_handle->second;
                 new_dmem_area.dma_type = PhysicalMemoryType::Pooled;
+                discard_list.emplace_back(phys_addr, size_in_dma);
 
                 // Coalesce with nearby direct memory areas.
                 MergeAdjacent(dmem_map, new_dmem_handle);
@@ -838,9 +843,63 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
 
     // Unmap from address space
     impl.Unmap(virtual_addr, size);
+    for (const auto& [phys_addr, discard_size] : discard_list) {
+        impl.DiscardPhysical(phys_addr, discard_size);
+    }
     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
     // TRACK_FREE(virtual_addr, "VMEM");
 
+    return ORBIS_OK;
+}
+
+s32 MemoryManager::ReleaseFlexibleMemory(VAddr virtual_addr, u64 size) {
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Flexible release range {:#x}-{:#x} is outside the memory map",
+                  virtual_addr, virtual_addr + size);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+
+    std::vector<std::pair<PAddr, u64>> discard_list;
+    VAddr current_addr = virtual_addr;
+    u64 remaining_size = size;
+    while (remaining_size > 0) {
+        const auto vma_handle = FindVMA(current_addr);
+        const auto& vma = vma_handle->second;
+        if (vma.type != VMAType::Flexible) {
+            LOG_ERROR(Kernel_Vmm, "Attempting to release a non-flexible area at {:#x}",
+                      current_addr);
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+
+        const u64 start_in_vma = current_addr - vma.base;
+        const u64 size_in_vma = std::min<u64>(remaining_size, vma.size - start_in_vma);
+
+        // The PS4 leaves GPU-accessible flexible pages resident. GPU mappings are not page-fault
+        // recoverable in the same way as CPU mappings, so mirror that rule on the host.
+        if (False(vma.prot & MemoryProt::GpuReadWrite)) {
+            u64 size_to_discard = size_in_vma;
+            auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+            while (phys_handle != vma.phys_areas.end() && size_to_discard > 0) {
+                const u64 phys_offset =
+                    std::max<u64>(phys_handle->first, start_in_vma) - phys_handle->first;
+                const PAddr phys_addr = phys_handle->second.base + phys_offset;
+                const u64 discard_size =
+                    std::min<u64>(size_to_discard, phys_handle->second.size - phys_offset);
+                discard_list.emplace_back(phys_addr, discard_size);
+                size_to_discard -= discard_size;
+                ++phys_handle;
+            }
+            ASSERT_MSG(size_to_discard == 0, "Flexible mapping has incomplete physical backing");
+        }
+
+        current_addr += size_in_vma;
+        remaining_size -= size_in_vma;
+    }
+
+    for (const auto& [phys_addr, discard_size] : discard_list) {
+        impl.DiscardPhysical(phys_addr, discard_size);
+    }
     return ORBIS_OK;
 }
 
@@ -853,8 +912,11 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     // Align address and size appropriately
     virtual_addr = Common::AlignDown(virtual_addr, 16_KB);
     size = Common::AlignUp(size, 16_KB);
-    ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+    if (!IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map", virtual_addr,
+                  size);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
 
     // If the requested range has GPU access, unmap from GPU.
     if (IsValidGpuMapping(virtual_addr, size)) {
@@ -874,7 +936,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
         return size_in_vma;
     }
 
-    VAddr current_addr = virtual_addr;
+    std::vector<std::pair<PAddr, u64>> discard_list;
     if (vma_base.phys_areas.size() > 0) {
         u64 size_to_free = size_in_vma;
         auto phys_handle = std::prev(vma_base.phys_areas.upper_bound(start_in_vma));
@@ -901,9 +963,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
                 // Coalesce with nearby flexible memory areas.
                 MergeAdjacent(fmem_map, new_fmem_handle);
 
-                // Zero out the old memory data
-                const auto unmap_hardware_address = impl.BackingBase() + phys_addr;
-                std::memset(unmap_hardware_address, 0, size_in_dma);
+                discard_list.emplace_back(phys_addr, size_in_dma);
 
                 // Update flexible usage
                 flexible_usage -= size_in_dma;
@@ -929,6 +989,9 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
         // Unmap the memory region.
         impl.Unmap(virtual_addr, size_in_vma);
+        for (const auto& [phys_addr, discard_size] : discard_list) {
+            impl.DiscardPhysical(phys_addr, discard_size);
+        }
         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
         // TRACK_FREE(virtual_addr, "VMEM");
     }
@@ -1382,7 +1445,10 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
     }
 
     // If the requested address is beyond the maximum our code can handle, throw an assert
-    ASSERT_MSG(IsValidMapping(virtual_addr), "Input address {:#x} is out of bounds", virtual_addr);
+    if (!IsValidMapping(virtual_addr)) {
+        LOG_ERROR(Kernel_Vmm, "addr = {:#x} is outside the memory map", virtual_addr);
+        return -1;
+    }
 
     // Align up the virtual_addr first.
     virtual_addr = Common::AlignUp(virtual_addr, alignment);

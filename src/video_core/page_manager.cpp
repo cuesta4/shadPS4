@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <limits>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -41,10 +42,10 @@ constexpr size_t PM_PAGE_BITS = 12;
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers : 7;
-        // At the moment only buffer cache can request read watchers.
-        // And buffers cannot overlap, thus only 1 can exist per page.
-        u8 num_read_watchers : 1;
+        u8 num_write_watchers;
+        // Buffer and demand-image read watches can overlap. Keep a real reference count so
+        // materializing either resource does not accidentally make the page readable early.
+        u8 num_read_watchers;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -64,6 +65,8 @@ struct PageManager::Impl {
         u8 AddDelta() {
             if constexpr (is_read) {
                 if constexpr (delta == 1) {
+                    ASSERT_MSG(num_read_watchers != std::numeric_limits<u8>::max(),
+                               "Too many read watchers");
                     return ++num_read_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
@@ -73,6 +76,8 @@ struct PageManager::Impl {
                 }
             } else {
                 if constexpr (delta == 1) {
+                    ASSERT_MSG(num_write_watchers != std::numeric_limits<u8>::max(),
+                               "Too many write watchers");
                     return ++num_write_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
@@ -377,9 +382,9 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
-template <bool track>
+template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
-    impl->UpdatePageWatchers<track, false>(addr, size);
+    impl->UpdatePageWatchers<track, is_read>(addr, size);
 }
 
 template <bool track, bool is_read>
@@ -387,8 +392,10 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask)
     impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
 
-template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
-template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, true>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
                                                                    RegionBits& mask) const;
 template void PageManager::UpdatePageWatchersForRegion<true, false>(VAddr base_addr,

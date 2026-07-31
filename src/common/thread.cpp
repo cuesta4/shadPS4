@@ -3,7 +3,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <condition_variable>
 #include <ctime>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -37,6 +41,93 @@
 #endif
 
 namespace Common {
+
+struct InterruptibleTimer::Impl {
+#ifdef _WIN32
+    HANDLE timer{};
+    HANDLE interrupt{};
+#else
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool interrupted{};
+#endif
+};
+
+InterruptibleTimer::InterruptibleTimer() : impl{std::make_unique<Impl>()} {
+#ifdef _WIN32
+    impl->timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+    if (impl->timer == nullptr) {
+        impl->timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }
+    impl->interrupt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#endif
+}
+
+InterruptibleTimer::~InterruptibleTimer() {
+#ifdef _WIN32
+    if (impl->timer != nullptr) {
+        CloseHandle(impl->timer);
+    }
+    if (impl->interrupt != nullptr) {
+        CloseHandle(impl->interrupt);
+    }
+#endif
+}
+
+void InterruptibleTimer::WaitUntil(std::chrono::steady_clock::time_point deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (deadline <= now) {
+        return;
+    }
+#ifdef _WIN32
+    if (impl->timer == nullptr || impl->interrupt == nullptr) {
+        std::this_thread::sleep_until(deadline);
+        return;
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+    LARGE_INTEGER interval{.QuadPart = -std::max<s64>(1, remaining / 100)};
+    if (!SetWaitableTimer(impl->timer, &interval, 0, nullptr, nullptr, FALSE)) {
+        std::this_thread::sleep_until(deadline);
+        return;
+    }
+    const std::array handles{impl->timer, impl->interrupt};
+    const DWORD result =
+        WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, INFINITE);
+    if (result == WAIT_OBJECT_0 + 1) {
+        CancelWaitableTimer(impl->timer);
+    }
+    if (result == WAIT_FAILED) {
+        std::this_thread::sleep_until(deadline);
+        return;
+    }
+#else
+    std::unique_lock lock{impl->mutex};
+    if (impl->interrupted) {
+        impl->interrupted = false;
+        return;
+    }
+    if (impl->cv.wait_until(lock, deadline, [&] { return impl->interrupted; })) {
+        impl->interrupted = false;
+        return;
+    }
+#endif
+}
+
+void InterruptibleTimer::Notify() {
+#ifdef _WIN32
+    if (impl->interrupt != nullptr) {
+        SetEvent(impl->interrupt);
+    }
+#else
+    {
+        std::scoped_lock lock{impl->mutex};
+        impl->interrupted = true;
+    }
+    impl->cv.notify_one();
+#endif
+}
 
 #ifdef __APPLE__
 
@@ -110,7 +201,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+    const auto begin_sleep = std::chrono::steady_clock::now();
 
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
@@ -231,22 +322,39 @@ void SetThreadName(void* thread, const char* name) {
 
 #endif
 
-AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
-    : target_interval(target_interval) {}
+AccurateTimer::AccurateTimer(const std::chrono::nanoseconds target_interval,
+                             const u32 max_catch_up_intervals,
+                             const MissedTickPolicy missed_tick_policy)
+    : target_interval{target_interval}, max_timing_debt{target_interval * max_catch_up_intervals},
+      missed_tick_policy{missed_tick_policy} {}
 
 void AccurateTimer::Start() {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
     if (total_wait.count() > 0) {
         AccurateSleep(total_wait, nullptr, false);
     }
-    start_time = std::chrono::high_resolution_clock::now();
+    start_time = std::chrono::steady_clock::now();
     total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
 }
 
 void AccurateTimer::End() {
-    auto now = std::chrono::high_resolution_clock::now();
+    const auto now = std::chrono::steady_clock::now();
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+
+    total_wait = Detail::NormalizePeriodicWait(total_wait, target_interval, max_timing_debt,
+                                               missed_tick_policy);
+}
+
+void AccurateTimer::Adjust(const std::chrono::nanoseconds correction) {
+    const auto minimum_wait = missed_tick_policy == MissedTickPolicy::CatchUp
+                                  ? -max_timing_debt
+                                  : std::chrono::nanoseconds{1};
+    total_wait = std::clamp(total_wait + correction, minimum_wait, target_interval);
+}
+
+void AccurateTimer::Reset() {
+    total_wait = target_interval;
 }
 
 std::string GetCurrentThreadName() {

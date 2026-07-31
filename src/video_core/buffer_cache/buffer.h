@@ -9,6 +9,7 @@
 #include <vector>
 #include "common/types.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/buffer_cache/buffer_access.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -124,26 +125,25 @@ public:
         return buffer.bda_addr;
     }
 
-    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
-                                                       vk::PipelineStageFlagBits2 dst_stage,
+    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_access_mask,
+                                                       vk::PipelineStageFlags2 dst_stage,
                                                        u32 offset = 0) {
-        if (dst_acess_mask == access_mask && stage == dst_stage) {
+        const auto transition = access_tracker.TransitionTo(dst_access_mask, dst_stage);
+        if (!transition) {
             return {};
         }
 
         DEBUG_ASSERT(offset < size_bytes);
 
         const auto barrier = vk::BufferMemoryBarrier2{
-            .srcStageMask = stage,
-            .srcAccessMask = access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_acess_mask,
+            .srcStageMask = transition->source_stages,
+            .srcAccessMask = transition->source_access,
+            .dstStageMask = transition->destination_stages,
+            .dstAccessMask = transition->destination_access,
             .buffer = buffer.buffer,
             .offset = offset,
             .size = size_bytes - offset,
         };
-        access_mask = dst_acess_mask;
-        stage = dst_stage;
         return barrier;
     }
 
@@ -162,10 +162,7 @@ public:
     Vulkan::Scheduler* scheduler;
     MemoryUsage usage;
     UniqueBuffer buffer;
-    vk::Flags<vk::AccessFlagBits2> access_mask{
-        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-        vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    BufferAccessTracker access_tracker;
 };
 
 class StreamBuffer : public Buffer {
@@ -178,6 +175,14 @@ public:
 
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
+
+    /// Makes a completed GPU download visible through the mapped CPU pointer.
+    void InvalidateCpuCache(u64 offset, u64 size);
+
+    /// Returns the ring-buffer generation. It changes whenever allocations wrap to offset zero.
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation;
+    }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -202,6 +207,7 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
+    u64 generation{1};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

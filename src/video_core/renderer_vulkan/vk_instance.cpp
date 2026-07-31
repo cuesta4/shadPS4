@@ -201,10 +201,10 @@ bool Instance::CreateDevice() {
                           vk::PhysicalDeviceRobustness2FeaturesEXT,
                           vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
                           vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
-                          vk::PhysicalDevicePortabilitySubsetFeaturesKHR,
                           vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
                           vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-                          vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
+                          vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT,
+                          vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -239,9 +239,23 @@ bool Instance::CreateDevice() {
     };
 
     // Required
-    ASSERT(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME));
-    ASSERT(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
-    ASSERT(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME));
+    ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
+               "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
+               "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
+               "Required Vulkan extension unavailable: {}",
+               VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    ASSERT_MSG(add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME),
+               "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+
+    const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+    ASSERT_MSG(robustness2_features.robustBufferAccess2,
+               "Required Vulkan feature unavailable: robustBufferAccess2");
+    ASSERT_MSG(robustness2_features.robustImageAccess2,
+               "Required Vulkan feature unavailable: robustImageAccess2");
+    ASSERT_MSG(robustness2_features.nullDescriptor,
+               "Required Vulkan feature unavailable: nullDescriptor");
 
     // Optional
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
@@ -262,20 +276,19 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- extendedDynamicState3ColorWriteMask: {}",
                  dynamic_state_3_features.extendedDynamicState3ColorWriteMask);
     }
-    robustness2 = add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-    if (robustness2) {
-        robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
-        LOG_INFO(Render_Vulkan, "- robustBufferAccess2: {}",
-                 robustness2_features.robustBufferAccess2);
-        LOG_INFO(Render_Vulkan, "- robustImageAccess2: {}",
-                 robustness2_features.robustImageAccess2);
-        LOG_INFO(Render_Vulkan, "- nullDescriptor: {}", robustness2_features.nullDescriptor);
-    }
     custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     list_restart = add_extension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+    if (list_restart) {
+        list_restart_features =
+            feature_chain.get<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();
+        LOG_INFO(Render_Vulkan, "- primitiveTopologyListRestart: {}",
+                 list_restart_features.primitiveTopologyListRestart);
+        LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
+                 list_restart_features.primitiveTopologyPatchListRestart);
+    }
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     if (!amd_shader_explicit_vertex_parameter) {
@@ -323,20 +336,12 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- sampler2DViewOf3D: {}",
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
+    supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    swapchain_maintenance1 = add_extension(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) &&
+                             feature_chain.get<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>()
+                                 .swapchainMaintenance1;
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
-
-#ifdef __APPLE__
-    if (driver_id == vk::DriverId::eMoltenvk) {
-        portability_subset = add_extension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
-        if (portability_subset) {
-            portability_features =
-                feature_chain.get<vk::PhysicalDevicePortabilitySubsetFeaturesKHR>();
-        }
-    }
-#endif
-
-    supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -365,8 +370,6 @@ bool Instance::CreateDevice() {
         .pQueuePriorities = queue_priorities.data(),
     };
 
-    const auto topology_list_restart_features =
-        feature_chain.get<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
@@ -452,17 +455,17 @@ bool Instance::CreateDevice() {
             .depthClipEnable = true,
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
-            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
-            .robustImageAccess2 = robustness2_features.robustImageAccess2,
-            .nullDescriptor = robustness2_features.nullDescriptor,
+            .robustBufferAccess2 = true,
+            .robustImageAccess2 = true,
+            .nullDescriptor = true,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
         },
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT{
-            .primitiveTopologyListRestart = true,
+            .primitiveTopologyListRestart = list_restart_features.primitiveTopologyListRestart,
             .primitiveTopologyPatchListRestart =
-                topology_list_restart_features.primitiveTopologyPatchListRestart,
+                list_restart_features.primitiveTopologyPatchListRestart,
         },
         vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{
             .fragmentShaderBarycentric = true,
@@ -504,27 +507,9 @@ bool Instance::CreateDevice() {
             .image2DViewOf3D = image_2d_view_of_3d_features.image2DViewOf3D,
             .sampler2DViewOf3D = image_2d_view_of_3d_features.sampler2DViewOf3D,
         },
-#ifdef __APPLE__
-        vk::PhysicalDevicePortabilitySubsetFeaturesKHR{
-            .constantAlphaColorBlendFactors = portability_features.constantAlphaColorBlendFactors,
-            .events = portability_features.events,
-            .imageViewFormatReinterpretation = portability_features.imageViewFormatReinterpretation,
-            .imageViewFormatSwizzle = portability_features.imageViewFormatSwizzle,
-            .imageView2DOn3DImage = portability_features.imageView2DOn3DImage,
-            .multisampleArrayImage = portability_features.multisampleArrayImage,
-            .mutableComparisonSamplers = portability_features.mutableComparisonSamplers,
-            .pointPolygons = portability_features.pointPolygons,
-            .samplerMipLodBias = portability_features.samplerMipLodBias,
-            .separateStencilMaskRef = portability_features.separateStencilMaskRef,
-            .shaderSampleRateInterpolationFunctions =
-                portability_features.shaderSampleRateInterpolationFunctions,
-            .tessellationIsolines = portability_features.tessellationIsolines,
-            .tessellationPointMode = portability_features.tessellationPointMode,
-            .triangleFans = portability_features.triangleFans,
-            .vertexAttributeAccessBeyondStride =
-                portability_features.vertexAttributeAccessBeyondStride,
+        vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT{
+            .swapchainMaintenance1 = true,
         },
-#endif
     };
 
     if (!custom_border_color) {
@@ -538,9 +523,6 @@ bool Instance::CreateDevice() {
     }
     if (!depth_clip_enable) {
         device_chain.unlink<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>();
-    }
-    if (!robustness2) {
-        device_chain.unlink<vk::PhysicalDeviceRobustness2FeaturesEXT>();
     }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
@@ -572,6 +554,9 @@ bool Instance::CreateDevice() {
     }
     if (!image_2d_view_of_3d) {
         device_chain.unlink<vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
+    }
+    if (!swapchain_maintenance1) {
+        device_chain.unlink<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
