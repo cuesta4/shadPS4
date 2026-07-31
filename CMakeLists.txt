@@ -867,6 +867,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_sys/directories/normal_directory.h
          src/core/file_sys/directories/pfs_directory.cpp
          src/core/file_sys/directories/pfs_directory.h
+         src/core/file_sys/storage_scheduler.cpp
+         src/core/file_sys/storage_scheduler.h
          src/core/file_format/pfs.h
          src/core/file_format/psf.cpp
          src/core/file_format/psf.h
@@ -1141,8 +1143,11 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/tile_manager.cpp
                src/video_core/texture_cache/tile_manager.h
                src/video_core/texture_cache/types.h
+               src/video_core/cache_archive.cpp
+               src/video_core/cache_archive.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/cache_task_queue.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/multi_level_page_table.h

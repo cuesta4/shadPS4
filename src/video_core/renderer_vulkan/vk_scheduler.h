@@ -55,15 +55,18 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 3> wait_semas;
     std::array<u64, 3> wait_ticks;
+    std::array<vk::PipelineStageFlags, 3> wait_stages;
     std::array<vk::Semaphore, 3> signal_semas;
     std::array<u64, 3> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1,
+                 vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
         wait_semas[num_wait_semas] = semaphore;
-        wait_ticks[num_wait_semas++] = tick;
+        wait_ticks[num_wait_semas] = tick;
+        wait_stages[num_wait_semas++] = stage;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
@@ -385,12 +388,46 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
+        if (gpu_sync_fast_paths) {
+            // Access normally precedes recording a Vulkan command. False positives only cause an
+            // unnecessary submission; they can never make an asynchronous guest completion early.
+            ++command_recording_generation;
+        }
         return current_cmdbuf;
+    }
+
+    /// Returns whether the active command buffer may contain commands not covered by a submit.
+    [[nodiscard]] bool HasUnsubmittedGpuWork() const noexcept {
+        return gpu_sync_fast_paths &&
+               command_recording_generation != submitted_recording_generation;
+    }
+
+    /// Returns the timeline tick signaled by the most recent submit.
+    [[nodiscard]] u64 LastSubmittedTick() const noexcept {
+        return last_submitted_tick;
     }
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore.CurrentTick();
+    }
+
+    /// Returns true when high draw-call CPU optimizations are enabled for this session.
+    [[nodiscard]] bool IsHighDrawCallOptimization() const noexcept {
+        return high_draw_call_optimization;
+    }
+
+    /// Returns a monotonic epoch incremented whenever graphics push-descriptor state is disturbed
+    /// in the guest command buffer. Cached partial pushes use this to reject stale state.
+    [[nodiscard]] u64 GraphicsPushDescriptorEpoch() const noexcept {
+        return graphics_push_descriptor_epoch;
+    }
+
+    /// Records a graphics push-descriptor write in the guest command buffer.
+    void NotifyGraphicsPushDescriptorSet() noexcept {
+        if (high_draw_call_optimization) {
+            ++graphics_push_descriptor_epoch;
+        }
     }
 
     /// Returns true when a tick has been triggered by the GPU.
@@ -416,14 +453,17 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperationAt(CurrentTick(), std::move(func));
+    }
+
+    /// Defers an operation until a specific submitted timeline point has completed.
+    void DeferPriorityOperationAt(const u64 tick, Common::UniqueFunction<void>&& func) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), tick);
         }
         priority_pending_ops_cv.notify_one();
     }
-
-    static std::mutex submit_mutex;
 
 private:
     void AllocateWorkerCommandBuffers();
@@ -434,10 +474,16 @@ private:
 
 private:
     const Instance& instance;
+    const bool high_draw_call_optimization;
+    const bool gpu_sync_fast_paths;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    mutable u64 command_recording_generation{};
+    u64 submitted_recording_generation{};
+    u64 last_submitted_tick{};
+    u64 graphics_push_descriptor_epoch{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

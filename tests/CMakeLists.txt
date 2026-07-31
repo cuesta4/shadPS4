@@ -20,7 +20,6 @@ set(SETTINGS_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
     ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
-
     # Minimal common support
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
@@ -36,6 +35,8 @@ set(SETTINGS_TEST_SOURCES
 
     # Tests
     test_emulator_settings.cpp
+    test_ring_buffer_queue.cpp
+    test_storage_scheduler.cpp
 )
 
 set(NGS2_TEST_SOURCES
@@ -159,6 +160,24 @@ set(GCN_TEST_SOURCES
 
     # Tests
     gcn/test_gcn_instructions.cpp
+)
+
+set(VIDEO_CORE_TEST_SOURCES
+    test_depth_stencil_state.cpp
+    test_buffer_access.cpp
+    test_blend_rewrite.cpp
+    test_pm4_sync.cpp
+)
+
+set(INPUT_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/input/controller_state.cpp
+
+    # Stubs that replace dependencies
+    stubs/kernel_stub.cpp
+
+    # Tests
+    input/test_controller_state.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})

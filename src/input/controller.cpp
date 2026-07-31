@@ -262,7 +262,7 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 
 static bool is_first_check = true;
 
-void GameControllers::TryOpenSDLControllers() {
+void GameControllers::TryOpenSDLControllers(StatePublication publication) {
     using namespace Libraries::UserService;
     int controller_count;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
@@ -317,7 +317,7 @@ void GameControllers::TryOpenSDLControllers() {
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
-                c->ConnectController(pad);
+                c->ConnectController(pad, publication);
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
@@ -345,7 +345,7 @@ void GameControllers::TryOpenSDLControllers() {
         if (controller_count == 0) {
             auto u = UserManagement.GetUserByPlayerIndex(1);
             controllers[0]->user_id = u->user_id;
-            controllers[0]->ConnectController(nullptr);
+            controllers[0]->ConnectController(nullptr, publication);
             UserManagement.LoginUser(u, 1);
         }
     }

@@ -167,7 +167,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     }
     if (game_id == "global") {
         std::map<std::string, std::string> default_bindings_to_add = {
-            {"hotkey_capture_frame", "f12"},
+            {"hotkey_capture_frame", "home"},
             {"hotkey_screenshot_with_overlays", "lalt, f12"},
             {"hotkey_fullscreen", "f11"},
             {"hotkey_show_fps", "f10"},
@@ -846,18 +846,18 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case Axis::TriggerLeft:
             ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), false);
             controller->Button(OrbisPadButtonDataOffset::L2, *new_param > 0x20);
             return;
         case Axis::TriggerRight:
             ApplyDeadzone(new_param, righttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), false);
             controller->Button(OrbisPadButtonDataOffset::R2, *new_param > 0x20);
             return;
         default:
             break;
         }
-        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
+        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier), false);
     }
 }
 

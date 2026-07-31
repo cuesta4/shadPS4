@@ -9,5 +9,7 @@ namespace Libraries::Kernel {
 
 void TestSetSdkVersion(s32 ver);
 void TestResetSdkVersion();
+void TestSetProcessTime(u64 time);
+void TestResetProcessTime();
 
 } // namespace Libraries::Kernel

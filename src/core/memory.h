@@ -261,6 +261,8 @@ public:
 
     s32 PoolDecommit(VAddr virtual_addr, u64 size);
 
+    s32 ReleaseFlexibleMemory(VAddr virtual_addr, u64 size);
+
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
     s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot);

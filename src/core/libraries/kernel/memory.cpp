@@ -342,6 +342,17 @@ s32 PS4_SYSV_ABI sceKernelMapFlexibleMemory(void** addr_in_out, u64 len, s32 pro
     return sceKernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "anon");
 }
 
+s32 PS4_SYSV_ABI sceKernelReleaseFlexibleMemory(void* addr, u64 len) {
+    LOG_INFO(Kernel_Vmm, "addr = {}, len = {:#x}", fmt::ptr(addr), len);
+    const VAddr virtual_addr = reinterpret_cast<VAddr>(addr);
+    if (!Common::Is16KBAligned(virtual_addr) || len == 0 || !Common::Is16KBAligned(len) ||
+        virtual_addr + len < virtual_addr) {
+        LOG_ERROR(Kernel_Vmm, "Release range is empty or not 16KB aligned");
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    return Core::Memory::Instance()->ReleaseFlexibleMemory(virtual_addr, len);
+}
+
 s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 len, s32 prot,
                                                        s32 flags, const char* name) {
     LOG_INFO(Kernel_Vmm, "in_addr = {}, len = {:#x}, prot = {:#x}, flags = {:#x}, name = '{}'",
@@ -923,6 +934,7 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("aNz11fnnzi4", "libkernel_avlfmem", 1, "libkernel",
                  sceKernelAvailableFlexibleMemorySize);
     LIB_FUNCTION("IWIBBdTHit4", "libkernel", 1, "libkernel", sceKernelMapFlexibleMemory);
+    LIB_FUNCTION("teiItL2boFw", "libkernel", 1, "libkernel", sceKernelReleaseFlexibleMemory);
     LIB_FUNCTION("p5EcQeEeJAE", "libkernel", 1, "libkernel", _sceKernelRtldSetApplicationHeapAPI);
     LIB_FUNCTION("2SKEx6bSq-4", "libkernel", 1, "libkernel", sceKernelBatchMap);
     LIB_FUNCTION("kBJzF8x4SyE", "libkernel", 1, "libkernel", sceKernelBatchMap2);

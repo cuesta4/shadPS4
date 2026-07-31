@@ -134,6 +134,11 @@ enum class FileType {
     Equeue
 };
 
+enum class StorageClass {
+    Native,
+    App0,
+};
+
 struct File {
     std::atomic_bool is_opened{};
     std::atomic<FileType> type{FileType::Regular};
@@ -191,6 +196,11 @@ public:
 
     int CreateHandle();
     void DeleteHandle(int d);
+    std::shared_ptr<File> TakeHandle(int d);
+    std::shared_ptr<File> GetFileShared(int d);
+    // Returns a raw pointer without extending the file's lifetime: a caller racing close()
+    // can observe a dangling pointer. New call sites should prefer GetFileShared; existing
+    // ones still need to be migrated.
     File* GetFile(int d);
     File* GetSocket(int d);
     File* GetEpoll(int d);
@@ -201,7 +211,7 @@ public:
     void CreateStdHandles();
 
 private:
-    std::vector<File*> m_files;
+    std::vector<std::shared_ptr<File>> m_files;
     std::mutex m_mutex;
 };
 

@@ -21,45 +21,43 @@ namespace VideoCore {
 
 enum class CaptureState {
     Idle,
-    Triggered,
+    StartRequested,
     InProgress,
+    StopRequested,
 };
-static CaptureState capture_state{CaptureState::Idle};
+static std::atomic<CaptureState> capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {
+    if (!EmulatorSettings.IsRenderdocEnabled()) {
+        return;
+    }
+
 #ifdef WIN32
 
     // Check if we are running by RDoc GUI
-    HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
-        // If enabled in config, try to load RDoc runtime in offline mode
-        HKEY h_reg_key;
-        LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                                    L"SOFTWARE\\Classes\\RenderDoc.RDCCapture.1\\DefaultIcon\\", 0,
-                                    KEY_READ, &h_reg_key);
-        if (result != ERROR_SUCCESS) {
-            return;
+    HMODULE mod = GetModuleHandleW(L"renderdoc.dll");
+    if (!mod) {
+        static constexpr wchar_t RenderDocPath[] = LR"(C:\Program Files\RenderDoc\renderdoc.dll)";
+        mod = LoadLibraryW(RenderDocPath);
+        if (!mod) {
+            LOG_ERROR(Render,
+                      "Cannot load RenderDoc from C:\\Program Files\\RenderDoc "
+                      "(Windows error {})",
+                      GetLastError());
         }
-        std::array<wchar_t, MAX_PATH> key_str{};
-        DWORD str_sz_out{key_str.size()};
-        result = RegQueryValueExW(h_reg_key, L"", 0, NULL, (LPBYTE)key_str.data(), &str_sz_out);
-        if (result != ERROR_SUCCESS) {
-            return;
-        }
-
-        std::filesystem::path path{key_str.cbegin(), key_str.cend()};
-        path = path.parent_path().append("renderdoc.dll");
-        const auto path_to_lib = path.generic_string();
-        mod = LoadLibraryA(path_to_lib.c_str());
     }
 
     if (mod) {
         const auto RENDERDOC_GetAPI =
             reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(mod, "RENDERDOC_GetAPI"));
+        if (!RENDERDOC_GetAPI) {
+            LOG_ERROR(Render, "Loaded RenderDoc module does not export RENDERDOC_GetAPI");
+            return;
+        }
         const s32 ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
         ASSERT(ret == 1);
     }
@@ -98,9 +96,11 @@ void StartCapture() {
         return;
     }
 
-    if (capture_state == CaptureState::Triggered) {
+    CaptureState expected = CaptureState::StartRequested;
+    if (capture_state.compare_exchange_strong(expected, CaptureState::InProgress,
+                                              std::memory_order_acq_rel)) {
         rdoc_api->StartFrameCapture(nullptr, nullptr);
-        capture_state = CaptureState::InProgress;
+        LOG_INFO(Render, "RenderDoc multi-frame capture started; press Home again to save");
     }
 }
 
@@ -109,15 +109,45 @@ void EndCapture() {
         return;
     }
 
-    if (capture_state == CaptureState::InProgress) {
-        rdoc_api->EndFrameCapture(nullptr, nullptr);
-        capture_state = CaptureState::Idle;
+    CaptureState expected = CaptureState::StopRequested;
+    if (capture_state.compare_exchange_strong(expected, CaptureState::Idle,
+                                              std::memory_order_acq_rel)) {
+        if (rdoc_api->EndFrameCapture(nullptr, nullptr) == 0) {
+            LOG_ERROR(Render, "RenderDoc failed to end capture");
+        } else {
+            LOG_INFO(Render, "RenderDoc multi-frame capture saved");
+        }
     }
 }
 
-void TriggerCapture() {
-    if (capture_state == CaptureState::Idle) {
-        capture_state = CaptureState::Triggered;
+void ToggleCapture() {
+    CaptureState state = capture_state.load(std::memory_order_acquire);
+    for (;;) {
+        switch (state) {
+        case CaptureState::Idle:
+            if (capture_state.compare_exchange_weak(state, CaptureState::StartRequested,
+                                                    std::memory_order_acq_rel)) {
+                LOG_INFO(Render, "RenderDoc capture requested");
+                return;
+            }
+            break;
+        case CaptureState::StartRequested:
+            if (capture_state.compare_exchange_weak(state, CaptureState::Idle,
+                                                    std::memory_order_acq_rel)) {
+                LOG_INFO(Render, "RenderDoc capture request cancelled");
+                return;
+            }
+            break;
+        case CaptureState::InProgress:
+            if (capture_state.compare_exchange_weak(state, CaptureState::StopRequested,
+                                                    std::memory_order_acq_rel)) {
+                LOG_INFO(Render, "RenderDoc capture save requested");
+                return;
+            }
+            break;
+        case CaptureState::StopRequested:
+            return;
+        }
     }
 }
 

@@ -88,14 +88,21 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// Materializes GPU-written linear images before a CPU read consumes their RAM backing.
+    bool ReadMemory(VAddr addr, size_t size);
+
+    /// Materializes GPU-written linear images before BufferCache consumes their RAM backing.
+    bool MaterializeForBufferAccess(VAddr addr, size_t size);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
-    /// Schedules a copy of pending images for download back to CPU memory.
-    void ProcessDownloadImages();
+    /// Schedules pending images for download back to CPU memory.
+    /// Returns true when at least one image copy was recorded.
+    bool ProcessDownloadImages();
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -104,12 +111,21 @@ public:
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
+    /// Applies texture-binding side effects and refreshes image contents without resolving a view.
+    void PrepareTexture(ImageId image_id, const ImageDesc& desc);
+
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the render target with specified properties
+    /// Applies render-target side effects without resolving a Vulkan image view.
+    void PrepareRenderTarget(ImageId image_id, const ImageDesc& desc);
+
+    /// Retrieves the render target with specified properties.
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the depth target with specified properties
+    /// Applies depth-target side effects without resolving a Vulkan image view.
+    void PrepareDepthTarget(ImageId image_id, const ImageDesc& desc);
+
+    /// Retrieves the depth target with specified properties.
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
@@ -134,6 +150,10 @@ public:
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base);
+
+    [[nodiscard]] u64 BindingGeneration() const noexcept {
+        return binding_generation;
+    }
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -322,6 +342,7 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        UntrackCpuReadback(image_id);
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -333,6 +354,7 @@ private:
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
+    const bool high_draw_call_optimization;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
@@ -342,6 +364,33 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+
+    // Small conservative lookup caches for the extremely hot texture-binding path.
+    // The image cache only shortcuts the exact-match branch already present in FindImage().
+    // It never bypasses UpdateImage(), view lookup, layout transitions, or descriptor emission.
+    struct FindImageFastEntry {
+        ImageId image_id{};
+        VAddr guest_address{};
+        u64 guest_size{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        vk::Format pixel_format{vk::Format::eUndefined};
+        AmdGpu::ImageType type{};
+        bool exact_fmt{};
+        bool valid{};
+    };
+    static constexpr size_t FindImageFastCacheSize = 8;
+    std::array<FindImageFastEntry, FindImageFastCacheSize> find_image_fast_cache{};
+    size_t find_image_fast_next{};
+
+    u64 binding_generation{1};
+
+    u64 sampler_fast_hash{};
+    vk::Sampler sampler_fast_handle{};
+    bool sampler_fast_valid{};
+
+    tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
     struct AliasState {
         // Backing contains the complete shared-memory view; writer is an uncommitted write.
@@ -374,8 +423,11 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
+    bool gpu_sync_fast_paths;
     PageTable page_table;
-    std::mutex mutex;
+    // A protected CPU access may re-enter the cache from the GPU command processor while a
+    // cache operation is already in progress on that same thread.
+    std::recursive_mutex mutex;
     std::mutex samplers_mutex;
     struct MetaDataInfo {
         enum class Type {
