@@ -3,6 +3,7 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include "common/performance_telemetry.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -26,6 +27,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
     if (!buffer_barriers.empty()) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::BarrierCalls);
         const auto dependencies = vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = u32(buffer_barriers.size()),

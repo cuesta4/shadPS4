@@ -5,8 +5,10 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <thread>
+#include <mutex>
 #include <queue>
+#include <thread>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -47,10 +49,19 @@ public:
     void Wait(u64 tick);
 
 protected:
+    friend class Scheduler;
+
+    void TelemetrySubmit(u64 tick);
+    void TelemetryComplete(u64 tick);
+
     const Instance& instance;
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.
     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
     std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    std::mutex telemetry_mutex;
+    u64 telemetry_submitted_tick{};
+    u64 telemetry_completed_tick{};
+    u64 telemetry_idle_since_ns{};
 };
 
 } // namespace Vulkan

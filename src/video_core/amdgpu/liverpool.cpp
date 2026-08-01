@@ -11,6 +11,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -207,6 +208,9 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            Common::PerformanceTelemetry::ScopedDuration blocked{
+                Common::PerformanceTelemetry::Counter::GcpBlockedNs,
+                Common::PerformanceTelemetry::EventType::GcpBlocked};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
@@ -215,6 +219,11 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
 
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::GcpWakes);
+        Common::PerformanceTelemetry::ScopedDuration active{
+            Common::PerformanceTelemetry::Counter::GcpActiveNs,
+            Common::PerformanceTelemetry::EventType::GcpActive};
         VideoCore::StartCapture();
 
         curr_qid = -1;
@@ -223,6 +232,8 @@ void Liverpool::Process(std::stop_token stoken) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::QueueScans);
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -234,7 +245,21 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            task.resume();
+            auto& ready_since_ns = task.promise().telemetry_ready_since_ns;
+            if (ready_since_ns != 0) {
+                Common::PerformanceTelemetry::RecordDurationEnabled(
+                    Common::PerformanceTelemetry::Counter::QueueReadyNs,
+                    Common::PerformanceTelemetry::EventType::None, ready_since_ns,
+                    static_cast<u64>(curr_qid));
+                ready_since_ns = 0;
+            }
+            {
+                Common::PerformanceTelemetry::ScopedDuration resume{
+                    Common::PerformanceTelemetry::Counter::QueueResumeNs};
+                Common::PerformanceTelemetry::Add(
+                    Common::PerformanceTelemetry::Counter::QueueResumes);
+                task.resume();
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -261,7 +286,7 @@ void Liverpool::Process(std::stop_token stoken) {
     }
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, u32 ib_depth) {
     FIBER_ENTER(ccb_task_name);
 
     while (!ccb.empty()) {
@@ -275,6 +300,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        Common::PerformanceTelemetry::CountPm4Packet(
+            Common::PerformanceTelemetry::Pm4Engine::Constant, GfxQueueId,
+            static_cast<u32>(opcode), ib_depth, reinterpret_cast<uintptr_t>(header),
+            header->type3.NumWords() + 1);
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -307,7 +336,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size},
+                                ib_depth + 1);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -369,7 +399,8 @@ void Liverpool::WriteGraphicsRegisters(u32 first_register, const u32* payload, u
     }
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           u32 ib_depth) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -380,7 +411,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
+        ce_task = ProcessCeUpdate(ccb, ib_depth);
         RESUME_GFX(ce_task);
     }
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -403,11 +434,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             break;
         case 2:
             // Type-2 packet are used for padding purposes
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::Pm4Type2Packets);
             dcb = NextPacket(dcb, 1);
             continue;
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            Common::PerformanceTelemetry::CountPm4Packet(
+                Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
+                static_cast<u32>(opcode), ib_depth, reinterpret_cast<uintptr_t>(header),
+                count + 1);
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -988,7 +1025,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {},
+                    ib_depth + 1);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -1060,7 +1098,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u32 ib_depth) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -1101,6 +1139,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         if (header->type == 2) {
             // Type-2 packet are used for padding purposes
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::Pm4Type2Packets);
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
@@ -1116,6 +1156,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        Common::PerformanceTelemetry::CountPm4Packet(
+            Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1,
+            static_cast<u32>(opcode), ib_depth, reinterpret_cast<uintptr_t>(header), next_dw_off);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1126,7 +1169,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid,
+                ib_depth + 1);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -1374,13 +1418,23 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     auto task = ProcessGraphics(dcb, ccb);
+    task.handle.promise().telemetry_ready_since_ns = Common::PerformanceTelemetry::Enabled()
+                                                       ? Common::PerformanceTelemetry::Timestamp()
+                                                       : 0;
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
     }
 
     std::scoped_lock lk{submit_mutex};
-    ++num_submits;
+    const u32 queue_depth = ++num_submits;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GfxSubmits);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::DcbBytes,
+                                      dcb.size_bytes());
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CcbBytes,
+                                      ccb.size_bytes());
+    Common::PerformanceTelemetry::ObserveMax(
+        Common::PerformanceTelemetry::Counter::SubmitQueueDepthMax, queue_depth);
     submit_cv.notify_one();
 }
 
@@ -1390,6 +1444,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
+    task.handle.promise().telemetry_ready_since_ns = Common::PerformanceTelemetry::Enabled()
+                                                       ? Common::PerformanceTelemetry::Timestamp()
+                                                       : 0;
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
@@ -1397,7 +1454,12 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
-    ++num_submits;
+    const u32 queue_depth = ++num_submits;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AscSubmits);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AcbBytes,
+                                      acb.size_bytes());
+    Common::PerformanceTelemetry::ObserveMax(
+        Common::PerformanceTelemetry::Counter::SubmitQueueDepthMax, queue_depth);
     submit_cv.notify_one();
 }
 

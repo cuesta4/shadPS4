@@ -17,6 +17,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/performance_telemetry.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -613,6 +614,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         liverpool->GraphicsPipelineGeneration() == opt.graphics_dependency.fixed_generation) {
         const auto dependency = build_dependency();
         if (dependency && *dependency == opt.graphics_dependency) {
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::PipelineHits);
             return opt.graphics_pipeline;
         }
     }
@@ -634,14 +637,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
 const GraphicsPipeline* PipelineCache::ResolveGraphicsPipelineSlow() {
     if (!RefreshGraphicsKey()) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineMisses);
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineMisses);
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        Common::PerformanceTelemetry::ScopedDuration compile_duration{
+            Common::PerformanceTelemetry::Counter::PipelineCompileNs};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
@@ -658,6 +667,9 @@ const GraphicsPipeline* PipelineCache::ResolveGraphicsPipelineSlow() {
             }
         }
         fetch_shader.reset();
+    } else {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineHits);
     }
     return it->second.get();
 }
@@ -678,14 +690,20 @@ bool PipelineCache::CanReuseGraphicsPipeline() const {
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineMisses);
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineMisses);
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
+        Common::PerformanceTelemetry::ScopedDuration compile_duration{
+            Common::PerformanceTelemetry::Counter::PipelineCompileNs};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
@@ -696,6 +714,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
+    } else {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::PipelineHits);
     }
     return it->second.get();
 }

@@ -12,6 +12,7 @@
 #include <boost/container/static_vector.hpp>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -278,6 +279,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         const auto& request = requests.front();
         const auto [destination, offset] = stream_buffer.Map(request.size, request.alignment);
         ASSERT(destination != nullptr);
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::StagingBytes, request.size);
         switch (request.source_type) {
         case StreamCopySource::Guest:
             memory->CopySparseMemory(request.guest_address, destination, request.size);
@@ -384,6 +387,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
 
     const auto [destination, base_offset] = stream_buffer.Map(total_size, max_alignment);
     ASSERT(destination != nullptr);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
+                                      total_size);
 
     u16 guest_copy_count = 0;
     u64 guest_copy_size = 0;
@@ -473,6 +478,9 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                      total_size_bytes);
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
@@ -841,6 +849,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     };
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                      num_bytes);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 2,
@@ -901,6 +913,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 if (entry.generation == stream_buffer.Generation() &&
                     entry.tick == scheduler.CurrentTick() &&
                     std::memcmp(reuse.Shadow(set_index, way), reuse.scratch.data(), size) == 0) {
+                    Common::PerformanceTelemetry::Add(
+                        Common::PerformanceTelemetry::Counter::StreamSliceHits);
                     return {&stream_buffer, entry.offset};
                 }
                 replacement = &entry;
@@ -920,6 +934,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 
         const auto [destination, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         ASSERT(destination != nullptr);
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::StreamSliceMisses);
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::StagingBytes, size);
         std::memcpy(destination, reuse.scratch.data(), size);
         stream_buffer.Commit();
         std::memcpy(reuse.Shadow(set_index, replacement_way), reuse.scratch.data(), size);
@@ -959,6 +977,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     }
     // In all other cases, just do a CPU copy to the staging buffer.
     const auto [data, offset] = staging_buffer.Map(size, 16);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes, size);
     memory->CopySparseMemory(gpu_addr, data, size);
     staging_buffer.Commit();
     return {&staging_buffer, offset};
@@ -1218,6 +1237,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (src_buffer) {
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                          total_size_bytes);
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -1263,6 +1286,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         return VK_NULL_HANDLE;
     }
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
+                                      total_size_bytes);
     if (staging) {
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
@@ -1351,6 +1376,8 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .size = num_bytes,
     };
     vk::Buffer src_buffer = staging_buffer.Handle();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
+                                      num_bytes);
     if (num_bytes < StagingBufferSize) {
         const auto [staging, offset] = staging_buffer.Map(num_bytes);
         std::memcpy(staging, value, num_bytes);
@@ -1369,6 +1396,10 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
     }
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                      num_bytes);
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,

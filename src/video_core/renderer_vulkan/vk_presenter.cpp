@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/performance_telemetry.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -696,6 +697,9 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    Common::PerformanceTelemetry::ScopedDuration prepare_duration{
+        Common::PerformanceTelemetry::Counter::PresentPrepareNs,
+        Common::PerformanceTelemetry::EventType::PresentPrepare, cpu_address};
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -723,6 +727,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     draw_scheduler.EndRendering();
     const auto cmdbuf = draw_scheduler.CommandBuffer();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -858,6 +863,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    Common::PerformanceTelemetry::ScopedDuration present_duration{
+        Common::PerformanceTelemetry::Counter::PresentCpuNs,
+        Common::PerformanceTelemetry::EventType::PresentCpu, frame->id};
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1098,13 +1106,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::DriverPresentCalls);
+        const bool presented = [&] {
+            Common::PerformanceTelemetry::ScopedDuration present_driver_duration{
+                Common::PerformanceTelemetry::Counter::DriverPresentNs,
+                Common::PerformanceTelemetry::EventType::DriverPresent, frame->id};
+            return swapchain.Present();
+        }();
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
 
     free_frame();
     if (!is_reusing_frame) {
+        Common::PerformanceTelemetry::Record(
+            Common::PerformanceTelemetry::EventType::FramePresented, frame->id);
         DebugState.IncFlipFrameNum();
     }
 }
@@ -1131,6 +1149,10 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WaitCalls);
+    Common::PerformanceTelemetry::ScopedDuration wait_duration{
+        Common::PerformanceTelemetry::Counter::WaitNs,
+        Common::PerformanceTelemetry::EventType::Wait, frame->id};
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
