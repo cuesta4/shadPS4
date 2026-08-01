@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <limits>
+
+#include "common/performance_telemetry.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -28,7 +31,64 @@ MasterSemaphore::MasterSemaphore(const Instance& instance_) : instance{instance_
 
 MasterSemaphore::~MasterSemaphore() = default;
 
+void MasterSemaphore::TelemetrySubmit(u64 tick) {
+    if (!Common::PerformanceTelemetry::Enabled()) [[likely]] {
+        return;
+    }
+
+    u64 now{};
+    u64 idle_since{};
+    {
+        std::scoped_lock lock{telemetry_mutex};
+        now = Common::PerformanceTelemetry::Timestamp();
+        if (telemetry_idle_since_ns != 0 &&
+            telemetry_completed_tick >= telemetry_submitted_tick) {
+            idle_since = telemetry_idle_since_ns;
+        }
+        telemetry_submitted_tick = std::max(telemetry_submitted_tick, tick);
+        telemetry_idle_since_ns = 0;
+    }
+
+    Common::PerformanceTelemetry::AddEnabled(
+        Common::PerformanceTelemetry::Counter::DriverSubmitCalls, 1);
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::DriverSubmit,
+        reinterpret_cast<uintptr_t>(this), tick);
+    if (idle_since != 0) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GpuIdleGaps, 1);
+        Common::PerformanceTelemetry::RecordDurationValueEnabled(
+            Common::PerformanceTelemetry::Counter::GpuIdleGapNs,
+            Common::PerformanceTelemetry::EventType::GpuIdleGap, now - idle_since,
+            reinterpret_cast<uintptr_t>(this));
+    }
+}
+
+void MasterSemaphore::TelemetryComplete(u64 tick) {
+    if (!Common::PerformanceTelemetry::Enabled()) [[likely]] {
+        return;
+    }
+
+    {
+        std::scoped_lock lock{telemetry_mutex};
+        const u64 now = Common::PerformanceTelemetry::Timestamp();
+        telemetry_completed_tick = std::max(telemetry_completed_tick, tick);
+        if (telemetry_submitted_tick != 0 &&
+            telemetry_completed_tick >= telemetry_submitted_tick && telemetry_idle_since_ns == 0) {
+            telemetry_idle_since_ns = now;
+        }
+    }
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::TimelineComplete,
+        reinterpret_cast<uintptr_t>(this), tick);
+}
+
 void MasterSemaphore::Refresh() {
+    Common::PerformanceTelemetry::ScopedDuration poll_duration{
+        Common::PerformanceTelemetry::Counter::TimelinePollNs};
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::TimelinePolls);
+    const u64 previous_tick = gpu_tick.load(std::memory_order_relaxed);
     u64 this_tick{};
     u64 counter{};
     do {
@@ -42,6 +102,9 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (counter > previous_tick) {
+        TelemetryComplete(counter);
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -62,6 +125,10 @@ void MasterSemaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WaitCalls);
+    Common::PerformanceTelemetry::ScopedDuration wait_duration{
+        Common::PerformanceTelemetry::Counter::WaitNs,
+        Common::PerformanceTelemetry::EventType::Wait, tick};
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
     }
     Refresh();

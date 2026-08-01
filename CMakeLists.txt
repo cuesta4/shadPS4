@@ -40,6 +40,7 @@ option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+option(ENABLE_DETAILED_TELEMETRY "Record detailed PM4 telemetry events" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -796,6 +797,8 @@ set(COMMON src/common/logging/classes.h
            src/common/native_clock.h
            src/common/path_util.cpp
            src/common/path_util.h
+           src/common/performance_telemetry.cpp
+           src/common/performance_telemetry.h
            src/common/object_pool.h
            src/common/polyfill_thread.h
            src/common/range_lock.h
@@ -1274,6 +1277,10 @@ else()
 endif()
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
+
+if (ENABLE_DETAILED_TELEMETRY)
+    target_compile_definitions(shadps4 PRIVATE SHADPS4_ENABLE_DETAILED_TELEMETRY)
+endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
 if (ENABLE_DISCORD_RPC)

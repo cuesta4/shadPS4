@@ -7,6 +7,7 @@
 #include <span>
 
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -211,6 +212,9 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Draws);
+    Common::PerformanceTelemetry::ScopedDuration draw_duration{
+        Common::PerformanceTelemetry::Counter::DrawCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -260,6 +264,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Draws);
+    Common::PerformanceTelemetry::ScopedDuration draw_duration{
+        Common::PerformanceTelemetry::Counter::DrawCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -339,6 +346,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Dispatches);
+    Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
+        Common::PerformanceTelemetry::Counter::DispatchCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -370,6 +380,9 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Dispatches);
+    Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
+        Common::PerformanceTelemetry::Counter::DispatchCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -532,6 +545,9 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         if (!unchanged) {
             partial_set_writes.push_back(write);
         }
+        Common::PerformanceTelemetry::Add(
+            unchanged ? Common::PerformanceTelemetry::Counter::DescriptorHits
+                      : Common::PerformanceTelemetry::Counter::DescriptorMisses);
     }
 
     auto& writes = can_reuse ? partial_set_writes : set_writes;
@@ -749,6 +765,9 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
                 cached.topology_epoch == buffer_cache.TopologyEpoch() &&
                 buffer_cache.IsBufferCacheEntryValid(cached.buffer_id, cached.buffer_uid,
                                                      vsharp.base_address, size);
+            Common::PerformanceTelemetry::Add(
+                cache_hit ? Common::PerformanceTelemetry::Counter::BufferTokenHits
+                          : Common::PerformanceTelemetry::Counter::BufferTokenMisses);
             if (cache_hit) {
                 pending.buffer_id = cached.buffer_id;
             } else {
@@ -963,6 +982,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                    cached.topology_epoch == texture_cache.TopologyEpoch() &&
                                    texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
                                                                cached.topology_epoch);
+            Common::PerformanceTelemetry::Add(
+                cache_hit ? Common::PerformanceTelemetry::Counter::ImageTokenHits
+                          : Common::PerformanceTelemetry::Counter::ImageTokenMisses);
 
             if (cache_hit) {
                 image_bindings.emplace_back(cached.image_id, cached.resolved_desc);
@@ -1148,6 +1170,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     cached_view.topology_epoch == topology_epoch &&
                                     cached_view.backing_image == image->GetImage() &&
                                     cached_view.info == desc.view_info;
+        Common::PerformanceTelemetry::Add(
+            view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
+                           : Common::PerformanceTelemetry::Counter::RenderTargetMisses);
         if (!view_cache_hit) {
             auto& image_view = image->FindView(desc.view_info, false);
             cached_view = {
@@ -1212,6 +1237,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     cached_depth_target_view.topology_epoch == topology_epoch &&
                                     cached_depth_target_view.backing_image == image.GetImage() &&
                                     cached_depth_target_view.info == desc.view_info;
+        Common::PerformanceTelemetry::Add(
+            view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
+                           : Common::PerformanceTelemetry::Counter::RenderTargetMisses);
         if (!view_cache_hit) {
             auto& image_view = image.FindView(desc.view_info, false);
             cached_depth_target_view = {

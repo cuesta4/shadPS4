@@ -7,6 +7,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/hash.h"
+#include "common/performance_telemetry.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -78,6 +79,12 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    const u64 writeback_start = Common::PerformanceTelemetry::Enabled()
+                                    ? Common::PerformanceTelemetry::Timestamp()
+                                    : 0;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WritebackCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WritebackBytes,
+                                      download_size);
     const auto [download, offset] = download_buffer.Map(download_size);
     download_buffer.Commit();
     const vk::BufferImageCopy image_download = {
@@ -98,6 +105,9 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                      download_size);
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
@@ -105,11 +115,24 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         scheduler.Finish();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
+        if (writeback_start != 0) {
+            Common::PerformanceTelemetry::RecordDurationEnabled(
+                Common::PerformanceTelemetry::Counter::WritebackNs,
+                Common::PerformanceTelemetry::EventType::Writeback, writeback_start,
+                download_size);
+        }
     } else {
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+            [this, device_addr = image.info.guest_address, download, download_size,
+             writeback_start] {
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
                                                           download_size);
+                if (writeback_start != 0) {
+                    Common::PerformanceTelemetry::RecordDurationEnabled(
+                        Common::PerformanceTelemetry::Counter::WritebackNs,
+                        Common::PerformanceTelemetry::EventType::Writeback, writeback_start,
+                        download_size);
+                }
             });
     }
 }

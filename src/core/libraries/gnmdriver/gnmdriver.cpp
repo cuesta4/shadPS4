@@ -8,6 +8,7 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/performance_telemetry.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
 #include "core/debug_state.h"
@@ -2320,6 +2321,8 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     liverpool->SubmitDone();
     send_init_packet = true;
     ++frames_submitted;
+    Common::PerformanceTelemetry::Record(Common::PerformanceTelemetry::EventType::SubmitDone,
+                                         frames_submitted);
     DebugState.IncGnmFrameNum();
     return ORBIS_OK;
 }

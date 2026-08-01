@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -190,7 +191,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     };
 
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    master_semaphore.TelemetrySubmit(signal_value);
+    const auto submit_result = [&] {
+        Common::PerformanceTelemetry::ScopedDuration submit_duration{
+            Common::PerformanceTelemetry::Counter::DriverSubmitNs};
+        return instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    }();
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     master_semaphore.Refresh();
