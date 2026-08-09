@@ -602,7 +602,6 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
         return;
     }
     const u64 telemetry_start = pending.telemetry_start;
-    const u64 download_size = pending.size;
     scheduler.DeferPriorityOperation([tracker = readback_tracker, pending = std::move(pending)] {
         tracker->CompleteAsync(pending);
     });
