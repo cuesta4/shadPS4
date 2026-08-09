@@ -120,11 +120,43 @@ void Scheduler::Wait(u64 tick) {
 }
 
 void Scheduler::PopPendingOperations() {
-    std::unique_lock lk(priority_pending_ops_mutex);
-    master_semaphore.Refresh();
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (pending_ops.empty()) [[likely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpEmptyHits, 1);
+        }
+        return;
+    }
+
+    bool refreshed = false;
+    if (master_semaphore.IsFree(pending_ops.front().gpu_tick)) [[likely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpKnownTickHits, 1);
+        }
+    } else {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
+        }
+        master_semaphore.Refresh();
+        refreshed = true;
+    }
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
+    }
+    if (!pending_ops.empty() && !refreshed) {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
+        }
+        master_semaphore.Refresh();
+        while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+            pending_ops.front().callback();
+            pending_ops.pop();
+        }
     }
 }
 
@@ -233,6 +265,12 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    if (dirty_bits == 0) [[likely]] {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::DynamicStateEmptyCommits);
+        return;
+    }
+
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

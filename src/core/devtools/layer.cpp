@@ -152,7 +152,7 @@ void L::DrawAdvanced() {
 
     frame_graph.Draw();
 
-    if (DebugState.should_show_frame_dump && DebugState.waiting_reg_dumps.empty()) {
+    if (DebugState.should_show_frame_dump && !DebugState.DumpingCurrentReg()) {
         DebugState.should_show_frame_dump = false;
         std::unique_lock lock{DebugState.frame_dump_list_mutex};
         while (!DebugState.frame_dump_list.empty()) {

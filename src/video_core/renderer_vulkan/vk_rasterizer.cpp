@@ -6,6 +6,7 @@
 #include <limits>
 #include <span>
 
+#include "common/assert.h"
 #include "common/debug.h"
 #include "common/performance_telemetry.h"
 #include "core/debug_state.h"
@@ -54,6 +55,87 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
     return push_data;
+}
+
+static SHAD_NO_INLINE void ReportUnsupportedWindowOffset() {
+    LOG_ERROR(Render_Vulkan,
+              "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
+}
+
+[[nodiscard]] static vk::Viewport MakeViewport(const Instance& instance, const AmdGpu::Regs& regs,
+                                               const u32 index) {
+    const auto& vp = regs.viewports[index];
+    const auto& vp_ctl = regs.viewport_control;
+    const auto zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
+    const auto zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
+
+    vk::Viewport viewport{};
+    if (regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW) {
+        viewport.minDepth = zoffset - zscale;
+        viewport.maxDepth = zoffset + zscale;
+    } else {
+        viewport.minDepth = zoffset;
+        viewport.maxDepth = zoffset + zscale;
+    }
+
+    if (!instance.IsDepthRangeUnrestrictedSupported()) {
+        viewport.minDepth = std::max(viewport.minDepth, 0.f);
+        viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
+    }
+
+    if (regs.IsClipDisabled()) {
+        viewport.x = 0.f;
+        viewport.y = 0.f;
+        viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
+        viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
+    } else {
+        const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+        const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
+        const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+        const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
+
+        viewport.x = xoffset - xscale;
+        viewport.y = yoffset - yscale;
+        viewport.width = xscale * 2.0f;
+        viewport.height = yscale * 2.0f;
+    }
+    return viewport;
+}
+
+[[nodiscard]] static vk::Rect2D MakeViewportScissor(const AmdGpu::Regs& regs,
+                                                    const AmdGpu::Scissor& combined_scissor,
+                                                    const u32 index) {
+    auto scissor = combined_scissor;
+    if (regs.mode_control.vport_scissor_enable) {
+        scissor.top_left_x =
+            std::max(scissor.top_left_x, s16(regs.viewport_scissors[index].top_left_x));
+        scissor.top_left_y =
+            std::max(scissor.top_left_y, s16(regs.viewport_scissors[index].top_left_y));
+        scissor.bottom_right_x = std::min(AmdGpu::Scissor::Clamp(scissor.bottom_right_x),
+                                          regs.viewport_scissors[index].bottom_right_x);
+        scissor.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(scissor.bottom_right_y),
+                                          regs.viewport_scissors[index].bottom_right_y);
+    }
+    return {
+        .offset = {scissor.top_left_x, scissor.top_left_y},
+        .extent = {scissor.GetWidth(), scissor.GetHeight()},
+    };
+}
+
+static SHAD_NO_INLINE void SetMultipleViewportScissorState(
+    const Instance& instance, const AmdGpu::Regs& regs, const AmdGpu::Scissor& combined_scissor,
+    DynamicState& dynamic_state) {
+    Viewports viewports;
+    Scissors scissors;
+    for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; ++i) {
+        if (regs.viewports[i].xscale == 0.f) {
+            continue;
+        }
+        viewports.push_back(MakeViewport(instance, regs, i));
+        scissors.push_back(MakeViewportScissor(regs, combined_scissor, i));
+    }
+    dynamic_state.SetViewports(viewports);
+    dynamic_state.SetScissors(scissors);
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
@@ -173,7 +255,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
 
 static std::pair<u32, u32> GetDrawOffsets(
     const AmdGpu::Regs& regs, const Shader::Info& info,
-    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+    const std::optional<const Shader::Gcn::FetchShaderData>& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
     if (fetch_shader) {
@@ -212,9 +294,12 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Draws);
+    telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(Common::PerformanceTelemetry::Counter::Draws, 1);
+    }
     Common::PerformanceTelemetry::ScopedDuration draw_duration{
-        Common::PerformanceTelemetry::Counter::DrawCpuNs};
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::DrawCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -264,9 +349,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Draws);
+    telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(Common::PerformanceTelemetry::Counter::Draws, 1);
+    }
     Common::PerformanceTelemetry::ScopedDuration draw_duration{
-        Common::PerformanceTelemetry::Counter::DrawCpuNs};
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::DrawCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -346,9 +434,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Dispatches);
+    telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::Dispatches, 1);
+    }
     Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
-        Common::PerformanceTelemetry::Counter::DispatchCpuNs};
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::DispatchCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -380,9 +472,13 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::Dispatches);
+    telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::Dispatches, 1);
+    }
     Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
-        Common::PerformanceTelemetry::Counter::DispatchCpuNs};
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::DispatchCpuNs};
 
     scheduler.PopPendingOperations();
 
@@ -436,8 +532,9 @@ void Rasterizer::OnSubmit() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    if (pipeline->IsCompute() &&
+        (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+         IsComputeImageClear(pipeline))) [[unlikely]] {
         return false;
     }
 
@@ -473,40 +570,57 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
-        // We only use fault buffer for DMA right now.
-        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        for (auto& range : mapped_ranges) {
-            buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
-        }
-        fault_process_pending = true;
+        SynchronizeDmaBuffers();
     }
 
     return true;
 }
 
-void Rasterizer::CaptureDescriptorImageState(const Pipeline* pipeline) {
-    auto& state = descriptor_image_state;
+SHAD_NO_INLINE void Rasterizer::SynchronizeDmaBuffers() {
+    // We only use fault buffer for DMA right now.
+    Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+    for (auto& range : mapped_ranges) {
+        buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
+    }
+    fault_process_pending = true;
+}
+
+void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
+    auto& state = descriptor_state;
     state.pipeline = pipeline;
     state.command_buffer = scheduler.CommandBuffer();
     state.push_descriptor_epoch = scheduler.GraphicsPushDescriptorEpoch();
     state.writes.clear();
-    state.infos.clear();
+    state.image_infos.clear();
+    state.buffer_infos.clear();
 
     for (const auto& write : set_writes) {
-        if (write.pImageInfo == nullptr) {
+        const bool is_buffer = write.pBufferInfo != nullptr;
+        if (write.pImageInfo == nullptr && !is_buffer) {
             continue;
         }
         ASSERT(state.writes.size() < state.writes.capacity());
-        ASSERT(state.infos.size() + write.descriptorCount <= state.infos.capacity());
+        const u32 first_info = is_buffer ? static_cast<u32>(state.buffer_infos.size())
+                                         : static_cast<u32>(state.image_infos.size());
         state.writes.push_back({
             .binding = write.dstBinding,
             .array_element = write.dstArrayElement,
             .count = write.descriptorCount,
-            .first_info = static_cast<u32>(state.infos.size()),
+            .first_info = first_info,
             .type = write.descriptorType,
+            .is_buffer = is_buffer,
         });
-        state.infos.insert(state.infos.end(), write.pImageInfo,
-                           write.pImageInfo + write.descriptorCount);
+        if (is_buffer) {
+            ASSERT(state.buffer_infos.size() + write.descriptorCount <=
+                   state.buffer_infos.capacity());
+            state.buffer_infos.insert(state.buffer_infos.end(), write.pBufferInfo,
+                                      write.pBufferInfo + write.descriptorCount);
+        } else {
+            ASSERT(state.image_infos.size() + write.descriptorCount <=
+                   state.image_infos.capacity());
+            state.image_infos.insert(state.image_infos.end(), write.pImageInfo,
+                                     write.pImageInfo + write.descriptorCount);
+        }
     }
     state.valid = true;
 }
@@ -517,42 +631,54 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         return;
     }
 
-    const auto& cached = descriptor_image_state;
+    const auto& cached = descriptor_state;
     const bool can_reuse = cached.valid && cached.pipeline == pipeline &&
                            cached.command_buffer == scheduler.CommandBuffer() &&
                            cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch();
     partial_set_writes.clear();
-    u32 image_write_index = 0;
+    u32 cached_write_index = 0;
     for (const auto& write : set_writes) {
         bool unchanged = false;
-        if (write.pImageInfo != nullptr && can_reuse && image_write_index < cached.writes.size()) {
-            const auto& old_write = cached.writes[image_write_index];
+        const bool is_buffer = write.pBufferInfo != nullptr;
+        const bool is_cacheable = write.pImageInfo != nullptr || is_buffer;
+        if (is_cacheable && can_reuse && cached_write_index < cached.writes.size()) {
+            const auto& old_write = cached.writes[cached_write_index];
             unchanged = old_write.binding == write.dstBinding &&
                         old_write.array_element == write.dstArrayElement &&
                         old_write.count == write.descriptorCount &&
-                        old_write.type == write.descriptorType;
+                        old_write.type == write.descriptorType && old_write.is_buffer == is_buffer;
             for (u32 info_index = 0; unchanged && info_index < write.descriptorCount;
                  ++info_index) {
-                const auto& lhs = cached.infos[old_write.first_info + info_index];
-                const auto& rhs = write.pImageInfo[info_index];
-                unchanged = lhs.sampler == rhs.sampler && lhs.imageView == rhs.imageView &&
-                            lhs.imageLayout == rhs.imageLayout;
+                if (is_buffer) {
+                    const auto& lhs = cached.buffer_infos[old_write.first_info + info_index];
+                    const auto& rhs = write.pBufferInfo[info_index];
+                    unchanged = lhs.buffer == rhs.buffer && lhs.offset == rhs.offset &&
+                                lhs.range == rhs.range;
+                } else {
+                    const auto& lhs = cached.image_infos[old_write.first_info + info_index];
+                    const auto& rhs = write.pImageInfo[info_index];
+                    unchanged = lhs.sampler == rhs.sampler && lhs.imageView == rhs.imageView &&
+                                lhs.imageLayout == rhs.imageLayout;
+                }
             }
-            ++image_write_index;
-        } else if (write.pImageInfo != nullptr) {
-            ++image_write_index;
+            ++cached_write_index;
+        } else if (is_cacheable) {
+            ++cached_write_index;
         }
         if (!unchanged) {
             partial_set_writes.push_back(write);
         }
-        Common::PerformanceTelemetry::Add(
-            unchanged ? Common::PerformanceTelemetry::Counter::DescriptorHits
-                      : Common::PerformanceTelemetry::Counter::DescriptorMisses);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                unchanged ? Common::PerformanceTelemetry::Counter::DescriptorHits
+                          : Common::PerformanceTelemetry::Counter::DescriptorMisses,
+                1);
+        }
     }
 
     auto& writes = can_reuse ? partial_set_writes : set_writes;
     pipeline->BindResources(writes, buffer_barriers, push_data);
-    CaptureDescriptorImageState(pipeline);
+    CaptureDescriptorState(pipeline);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -765,9 +891,12 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
                 cached.topology_epoch == buffer_cache.TopologyEpoch() &&
                 buffer_cache.IsBufferCacheEntryValid(cached.buffer_id, cached.buffer_uid,
                                                      vsharp.base_address, size);
-            Common::PerformanceTelemetry::Add(
-                cache_hit ? Common::PerformanceTelemetry::Counter::BufferTokenHits
-                          : Common::PerformanceTelemetry::Counter::BufferTokenMisses);
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    cache_hit ? Common::PerformanceTelemetry::Counter::BufferTokenHits
+                              : Common::PerformanceTelemetry::Counter::BufferTokenMisses,
+                    1);
+            }
             if (cache_hit) {
                 pending.buffer_id = cached.buffer_id;
             } else {
@@ -963,9 +1092,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                    cached.topology_epoch == texture_cache.TopologyEpoch() &&
                                    texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
                                                                cached.topology_epoch);
-            Common::PerformanceTelemetry::Add(
-                cache_hit ? Common::PerformanceTelemetry::Counter::ImageTokenHits
-                          : Common::PerformanceTelemetry::Counter::ImageTokenMisses);
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    cache_hit ? Common::PerformanceTelemetry::Counter::ImageTokenHits
+                              : Common::PerformanceTelemetry::Counter::ImageTokenMisses,
+                    1);
+            }
 
             if (cache_hit) {
                 image_bindings.emplace_back(cached.image_id, cached.resolved_desc);
@@ -1124,7 +1256,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state;
+    RenderState state{};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -1151,9 +1283,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     cached_view.topology_epoch == topology_epoch &&
                                     cached_view.backing_image == image->GetImage() &&
                                     cached_view.info == desc.view_info;
-        Common::PerformanceTelemetry::Add(
-            view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
-                           : Common::PerformanceTelemetry::Counter::RenderTargetMisses);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
+                               : Common::PerformanceTelemetry::Counter::RenderTargetMisses,
+                1);
+        }
         if (!view_cache_hit) {
             auto& image_view = image->FindView(desc.view_info, false);
             cached_view = {
@@ -1218,9 +1353,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     cached_depth_target_view.topology_epoch == topology_epoch &&
                                     cached_depth_target_view.backing_image == image.GetImage() &&
                                     cached_depth_target_view.info == desc.view_info;
-        Common::PerformanceTelemetry::Add(
-            view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
-                           : Common::PerformanceTelemetry::Counter::RenderTargetMisses);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                view_cache_hit ? Common::PerformanceTelemetry::Counter::RenderTargetHits
+                               : Common::PerformanceTelemetry::Counter::RenderTargetMisses,
+                1);
+        }
         if (!view_cache_hit) {
             auto& image_view = image.FindView(desc.view_info, false);
             cached_depth_target_view = {
@@ -1390,6 +1528,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     }
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
+    page_manager.NotifyWrite(addr, size, VideoCore::MemoryWriteSource::Cpu);
     return true;
 }
 
@@ -1402,8 +1541,16 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     return true;
 }
 
-void Rasterizer::ProcessDownloadImages() {
-    texture_cache.ProcessDownloadImages();
+void Rasterizer::NotifyMemoryWrite(VAddr addr, u64 size, VideoCore::MemoryWriteSource source) {
+    page_manager.NotifyWrite(addr, size, source);
+}
+
+bool Rasterizer::ProcessDownloadImages() {
+    return texture_cache.ProcessDownloadImages();
+}
+
+void Rasterizer::DeferGpuCompletion(Common::UniqueFunction<void>&& callback) {
+    scheduler.DeferPriorityOperation(std::move(callback));
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
@@ -1440,11 +1587,31 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
+    const u64 generation = liverpool->GraphicsStateGeneration();
+    const bool state_unchanged = dynamic_state_generation == generation &&
+                                 dynamic_state_pipeline == pipeline &&
+                                 dynamic_state_indexed == is_indexed &&
+                                 dynamic_state_feedback_loop == attachment_feedback_loop;
+    if (state_unchanged) [[likely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::DynamicStateHits, 1);
+        }
+    } else {
+        UpdateViewportScissorState();
+        UpdateDepthStencilState();
+        UpdatePrimitiveState(is_indexed);
+        UpdateRasterizationState();
+        UpdateColorBlendingState(pipeline);
+        dynamic_state_generation = generation;
+        dynamic_state_pipeline = pipeline;
+        dynamic_state_indexed = is_indexed;
+        dynamic_state_feedback_loop = attachment_feedback_loop;
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::DynamicStateMisses, 1);
+        }
+    }
 
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
@@ -1454,10 +1621,10 @@ void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = liverpool->regs;
 
     const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
+        return std::max(scr, std::max(s16(win + win_offset), s16(gen + win_offset)));
     };
     const auto combined_scissor_value_br = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::min({scr, s16(win + win_offset), s16(gen + win_offset)});
+        return std::min(scr, std::min(s16(win + win_offset), s16(gen + win_offset)));
     };
     const bool enable_offset = !regs.window_scissor.window_offset_disable;
 
@@ -1479,88 +1646,28 @@ void Rasterizer::UpdateViewportScissorState() const {
         regs.generic_scissor.bottom_right_y,
         enable_offset ? regs.window_offset.window_y_offset : 0);
 
-    boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
-    boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
-
     if (regs.polygon_control.enable_window_offset &&
         (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
-        LOG_ERROR(Render_Vulkan,
-                  "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
+        ReportUnsupportedWindowOffset();
     }
 
-    const auto& vp_ctl = regs.viewport_control;
-    for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
-        const auto& vp = regs.viewports[i];
-        const auto& vp_d = regs.viewport_depths[i];
-        if (vp.xscale == 0) {
+    auto& dynamic_state = scheduler.GetDynamicState();
+    u32 first = AmdGpu::NUM_VIEWPORTS;
+#pragma clang loop unroll(disable)
+    for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; ++i) {
+        const u32 xscale = std::bit_cast<u32>(regs.viewports[i].xscale);
+        if ((xscale << 1) == 0) {
             continue;
         }
-
-        const auto zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
-        const auto zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
-
-        vk::Viewport viewport{};
-
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_pipeline_graphics.c#L688-689
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_cmd_buffer.c#L3103-3109
-        // When the clip space is ranged [-1...1], the zoffset is centered.
-        // By reversing the above viewport calculations, we get the following:
-        if (regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW) {
-            viewport.minDepth = zoffset - zscale;
-            viewport.maxDepth = zoffset + zscale;
-        } else {
-            viewport.minDepth = zoffset;
-            viewport.maxDepth = zoffset + zscale;
+        if (first != AmdGpu::NUM_VIEWPORTS) [[unlikely]] {
+            SetMultipleViewportScissorState(instance, regs, scsr, dynamic_state);
+            return;
         }
-
-        if (!instance.IsDepthRangeUnrestrictedSupported()) {
-            // Unrestricted depth range not supported by device. Restrict to valid range.
-            viewport.minDepth = std::max(viewport.minDepth, 0.f);
-            viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
-        }
-
-        if (regs.IsClipDisabled()) {
-            // In case if clipping is disabled we patch the shader to convert vertex position
-            // from screen space coordinates to NDC by defining a render space as full hardware
-            // window range [0..16383, 0..16383] and setting the viewport to its size.
-            viewport.x = 0.f;
-            viewport.y = 0.f;
-            viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
-            viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
-        } else {
-            const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
-            const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
-            const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
-            const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
-
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
-        }
-
-        viewports.push_back(viewport);
-
-        auto vp_scsr = scsr;
-        if (regs.mode_control.vport_scissor_enable) {
-            vp_scsr.top_left_x =
-                std::max(vp_scsr.top_left_x, s16(regs.viewport_scissors[i].top_left_x));
-            vp_scsr.top_left_y =
-                std::max(vp_scsr.top_left_y, s16(regs.viewport_scissors[i].top_left_y));
-            vp_scsr.bottom_right_x = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_x),
-                                              regs.viewport_scissors[i].bottom_right_x);
-            vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
-                                              regs.viewport_scissors[i].bottom_right_y);
-        }
-        scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
+        first = i;
     }
 
-    if (viewports.empty()) {
-        // Vulkan requires providing at least one viewport.
-        constexpr vk::Viewport empty_viewport = {
+    if (first == AmdGpu::NUM_VIEWPORTS) {
+        constexpr vk::Viewport empty_viewport{
             .x = -1.0f,
             .y = -1.0f,
             .width = 1.0f,
@@ -1568,17 +1675,16 @@ void Rasterizer::UpdateViewportScissorState() const {
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         };
-        constexpr vk::Rect2D empty_scissor = {
+        constexpr vk::Rect2D empty_scissor{
             .offset = {0, 0},
             .extent = {1, 1},
         };
-        viewports.push_back(empty_viewport);
-        scissors.push_back(empty_scissor);
+        dynamic_state.SetSingleViewportScissor(empty_viewport, empty_scissor);
+        return;
     }
 
-    auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetViewports(viewports);
-    dynamic_state.SetScissors(scissors);
+    dynamic_state.SetSingleViewportScissor(MakeViewport(instance, regs, first),
+                                           MakeViewportScissor(regs, scsr, first));
 }
 
 void Rasterizer::UpdateDepthStencilState() const {

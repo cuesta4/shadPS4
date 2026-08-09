@@ -30,6 +30,9 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+struct PM4CmdEventWriteEop;
+struct PM4CmdEventWriteEos;
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -136,6 +139,10 @@ public:
         return graphics_pipeline_generation;
     }
 
+    [[nodiscard]] u64 GraphicsStateGeneration() const noexcept {
+        return graphics_state_generation;
+    }
+
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;
@@ -190,7 +197,18 @@ private:
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
-    void WriteGraphicsRegisters(u32 first_register, const u32* payload, u32 word_count);
+    bool WriteGraphicsRegisters(u32 first_register, const u32* payload, u32 word_count);
+    bool WriteGraphicsRegisters4(u32 first_register, const u32* payload);
+    bool WriteGraphicsRegisters8(u32 first_register, const u32* payload);
+    bool WriteGraphicsRegistersSlow(u32 first_register, const u32* payload, u32 word_count);
+    void HandleContextRegisterHint(u32 register_address, u32 packet_count, const u32* payload);
+    void ProcessEventWriteEop(const PM4CmdEventWriteEop& packet);
+    void ProcessEventWriteEos(const PM4CmdEventWriteEos& packet);
+
+    bool ArmMemoryWait(u32 queue_id, VAddr address);
+    void CancelMemoryWait(u32 queue_id);
+    void WakeMemoryWait(u32 queue_id) noexcept;
+    void ReleaseMemoryWaitFallbacks(bool telemetry_enabled) noexcept;
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -202,12 +220,25 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    std::array<Task::Handle, NumTotalQueues> active_tasks{};
     u32 num_mapped_queues{1u}; // GFX is always available
+
+    struct MemoryWaitContext {
+        Liverpool* owner{};
+        u32 queue_id{};
+        VAddr page{};
+        u64 id{};
+        u64 epoch{};
+    };
+    std::array<MemoryWaitContext, NumTotalQueues> memory_waits{};
+    std::atomic<u64> ready_queue_mask{};
+    std::atomic<u64> blocked_queue_mask{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
     u64 graphics_pipeline_generation{1};
+    u64 graphics_state_generation{1};
     bool warned_set_predication{};
 
     struct ConstantEngine {

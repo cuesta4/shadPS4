@@ -213,6 +213,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
+    FetchShader loaded_fetch_shader{};
 
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
@@ -229,7 +230,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        if (!LoadPipelineStage(meta_ar, stage_idx, &loaded_fetch_shader)) {
             return false;
         }
     }
@@ -237,24 +238,33 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
+    std::optional<const Shader::Gcn::FetchShaderData> pipeline_fetch_shader{};
+    if (loaded_fetch_shader) {
+        pipeline_fetch_shader.emplace(std::move(*loaded_fetch_shader));
+    }
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+        runtime_infos, std::move(pipeline_fetch_shader), modules, sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-    fetch_shader.reset();
+    fetch_shader = nullptr;
 
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                                      FetchShader* loaded_fetch_shader) {
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
+    FetchShader stage_fetch_shader{};
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, stage_fetch_shader, spec, perm_idx)) {
         return false;
+    }
+    if (loaded_fetch_shader && stage_fetch_shader) {
+        *loaded_fetch_shader = std::move(stage_fetch_shader);
     }
 
     std::vector<u32> spv{};

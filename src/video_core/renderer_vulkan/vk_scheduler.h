@@ -95,40 +95,45 @@ struct StencilOps {
     }
 };
 struct DynamicState {
-    struct {
-        bool viewports : 1;
-        bool scissors : 1;
+    union {
+        struct {
+            u32 viewports : 1;
+            u32 scissors : 1;
 
-        bool depth_test_enabled : 1;
-        bool depth_write_enabled : 1;
-        bool depth_compare_op : 1;
+            u32 depth_test_enabled : 1;
+            u32 depth_write_enabled : 1;
+            u32 depth_compare_op : 1;
 
-        bool depth_bounds_test_enabled : 1;
-        bool depth_bounds : 1;
+            u32 depth_bounds_test_enabled : 1;
+            u32 depth_bounds : 1;
 
-        bool depth_bias_enabled : 1;
-        bool depth_bias : 1;
+            u32 depth_bias_enabled : 1;
+            u32 depth_bias : 1;
 
-        bool stencil_test_enabled : 1;
-        bool stencil_front_ops : 1;
-        bool stencil_front_reference : 1;
-        bool stencil_front_write_mask : 1;
-        bool stencil_front_compare_mask : 1;
-        bool stencil_back_ops : 1;
-        bool stencil_back_reference : 1;
-        bool stencil_back_write_mask : 1;
-        bool stencil_back_compare_mask : 1;
+            u32 stencil_test_enabled : 1;
+            u32 stencil_front_ops : 1;
+            u32 stencil_front_reference : 1;
+            u32 stencil_front_write_mask : 1;
+            u32 stencil_front_compare_mask : 1;
+            u32 stencil_back_ops : 1;
+            u32 stencil_back_reference : 1;
+            u32 stencil_back_write_mask : 1;
+            u32 stencil_back_compare_mask : 1;
 
-        bool primitive_restart_enable : 1;
-        bool rasterizer_discard_enable : 1;
-        bool cull_mode : 1;
-        bool front_face : 1;
+            u32 primitive_restart_enable : 1;
+            u32 rasterizer_discard_enable : 1;
+            u32 cull_mode : 1;
+            u32 front_face : 1;
 
-        bool blend_constants : 1;
-        bool color_write_masks : 1;
-        bool line_width : 1;
-        bool feedback_loop_enabled : 1;
-    } dirty_state{};
+            u32 blend_constants : 1;
+            u32 color_write_masks : 1;
+            u32 line_width : 1;
+            u32 feedback_loop_enabled : 1;
+        } dirty_state;
+        u32 dirty_bits{};
+    };
+
+    static constexpr u32 AllDirtyBits = (1U << 26) - 1;
 
     Viewports viewports{};
     Scissors scissors{};
@@ -171,7 +176,7 @@ struct DynamicState {
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
-        std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        dirty_bits = AllDirtyBits;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -184,6 +189,19 @@ struct DynamicState {
     void SetScissors(const Scissors& scissors_) {
         if (!std::ranges::equal(scissors, scissors_)) {
             scissors = scissors_;
+            dirty_state.scissors = true;
+        }
+    }
+
+    void SetSingleViewportScissor(const vk::Viewport& viewport, const vk::Rect2D& scissor) {
+        if (viewports.size() != 1 || viewports.front() != viewport) {
+            viewports.clear();
+            viewports.push_back(viewport);
+            dirty_state.viewports = true;
+        }
+        if (scissors.size() != 1 || scissors.front() != scissor) {
+            scissors.clear();
+            scissors.push_back(scissor);
             dirty_state.scissors = true;
         }
     }

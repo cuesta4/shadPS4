@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <string_view>
 #include <fmt/format.h>
 #include "common/assert.h"
@@ -115,7 +116,7 @@ union CompMapping {
     std::array<CompSwizzle, 4> array;
 
     bool operator==(const CompMapping& other) const {
-        return array == other.array;
+        return std::bit_cast<u32>(array) == std::bit_cast<u32>(other.array);
     }
 
     template <typename T>

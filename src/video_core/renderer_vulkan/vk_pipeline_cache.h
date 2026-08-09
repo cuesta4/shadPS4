@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -55,8 +56,10 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        u64 specialization_fingerprint{};
     };
     static constexpr size_t MaxPermutations = 8;
+    static constexpr size_t InvalidPermutation = std::numeric_limits<size_t>::max();
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     struct FetchShaderCacheEntry {
@@ -73,6 +76,7 @@ struct Program {
     boost::container::small_vector<FetchShaderCacheEntry, MaxFetchShaderCacheEntries>
         fetch_shader_cache;
     u64 next_fetch_shader_revision{1};
+    size_t current_permutation{InvalidPermutation};
     u8 next_fetch_shader_slot{};
     bool specialization_plan_ready{};
     bool specialization_plan_cacheable{};
@@ -92,8 +96,17 @@ struct Program {
     }
 };
 
+struct ShaderProgramHash {
+    [[nodiscard]] size_t operator()(u64 hash) const noexcept {
+        return static_cast<size_t>(hash ^ (hash >> 32));
+    }
+};
+
 class PipelineCache {
 public:
+    using FetchShader = std::optional<Shader::Gcn::FetchShaderData>;
+    using Result = std::tuple<const Shader::Info*, vk::ShaderModule, const FetchShader*, u64>;
+
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool);
     ~PipelineCache();
@@ -103,14 +116,13 @@ public:
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                           FetchShader* loaded_fetch_shader = nullptr);
 
     const GraphicsPipeline* GetGraphicsPipeline();
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
@@ -128,9 +140,23 @@ private:
     struct OptimizationState;
 
     const GraphicsPipeline* ResolveGraphicsPipelineSlow();
-    Result GetProgramSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
-                          const Shader::ShaderParams& params, Shader::RuntimeInfo runtime_info,
-                          Shader::Backend::Bindings& binding);
+    const GraphicsPipeline* CreateGraphicsPipeline();
+    Result GetProgramSlow(Program& program, Shader::Stage stage, Shader::LogicalStage l_stage,
+                          const Shader::ShaderParams& params,
+                          const Shader::RuntimeInfo& runtime_info,
+                          Shader::Backend::Bindings& binding,
+                          const FetchShader* fetch_shader);
+    Result CreateProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         Shader::Backend::Bindings& binding);
+    vk::ShaderModule CompilePermutation(Program& program, Shader::Stage stage,
+                                        Shader::LogicalStage l_stage,
+                                        const Shader::ShaderParams& params,
+                                        const Shader::RuntimeInfo& runtime_info,
+                                        Shader::Backend::Bindings& binding,
+                                        Shader::StageSpecialization&& specialization,
+                                        size_t permutation_index, u64 permutation_hash);
     bool CanReuseGraphicsPipeline() const;
 
     bool RefreshGraphicsKey();
@@ -159,13 +185,13 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
-    tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    tsl::robin_map<u64, std::unique_ptr<Program>, ShaderProgramHash> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    const FetchShader* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start

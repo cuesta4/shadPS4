@@ -62,18 +62,24 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
-void TextureCache::ProcessDownloadImages() {
+bool TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    bool scheduled = false;
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        scheduled |= DownloadImageMemory(image_id, true);
     }
     download_images.clear();
+    if (scheduled) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackBatches);
+    }
+    return scheduled;
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
+        return false;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -111,30 +117,44 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
-    if (sync) {
-        scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
-        if (writeback_start != 0) {
-            Common::PerformanceTelemetry::RecordDurationEnabled(
-                Common::PerformanceTelemetry::Counter::WritebackNs,
-                Common::PerformanceTelemetry::EventType::Writeback, writeback_start,
-                download_size);
-        }
-    } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size,
-             writeback_start] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
+    auto readback_token = validate_identity ? image.readback_token : nullptr;
+    const u64 image_uid = image.image_uid;
+    scheduler.DeferPriorityOperation(
+        [device_addr = image.info.guest_address, download, download_size, writeback_start,
+         image_uid, readback_token = std::move(readback_token)] {
+            const auto record_completion = [=] {
                 if (writeback_start != 0) {
                     Common::PerformanceTelemetry::RecordDurationEnabled(
                         Common::PerformanceTelemetry::Counter::WritebackNs,
                         Common::PerformanceTelemetry::EventType::Writeback, writeback_start,
                         download_size);
                 }
-            });
+            };
+            const auto write_back = [&] {
+                Core::Memory::Instance()->TryWriteBacking(
+                    std::bit_cast<u8*>(device_addr), download, download_size,
+                    Core::MemoryWriteOrigin::GpuCompletion);
+            };
+            if (readback_token) {
+                std::scoped_lock identity_lock{readback_token->mutex};
+                if (readback_token->image_uid != image_uid) {
+                    Common::PerformanceTelemetry::Add(
+                        Common::PerformanceTelemetry::Counter::WritebackStaleSkips);
+                    record_completion();
+                    return;
+                }
+                write_back();
+            } else {
+                write_back();
+            }
+            record_completion();
+        });
+    if (writeback_start != 0) {
+        Common::PerformanceTelemetry::RecordDurationEnabled(
+            Common::PerformanceTelemetry::Counter::WritebackEnqueueNs,
+            Common::PerformanceTelemetry::EventType::None, writeback_start, download_size);
     }
+    return true;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -1189,6 +1209,11 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+
+    if (image.readback_token) {
+        std::scoped_lock lk{image.readback_token->mutex};
+        image.readback_token->image_uid = 0;
+    }
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;

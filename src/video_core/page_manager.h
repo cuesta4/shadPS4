@@ -15,6 +15,27 @@ class Rasterizer;
 
 namespace VideoCore {
 
+enum class MemoryWriteSource : u8 {
+    Cpu,
+    CommandProcessor,
+    GpuCompletion,
+    Map,
+    Unmap,
+};
+
+struct MemoryWriteWatch {
+    VAddr page{};
+    u64 id{};
+    u64 epoch{};
+
+    explicit operator bool() const noexcept {
+        return id != 0;
+    }
+};
+
+using MemoryWriteCallback =
+    void (*)(void* user_data, VAddr page, u64 epoch, MemoryWriteSource source) noexcept;
+
 class PageManager {
     // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
     // Use the same page size as the tracker.
@@ -34,6 +55,17 @@ public:
 
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
+
+    /// Arms a one-shot notification for writes touching the page that contains address. The
+    /// callback must only update consumer-owned state and must not call back into PageManager.
+    [[nodiscard]] MemoryWriteWatch ArmWriteWatch(VAddr address, MemoryWriteCallback callback,
+                                                 void* user_data);
+
+    /// Cancels a write watch. Once this returns, its callback can no longer be running.
+    bool CancelWriteWatch(MemoryWriteWatch watch);
+
+    /// Notifies one-shot observers after a guest-memory write becomes visible.
+    void NotifyWrite(VAddr address, u64 size, MemoryWriteSource source);
 
     /// Updates watches in the pages touching the specified region.
     template <bool track>
