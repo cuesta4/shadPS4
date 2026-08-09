@@ -383,8 +383,10 @@ void MemoryManager::CopySparseMemoryBatch(std::span<const SparseCopyRequest> req
     FinishNonTemporalCopies(used_non_temporal);
 }
 
-bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
+                                    MemoryWriteOrigin origin) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    const u64 write_size = size;
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
@@ -417,6 +419,14 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
             memcpy(backing, data, copy_size);
             size -= copy_size;
         }
+    }
+
+    lk.unlock();
+    if (rasterizer != nullptr) {
+        const auto source = origin == MemoryWriteOrigin::GpuCompletion
+                                ? VideoCore::MemoryWriteSource::GpuCompletion
+                                : VideoCore::MemoryWriteSource::CommandProcessor;
+        rasterizer->NotifyMemoryWrite(virtual_addr, write_size, source);
     }
 
     return true;

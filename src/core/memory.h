@@ -44,6 +44,11 @@ enum class MemoryProt : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryProt)
 
+enum class MemoryWriteOrigin : u8 {
+    CommandProcessor,
+    GpuCompletion,
+};
+
 enum class MemoryMapFlags : u32 {
     NoFlags = 0,
     Shared = 1,
@@ -250,7 +255,8 @@ public:
     /// Copies a request batch whose sizes sum to total_size.
     void CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests, u64 total_size);
 
-    bool TryWriteBacking(void* address, const void* data, u64 size);
+    bool TryWriteBacking(void* address, const void* data, u64 size,
+                         MemoryWriteOrigin origin = MemoryWriteOrigin::CommandProcessor);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

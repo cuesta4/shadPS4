@@ -5,8 +5,10 @@
 
 #include <limits>
 
+#include "common/performance_telemetry.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -62,7 +64,16 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
-    void ProcessDownloadImages();
+    void NotifyMemoryWrite(VAddr addr, u64 size, VideoCore::MemoryWriteSource source);
+    [[nodiscard]] VideoCore::MemoryWriteWatch ArmMemoryWriteWatch(
+        VAddr addr, VideoCore::MemoryWriteCallback callback, void* user_data) {
+        return page_manager.ArmWriteWatch(addr, callback, user_data);
+    }
+    bool CancelMemoryWriteWatch(VideoCore::MemoryWriteWatch watch) {
+        return page_manager.CancelWriteWatch(watch);
+    }
+    bool ProcessDownloadImages();
+    void DeferGpuCompletion(Common::UniqueFunction<void>&& callback);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -105,8 +116,9 @@ private:
     void FinalizeBuffers(Shader::PushData& push_data, bool stream_only);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    void SynchronizeDmaBuffers();
     void BindPipelineResources(const Pipeline* pipeline);
-    void CaptureDescriptorImageState(const Pipeline* pipeline);
+    void CaptureDescriptorState(const Pipeline* pipeline);
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -203,27 +215,35 @@ private:
     std::array<CachedImageView, AmdGpu::NUM_COLOR_BUFFERS> cached_color_target_views{};
     CachedImageView cached_depth_target_view{};
 
-    struct DescriptorImageWriteState {
+    struct DescriptorWriteState {
         u32 binding{};
         u32 array_element{};
         u32 count{};
         u32 first_info{};
         vk::DescriptorType type{};
+        bool is_buffer{};
     };
 
-    struct DescriptorImageState {
+    struct DescriptorState {
         const Pipeline* pipeline{};
         vk::CommandBuffer command_buffer{};
         u64 push_descriptor_epoch{};
-        boost::container::static_vector<DescriptorImageWriteState,
-                                        Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
+        boost::container::static_vector<DescriptorWriteState,
+                                        Shader::NUM_BUFFERS + Shader::NUM_IMAGES +
+                                            Shader::NUM_SAMPLERS>
             writes;
         boost::container::static_vector<vk::DescriptorImageInfo,
                                         Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
-            infos;
+            image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
         bool valid{};
-    } descriptor_image_state;
+    } descriptor_state;
 
+    mutable u64 dynamic_state_generation{};
+    mutable const GraphicsPipeline* dynamic_state_pipeline{};
+    mutable bool dynamic_state_indexed{};
+    mutable bool dynamic_state_feedback_loop{};
+    Common::PerformanceTelemetry::Gate telemetry_enabled{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 };

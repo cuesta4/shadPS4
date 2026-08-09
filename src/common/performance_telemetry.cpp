@@ -29,11 +29,77 @@ constexpr size_t HistogramExactValues = 8;
 constexpr size_t HistogramBucketCount =
     HistogramExactValues + (std::numeric_limits<u64>::digits - 3) * HistogramSubdivisions;
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+constexpr size_t Pm4EngineCount = 3;
+constexpr size_t Pm4OpcodeCount = 256;
+constexpr size_t Pm4WordOverflowBucket = 256;
+constexpr size_t Pm4WordBucketCount = Pm4WordOverflowBucket + 1;
+constexpr size_t Pm4RegisterSpaceCount = 4;
+constexpr size_t Pm4RegisterCount = 0x1000;
+constexpr size_t Pm4ControlCapacity = 16384;
+constexpr size_t Pm4WaitCapacity = 2048;
+constexpr size_t Pm4HashProbeLimit = 32;
+static_assert(std::has_single_bit(Pm4ControlCapacity));
+static_assert(std::has_single_bit(Pm4WaitCapacity));
+constexpr std::array<u32, Pm4RegisterSpaceCount> Pm4RegisterOpcodes{0x68, 0x69, 0x76, 0x79};
+
+struct Pm4OpcodeDetail {
+    std::atomic<u64> packets{};
+    std::atomic<u64> words{};
+    std::atomic<u64> predicated{};
+    std::atomic<u64> shader_compute{};
+    std::atomic<u64> max_depth{};
+    std::array<std::atomic<u64>, Pm4WordBucketCount> word_counts{};
+};
+
+struct Pm4RegisterDetail {
+    std::atomic<u64> packets{};
+    std::atomic<u64> words{};
+    std::atomic<u64> changed{};
+};
+
+struct Pm4ControlDetail {
+    std::atomic<u64> hash{};
+    u64 identity{};
+    u32 control0{};
+    u32 control1{};
+    std::atomic<u64> packets{};
+};
+
+struct Pm4WaitDetail {
+    std::atomic<u64> hash{};
+    u64 location{};
+    u32 identity{};
+    u32 control{};
+    u32 reference{};
+    u32 mask{};
+    u32 poll_interval{};
+    std::atomic<u64> packets{};
+    std::atomic<u64> failed_tests{};
+    std::atomic<u64> immediate_passes{};
+    std::atomic<u64> vo_sleeps{};
+};
+
+struct Pm4Detail {
+    std::array<std::array<Pm4OpcodeDetail, Pm4OpcodeCount>, Pm4EngineCount> opcodes{};
+    std::array<std::array<std::array<Pm4RegisterDetail, Pm4RegisterCount>,
+                          Pm4RegisterSpaceCount>,
+               Pm4EngineCount>
+        registers{};
+    std::array<Pm4ControlDetail, Pm4ControlCapacity> controls{};
+    std::array<Pm4WaitDetail, Pm4WaitCapacity> waits{};
+    std::atomic<u64> register_overflow{};
+    std::atomic<u64> control_overflow{};
+    std::atomic<u64> wait_overflow{};
+};
+#endif
+
 constexpr std::array CounterNames{
     "pm4_packets",          "pm4_type2_packets",  "dcb_bytes",
     "ccb_bytes",            "acb_bytes",          "gfx_submits",
     "asc_submits",          "gcp_wakes",          "queue_scans",
-    "queue_resumes",        "gcp_active_ns",      "gcp_blocked_ns",
+    "queue_resumes",        "queue_front_loads",  "gcp_active_ns",
+    "gcp_blocked_ns",
     "queue_ready_ns",       "queue_resume_ns",    "ib_depth_max",
     "draws",
     "dispatches",           "draw_cpu_ns",        "dispatch_cpu_ns",
@@ -43,11 +109,26 @@ constexpr std::array CounterNames{
     "buffer_token_hits",    "buffer_token_misses", "stream_slice_hits",
     "stream_slice_misses",  "staging_bytes",      "barrier_calls",
     "copy_calls",           "copy_bytes",         "timeline_polls",
-    "timeline_poll_ns",     "driver_submit_calls", "driver_submit_ns",
+    "timeline_poll_ns",     "pending_op_empty_hits", "pending_op_known_tick_hits",
+    "pending_op_refreshes", "stage_cache_current_hits", "stage_cache_search_hits",
+    "stage_cache_misses",   "stage_cache_uncacheable", "stage_fingerprint_collisions",
+    "stage_specialization_builds", "stage_program_creates", "stage_permutation_compiles",
+    "stage_permutation_hits", "fetch_shader_cache_hits", "fetch_shader_cache_misses",
+    "fetch_shader_words",   "dynamic_state_hits", "dynamic_state_misses",
+    "dynamic_state_empty_commits",
+    "driver_submit_calls",  "driver_submit_ns",
     "driver_present_calls", "driver_present_ns",  "submit_queue_depth_max",
     "wait_calls",           "wait_ns",            "writeback_calls",
-    "writeback_bytes",      "writeback_ns",       "present_prepare_ns",
+    "writeback_bytes",      "writeback_ns",       "writeback_enqueue_ns",
+    "writeback_batches",    "writeback_stale_skips", "writeback_fence_deferrals",
+    "writeback_flushes",    "present_prepare_ns",
     "present_cpu_ns",       "gpu_idle_gaps",       "gpu_idle_gap_ns",
+    "memory_watch_arms",    "memory_watch_cancels", "memory_watch_wakeups",
+    "memory_watch_arm_failures", "memory_watch_fallbacks", "memory_notify_calls",
+    "memory_notify_pages",
+    "memory_notify_tracked_pages", "memory_notify_callbacks", "memory_notify_ns",
+    "memory_notify_cpu",    "memory_notify_command_processor",
+    "memory_notify_gpu_completion", "memory_notify_map", "memory_notify_unmap",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 
@@ -64,8 +145,11 @@ constexpr std::array HistogramCounters{
     Counter::QueueResumeNs,    Counter::DrawCpuNs,       Counter::DispatchCpuNs,
     Counter::PipelineCompileNs, Counter::TimelinePollNs, Counter::DriverSubmitNs,
     Counter::DriverPresentNs,  Counter::WaitNs,          Counter::WritebackNs,
+    Counter::WritebackEnqueueNs,
     Counter::PresentPrepareNs, Counter::PresentCpuNs,    Counter::GpuIdleGapNs,
+    Counter::MemoryNotifyNs,
     Counter::SubmitQueueDepthMax,
+    Counter::FetchShaderWords,
 };
 
 constexpr std::array HistogramNames{
@@ -73,8 +157,11 @@ constexpr std::array HistogramNames{
     "queue_resume_ns",     "draw_cpu_ns",       "dispatch_cpu_ns",
     "pipeline_compile_ns", "timeline_poll_ns",  "driver_submit_ns",
     "driver_present_ns",   "wait_ns",           "writeback_ns",
+    "writeback_enqueue_ns",
     "present_prepare_ns",  "present_cpu_ns",    "gpu_idle_gap_ns",
+    "memory_notify_ns",
     "submit_queue_depth",
+    "fetch_shader_words",
 };
 static_assert(HistogramCounters.size() == HistogramNames.size());
 
@@ -105,6 +192,9 @@ struct ThreadRing {
     std::array<std::atomic<u64>, 256> opcodes{};
     std::array<std::array<std::atomic<u64>, HistogramBucketCount>, HistogramCounters.size()>
         histograms{};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    Pm4Detail pm4{};
+#endif
     u32 id;
     std::string name;
 };
@@ -190,6 +280,42 @@ void AddDurationSingleWriter(ThreadRing& ring, Counter counter, u64 duration) no
     ObserveHistogramSingleWriter(ring, counter, duration);
 }
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+[[nodiscard]] constexpr u32 PackPm4Identity(Pm4Engine engine, u32 queue_id, u32 opcode,
+                                             u32 depth) noexcept {
+    return static_cast<u32>(engine) | ((queue_id & 0xff) << 8) | ((opcode & 0xff) << 16) |
+           ((depth & 0xff) << 24);
+}
+
+[[nodiscard]] constexpr u64 MixPm4Hash(u64 value) noexcept {
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+[[nodiscard]] constexpr u64 NonZeroPm4Hash(u64 value) noexcept {
+    const u64 hash = MixPm4Hash(value);
+    return hash != 0 ? hash : 1;
+}
+
+[[nodiscard]] constexpr size_t Pm4RegisterSpace(u32 opcode) noexcept {
+    switch (opcode) {
+    case 0x68:
+        return 0;
+    case 0x69:
+        return 1;
+    case 0x76:
+        return 2;
+    case 0x79:
+        return 3;
+    default:
+        return Pm4RegisterSpaceCount;
+    }
+}
+#endif
+
 void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
     const u64 sequence = ring.next_sequence.load(std::memory_order_relaxed);
     ring.next_sequence.store(sequence + 1, std::memory_order_release);
@@ -269,7 +395,7 @@ void RecordDurationValueEnabled(Counter counter, EventType type, u64 duration, u
 }
 
 void CountPm4PacketEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth,
-                           uintptr_t address, u32 words) noexcept {
+                           uintptr_t address, u32 words, u32 header) noexcept {
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -278,20 +404,131 @@ void CountPm4PacketEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth
         AddSingleWriter(ring->opcodes[opcode & 0xff], 1);
         ObserveSingleWriterMax(ring->counters[static_cast<size_t>(Counter::IbDepthMax)], depth + 1);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-        const u64 packed = static_cast<u64>(opcode & 0xff) |
-                           (static_cast<u64>(engine) << 8) |
-                           (static_cast<u64>(queue_id & 0xff) << 16) |
-                           (static_cast<u64>(depth & 0xff) << 24) |
-                           (static_cast<u64>(words) << 32);
-        WriteEvent(*ring, EventType::Pm4Packet, packed, address);
+        const size_t engine_index = static_cast<size_t>(engine);
+        auto& detail = ring->pm4.opcodes[engine_index][opcode & 0xff];
+        AddSingleWriter(detail.packets, 1);
+        AddSingleWriter(detail.words, words);
+        AddSingleWriter(detail.predicated, header & 1);
+        AddSingleWriter(detail.shader_compute, (header >> 1) & 1);
+        ObserveSingleWriterMax(detail.max_depth, depth);
+        AddSingleWriter(detail.word_counts[std::min<size_t>(words, Pm4WordOverflowBucket)], 1);
 #else
         static_cast<void>(engine);
         static_cast<void>(queue_id);
-        static_cast<void>(address);
         static_cast<void>(words);
+        static_cast<void>(header);
 #endif
+        static_cast<void>(address);
     }
 }
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth,
+                             u32 control0, u32 control1, u32 tag) noexcept {
+    if (g_dumping.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto* ring = GetThreadRing();
+    if (ring == nullptr) {
+        return;
+    }
+
+    const u64 identity = PackPm4Identity(engine, queue_id, opcode, depth) |
+                         (static_cast<u64>(tag) << 32);
+    const u64 hash = NonZeroPm4Hash(
+        NonZeroPm4Hash(static_cast<u64>(identity) | (static_cast<u64>(control0) << 32)) ^
+        MixPm4Hash(control1));
+    size_t slot = hash & (Pm4ControlCapacity - 1);
+    for (size_t probe = 0; probe < Pm4HashProbeLimit; ++probe) {
+        auto& entry = ring->pm4.controls[slot];
+        const u64 entry_hash = entry.hash.load(std::memory_order_acquire);
+        if (entry_hash == hash && entry.identity == identity && entry.control0 == control0 &&
+            entry.control1 == control1) {
+            AddSingleWriter(entry.packets, 1);
+            return;
+        }
+        if (entry_hash == 0) {
+            entry.identity = identity;
+            entry.control0 = control0;
+            entry.control1 = control1;
+            entry.hash.store(hash, std::memory_order_release);
+            AddSingleWriter(entry.packets, 1);
+            return;
+        }
+        slot = (slot + 1) & (Pm4ControlCapacity - 1);
+    }
+    AddSingleWriter(ring->pm4.control_overflow, 1);
+}
+
+void RecordPm4RegisterEnabled(Pm4Engine engine, u32 opcode, u32 register_offset, u32 words,
+                              bool changed) noexcept {
+    if (g_dumping.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto* ring = GetThreadRing();
+    if (ring == nullptr) {
+        return;
+    }
+    const size_t engine_index = static_cast<size_t>(engine);
+    const size_t space = Pm4RegisterSpace(opcode);
+    if (engine_index >= Pm4EngineCount || space >= Pm4RegisterSpaceCount ||
+        register_offset >= Pm4RegisterCount) {
+        AddSingleWriter(ring->pm4.register_overflow, 1);
+        return;
+    }
+    auto& detail = ring->pm4.registers[engine_index][space][register_offset];
+    AddSingleWriter(detail.packets, 1);
+    AddSingleWriter(detail.words, words);
+    AddSingleWriter(detail.changed, changed);
+}
+
+void RecordPm4WaitEnabled(Pm4Engine engine, u32 queue_id, u32 depth, u32 control,
+                          u64 location, u32 reference, u32 mask, u32 poll_interval,
+                          u64 failed_tests, bool vo_sleep) noexcept {
+    if (g_dumping.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto* ring = GetThreadRing();
+    if (ring == nullptr) {
+        return;
+    }
+
+    const u32 identity = PackPm4Identity(engine, queue_id, 0x3c, depth);
+    u64 hash = NonZeroPm4Hash(location ^ (static_cast<u64>(identity) << 32) ^ control);
+    hash = NonZeroPm4Hash(hash ^ (static_cast<u64>(reference) << 32) ^ mask);
+    hash = NonZeroPm4Hash(hash ^ poll_interval);
+    size_t slot = hash & (Pm4WaitCapacity - 1);
+    for (size_t probe = 0; probe < Pm4HashProbeLimit; ++probe) {
+        auto& entry = ring->pm4.waits[slot];
+        const u64 entry_hash = entry.hash.load(std::memory_order_acquire);
+        if (entry_hash == hash && entry.location == location && entry.identity == identity &&
+            entry.control == control && entry.reference == reference && entry.mask == mask &&
+            entry.poll_interval == poll_interval) {
+            AddSingleWriter(entry.packets, 1);
+            AddSingleWriter(entry.failed_tests, failed_tests);
+            AddSingleWriter(entry.immediate_passes, failed_tests == 0);
+            AddSingleWriter(entry.vo_sleeps, vo_sleep);
+            return;
+        }
+        if (entry_hash == 0) {
+            entry.location = location;
+            entry.identity = identity;
+            entry.control = control;
+            entry.reference = reference;
+            entry.mask = mask;
+            entry.poll_interval = poll_interval;
+            entry.hash.store(hash, std::memory_order_release);
+            AddSingleWriter(entry.packets, 1);
+            AddSingleWriter(entry.failed_tests, failed_tests);
+            AddSingleWriter(entry.immediate_passes, failed_tests == 0);
+            AddSingleWriter(entry.vo_sleeps, vo_sleep);
+            return;
+        }
+        slot = (slot + 1) & (Pm4WaitCapacity - 1);
+    }
+    AddSingleWriter(ring->pm4.wait_overflow, 1);
+}
+#endif
 
 std::filesystem::path Dump() {
     if (!Enabled() || g_dumping.exchange(true, std::memory_order_acq_rel)) {
@@ -377,7 +614,7 @@ std::filesystem::path Dump() {
     }
 
     file << "kind,thread,timestamp_ns,name,arg0,arg1,value\n";
-    file << "metadata,,0,schema_version,0,0,2\n";
+    file << "metadata,,0,schema_version,0,0,4\n";
     file << "metadata,,0,session_duration_ns,0,0," << Timestamp() - g_session_start_ns << '\n';
     file << "metadata,,0,ring_capacity,0,0," << RingCapacity << '\n';
     file << "metadata,,0,thread_count,0,0," << snapshot_rings.size() << '\n';
@@ -409,6 +646,88 @@ std::filesystem::path Dump() {
                 }
             }
         }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        for (size_t engine = 0; engine < Pm4EngineCount; ++engine) {
+            for (size_t opcode = 0; opcode < Pm4OpcodeCount; ++opcode) {
+                const auto& detail = ring->pm4.opcodes[engine][opcode];
+                const u64 packets = detail.packets.load(std::memory_order_relaxed);
+                if (packets == 0) {
+                    continue;
+                }
+                const u64 identity = engine | (opcode << 8);
+                file << "pm4_opcode," << ring->id << ",0,packets," << identity << ','
+                     << detail.words.load(std::memory_order_relaxed) << ',' << packets << '\n';
+                file << "pm4_opcode," << ring->id << ",0,max_depth," << identity << ",0,"
+                     << detail.max_depth.load(std::memory_order_relaxed) << '\n';
+                file << "pm4_opcode," << ring->id << ",0,predicated," << identity << ",0,"
+                     << detail.predicated.load(std::memory_order_relaxed) << '\n';
+                file << "pm4_opcode," << ring->id << ",0,shader_compute," << identity << ",0,"
+                     << detail.shader_compute.load(std::memory_order_relaxed) << '\n';
+                for (size_t words = 0; words < Pm4WordBucketCount; ++words) {
+                    const u64 count = detail.word_counts[words].load(std::memory_order_relaxed);
+                    if (count != 0) {
+                        const auto name = words == Pm4WordOverflowBucket ? "packet_words_ge_256"
+                                                                        : "packet_words";
+                        file << "pm4_words," << ring->id << ",0," << name << ',' << identity
+                             << ',' << words << ',' << count << '\n';
+                    }
+                }
+            }
+        }
+        for (size_t engine = 0; engine < Pm4EngineCount; ++engine) {
+            for (size_t space = 0; space < Pm4RegisterSpaceCount; ++space) {
+                for (size_t offset = 0; offset < Pm4RegisterCount; ++offset) {
+                    const auto& detail = ring->pm4.registers[engine][space][offset];
+                    const u64 packets = detail.packets.load(std::memory_order_relaxed);
+                    if (packets == 0) {
+                        continue;
+                    }
+                    const u64 identity = engine | (static_cast<u64>(Pm4RegisterOpcodes[space]) << 8) |
+                                         (static_cast<u64>(offset) << 16);
+                    file << "pm4_register," << ring->id << ",0,packets," << identity << ','
+                         << detail.words.load(std::memory_order_relaxed) << ',' << packets << '\n';
+                    file << "pm4_register," << ring->id << ",0,changed_packets," << identity
+                         << ",0," << detail.changed.load(std::memory_order_relaxed) << '\n';
+                }
+            }
+        }
+        for (const auto& detail : ring->pm4.controls) {
+            if (detail.hash.load(std::memory_order_acquire) == 0) {
+                continue;
+            }
+            const u64 controls = detail.control0 | (static_cast<u64>(detail.control1) << 32);
+            file << "pm4_control," << ring->id << ",0,raw_dwords," << detail.identity << ','
+                 << controls << ',' << detail.packets.load(std::memory_order_relaxed) << '\n';
+        }
+        for (const auto& detail : ring->pm4.waits) {
+            if (detail.hash.load(std::memory_order_acquire) == 0) {
+                continue;
+            }
+            const u64 identity = detail.identity | (static_cast<u64>(detail.control) << 32);
+            const u64 compare = detail.reference | (static_cast<u64>(detail.mask) << 32);
+            file << "pm4_wait_key," << ring->id << ',' << detail.location
+                 << ",parameters," << identity << ',' << compare << ','
+                 << detail.poll_interval << '\n';
+            file << "pm4_wait_stat," << ring->id << ',' << detail.location << ",packets,"
+                 << identity << ",0,"
+                 << detail.packets.load(std::memory_order_relaxed) << '\n';
+            file << "pm4_wait_stat," << ring->id << ',' << detail.location
+                 << ",failed_tests," << identity << ",0,"
+                 << detail.failed_tests.load(std::memory_order_relaxed) << '\n';
+            file << "pm4_wait_stat," << ring->id << ',' << detail.location
+                 << ",immediate_passes," << identity << ",0,"
+                 << detail.immediate_passes.load(std::memory_order_relaxed) << '\n';
+            file << "pm4_wait_stat," << ring->id << ',' << detail.location << ",vo_sleeps,"
+                 << identity << ",0,"
+                 << detail.vo_sleeps.load(std::memory_order_relaxed) << '\n';
+        }
+        file << "pm4_overflow," << ring->id << ",0,register,0,0,"
+             << ring->pm4.register_overflow.load(std::memory_order_relaxed) << '\n';
+        file << "pm4_overflow," << ring->id << ",0,control,0,0,"
+             << ring->pm4.control_overflow.load(std::memory_order_relaxed) << '\n';
+        file << "pm4_overflow," << ring->id << ",0,wait,0,0,"
+             << ring->pm4.wait_overflow.load(std::memory_order_relaxed) << '\n';
+#endif
     }
     for (size_t i = 0; i < totals.size(); ++i) {
         file << "counter,,0," << CounterNames[i] << ",0,0," << totals[i] << '\n';

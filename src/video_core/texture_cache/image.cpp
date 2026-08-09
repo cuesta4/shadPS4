@@ -127,6 +127,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         return;
     }
     image_uid = global_image_uid.Next();
+    readback_token = std::make_shared<ImageReadbackToken>(image_uid);
     mip_hashes.resize(info.resources.levels);
     // Here we force `eExtendedUsage` as don't know all image usage cases beforehand. In normal case
     // the texture cache should re-create the resource with the usage requested

@@ -515,7 +515,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
-                                    copy.size);
+                                    copy.size, Core::MemoryWriteOrigin::GpuCompletion);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
     };
