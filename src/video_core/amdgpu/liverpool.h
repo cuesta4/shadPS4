@@ -197,6 +197,8 @@ private:
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+    template <u32 NumWords>
+    bool WriteGraphicsRegistersSmall(u32 first_register, const u32* payload);
     bool WriteGraphicsRegisters(u32 first_register, const u32* payload, u32 word_count);
     bool WriteGraphicsRegisters4(u32 first_register, const u32* payload);
     bool WriteGraphicsRegisters8(u32 first_register, const u32* payload);

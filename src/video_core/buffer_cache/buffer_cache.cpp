@@ -31,6 +31,59 @@ static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
+static SHAD_NO_INLINE void ValidateStreamCopyRequest(
+    const bool finalized, const u16 request_count, const size_t max_requests,
+    const BufferCache::StreamCopyRequest& request) {
+    ASSERT(!finalized);
+    ASSERT(request_count < max_requests);
+    ASSERT(request.size != 0);
+    ASSERT(request.alignment != 0 && std::has_single_bit(request.alignment));
+    ASSERT(request.source_type == BufferCache::StreamCopySource::Guest ||
+           request.source_type == BufferCache::StreamCopySource::Host ||
+           request.source_type == BufferCache::StreamCopySource::Zero);
+    ASSERT(request.source_type != BufferCache::StreamCopySource::Host ||
+           request.host_address != nullptr);
+}
+
+static SHAD_NO_INLINE void ValidateStreamCopyBatch(const size_t request_count,
+                                                   const size_t result_count,
+                                                   const size_t max_requests) {
+    ASSERT(request_count == result_count);
+    ASSERT(request_count <= max_requests);
+}
+
+static SHAD_NO_INLINE void ValidateStreamCopyNotFinalized(const bool finalized) {
+    ASSERT(!finalized);
+}
+
+static SHAD_NO_INLINE void ValidateStreamCopyResult(const bool finalized, const u16 index,
+                                                    const u16 request_count) {
+    ASSERT(finalized);
+    ASSERT(index < request_count);
+}
+
+static SHAD_NO_INLINE void ValidateStreamCopyDestination(const void* destination) {
+    ASSERT(destination != nullptr);
+}
+
+static SHAD_NO_INLINE void ValidateStreamCopyMapping(const u16 canonical,
+                                                     const u16 no_canonical_copy) {
+    ASSERT(canonical != no_canonical_copy);
+}
+
+static SHAD_NO_INLINE void ValidateVertexRangeSize(u64 size) {
+    ASSERT(size <= std::numeric_limits<u32>::max());
+}
+
+static SHAD_NO_INLINE void ValidateVertexIndexState(bool prepared, bool stream_copy_finalized) {
+    ASSERT(prepared);
+    ASSERT(stream_copy_finalized);
+}
+
+static SHAD_NO_INLINE void ValidateVertexIndexBuffer(const void* buffer) {
+    ASSERT(buffer != nullptr);
+}
+
 struct BufferCache::StreamCopyScratch {
     static constexpr size_t HashTableSize = 256;
     static constexpr u16 NoCanonicalCopy = std::numeric_limits<u16>::max();
@@ -205,21 +258,24 @@ void BufferCache::BeginStreamCopyBatch() noexcept {
 }
 
 u16 BufferCache::QueueStreamCopy(const StreamCopyRequest& request) {
-    ASSERT(!stream_copy_finalized);
-    ASSERT(stream_copy_request_count < MaxStreamCopyRequests);
-    ASSERT(request.size != 0);
-    ASSERT(request.alignment != 0 && std::has_single_bit(request.alignment));
-    ASSERT(request.source_type == StreamCopySource::Guest ||
-           request.source_type == StreamCopySource::Host ||
-           request.source_type == StreamCopySource::Zero);
-    ASSERT(request.source_type != StreamCopySource::Host || request.host_address != nullptr);
+    const bool invalid =
+        stream_copy_finalized | (stream_copy_request_count >= MaxStreamCopyRequests) |
+        (request.size == 0) | !std::has_single_bit(request.alignment) |
+        (static_cast<u8>(request.source_type) > static_cast<u8>(StreamCopySource::Zero)) |
+        ((request.source_type == StreamCopySource::Host) & (request.host_address == nullptr));
+    if (invalid) [[unlikely]] {
+        ValidateStreamCopyRequest(stream_copy_finalized, stream_copy_request_count,
+                                  MaxStreamCopyRequests, request);
+    }
     const u16 index = stream_copy_request_count++;
     stream_copy_requests[index] = request;
     return index;
 }
 
 void BufferCache::FinalizeStreamCopyBatch() {
-    ASSERT(!stream_copy_finalized);
+    if (stream_copy_finalized) [[unlikely]] {
+        ValidateStreamCopyNotFinalized(stream_copy_finalized);
+    }
     if (stream_copy_request_count != 0) {
         ExecuteStreamCopyBatch(
             std::span<const StreamCopyRequest>{stream_copy_requests.data(),
@@ -230,15 +286,17 @@ void BufferCache::FinalizeStreamCopyBatch() {
 }
 
 const BufferCache::StreamCopyResult& BufferCache::GetStreamCopyResult(u16 index) const {
-    ASSERT(stream_copy_finalized);
-    ASSERT(index < stream_copy_request_count);
+    if (!stream_copy_finalized || index >= stream_copy_request_count) [[unlikely]] {
+        ValidateStreamCopyResult(stream_copy_finalized, index, stream_copy_request_count);
+    }
     return stream_copy_results[index];
 }
 
 void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requests,
                                          std::span<StreamCopyResult> results) {
-    ASSERT(requests.size() == results.size());
-    ASSERT(requests.size() <= MaxStreamCopyRequests);
+    if (requests.size() != results.size() || requests.size() > MaxStreamCopyRequests) [[unlikely]] {
+        ValidateStreamCopyBatch(requests.size(), results.size(), MaxStreamCopyRequests);
+    }
     if (requests.empty()) {
         return;
     }
@@ -278,7 +336,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     if (requests.size() == 1) {
         const auto& request = requests.front();
         const auto [destination, offset] = stream_buffer.Map(request.size, request.alignment);
-        ASSERT(destination != nullptr);
+        if (destination == nullptr) [[unlikely]] {
+            ValidateStreamCopyDestination(destination);
+        }
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::StagingBytes, request.size);
         switch (request.source_type) {
@@ -386,7 +446,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     }
 
     const auto [destination, base_offset] = stream_buffer.Map(total_size, max_alignment);
-    ASSERT(destination != nullptr);
+    if (destination == nullptr) [[unlikely]] {
+        ValidateStreamCopyDestination(destination);
+    }
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
                                       total_size);
 
@@ -420,7 +482,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
 
     for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
         const auto& mapping = scratch.request_map[request_index];
-        ASSERT(mapping.canonical != StreamCopyScratch::NoCanonicalCopy);
+        if (mapping.canonical == StreamCopyScratch::NoCanonicalCopy) [[unlikely]] {
+            ValidateStreamCopyMapping(mapping.canonical, StreamCopyScratch::NoCanonicalCopy);
+        }
         const auto& canonical = scratch.canonical_copies[mapping.canonical];
         results[request_index] = {
             .buffer = &stream_buffer,
@@ -589,7 +653,9 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
 
     for (auto& range : state.ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        ASSERT(size <= std::numeric_limits<u32>::max());
+        if (size > std::numeric_limits<u32>::max()) [[unlikely]] {
+            ValidateVertexRangeSize(size);
+        }
         range.size = static_cast<u32>(size);
         range.was_gpu_modified = IsRegionGpuModified(range.base_address, size);
         if (!range.was_gpu_modified && size <= CACHING_PAGESIZE) {
@@ -626,8 +692,9 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
 void BufferCache::FinalizeVertexIndexBuffers(
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     auto& state = *vertex_index_state;
-    ASSERT(state.prepared);
-    ASSERT(stream_copy_finalized);
+    if (!state.prepared || !stream_copy_finalized) [[unlikely]] {
+        ValidateVertexIndexState(state.prepared, stream_copy_finalized);
+    }
 
     for (auto& range : state.ranges_merged) {
         if (range.stream_index != VertexIndexState::NoStreamCopy) {
@@ -642,7 +709,9 @@ void BufferCache::FinalizeVertexIndexBuffers(
             range.vk_buffer = range.buffer->Handle();
             range.offset = range.buffer->Offset(range.base_address);
         }
-        ASSERT(range.buffer != nullptr);
+        if (range.buffer == nullptr) [[unlikely]] {
+            ValidateVertexIndexBuffer(range.buffer);
+        }
         if (range.was_gpu_modified) {
             if (auto barrier =
                     range.buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
@@ -668,7 +737,9 @@ void BufferCache::FinalizeVertexIndexBuffers(
             SynchronizeBuffer(*index.buffer, index.address, index.size, false, false);
             index.offset = index.buffer->Offset(index.address);
         }
-        ASSERT(index.buffer != nullptr);
+        if (index.buffer == nullptr) [[unlikely]] {
+            ValidateVertexIndexBuffer(index.buffer);
+        }
         if (index.was_gpu_modified) {
             if (auto barrier = index.buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                         vk::PipelineStageFlagBits2::eIndexInput)) {
@@ -692,8 +763,11 @@ void BufferCache::FinalizeVertexIndexBuffers(
         for (u32 i = 0; i < rhs_count; ++i) {
             const auto& left = lhs[i];
             const auto& right = rhs[i];
-            if (left.location != right.location || left.binding != right.binding ||
-                left.format != right.format || left.offset != right.offset) {
+            const u32 different =
+                (left.location ^ right.location) | (left.binding ^ right.binding) |
+                (static_cast<u32>(left.format) ^ static_cast<u32>(right.format)) |
+                (left.offset ^ right.offset);
+            if (different != 0) {
                 return false;
             }
         }
@@ -706,8 +780,11 @@ void BufferCache::FinalizeVertexIndexBuffers(
         for (u32 i = 0; i < rhs_count; ++i) {
             const auto& left = lhs[i];
             const auto& right = rhs[i];
-            if (left.binding != right.binding || left.stride != right.stride ||
-                left.inputRate != right.inputRate || left.divisor != right.divisor) {
+            const u32 different =
+                (left.binding ^ right.binding) | (left.stride ^ right.stride) |
+                (static_cast<u32>(left.inputRate) ^ static_cast<u32>(right.inputRate)) |
+                (left.divisor ^ right.divisor);
+            if (different != 0) {
                 return false;
             }
         }
@@ -754,18 +831,51 @@ void BufferCache::FinalizeVertexIndexBuffers(
             }
         }
 
-        const auto values_equal = [num_buffers](const auto& lhs, const auto& rhs) {
-            return std::equal(lhs.begin(), lhs.begin() + num_buffers, rhs.begin());
+        const bool dynamic_vertex_input = instance.IsVertexInputDynamicState();
+        const auto vertex_buffers_equal = [&] {
+            u32 i = 0;
+            for (; i + 4 <= num_buffers; i += 4) {
+                const u64 different =
+                    (std::bit_cast<u64>(host_buffers[i]) ^
+                     std::bit_cast<u64>(state.emitted_buffers[i])) |
+                    (std::bit_cast<u64>(host_buffers[i + 1]) ^
+                     std::bit_cast<u64>(state.emitted_buffers[i + 1])) |
+                    (std::bit_cast<u64>(host_buffers[i + 2]) ^
+                     std::bit_cast<u64>(state.emitted_buffers[i + 2])) |
+                    (std::bit_cast<u64>(host_buffers[i + 3]) ^
+                     std::bit_cast<u64>(state.emitted_buffers[i + 3])) |
+                    (host_offsets[i] ^ state.emitted_offsets[i]) |
+                    (host_offsets[i + 1] ^ state.emitted_offsets[i + 1]) |
+                    (host_offsets[i + 2] ^ state.emitted_offsets[i + 2]) |
+                    (host_offsets[i + 3] ^ state.emitted_offsets[i + 3]);
+                if (different != 0) {
+                    return false;
+                }
+            }
+            for (; i < num_buffers; ++i) {
+                const u64 different =
+                    (std::bit_cast<u64>(host_buffers[i]) ^
+                     std::bit_cast<u64>(state.emitted_buffers[i])) |
+                    (host_offsets[i] ^ state.emitted_offsets[i]);
+                if (different != 0) {
+                    return false;
+                }
+            }
+            if (!dynamic_vertex_input) {
+                for (u32 i = 0; i < num_buffers; ++i) {
+                    if (((host_sizes[i] ^ state.emitted_sizes[i]) |
+                         (host_strides[i] ^ state.emitted_strides[i])) != 0) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         };
         const bool same_buffers = state.vertex_buffers_valid &&
                                   state.emitted_buffer_count == num_buffers &&
-                                  values_equal(host_buffers, state.emitted_buffers) &&
-                                  values_equal(host_offsets, state.emitted_offsets) &&
-                                  (instance.IsVertexInputDynamicState() ||
-                                   (values_equal(host_sizes, state.emitted_sizes) &&
-                                    values_equal(host_strides, state.emitted_strides)));
+                                  vertex_buffers_equal();
         if (!same_buffers) {
-            if (instance.IsVertexInputDynamicState()) {
+            if (dynamic_vertex_input) {
                 cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
             } else {
                 cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),

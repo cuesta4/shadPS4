@@ -132,6 +132,14 @@ void FinishNonTemporalCopies(bool used_non_temporal) noexcept {
 #endif
 }
 
+SHAD_NO_INLINE void ValidateSparseCopyDestination(const void* destination) {
+    ASSERT(destination != nullptr);
+}
+
+SHAD_NO_INLINE void ValidateSparseCopyMapping(bool valid, VAddr source) {
+    ASSERT_MSG(valid, "Attempted to access invalid address {:#x}", source);
+}
+
 } // namespace
 
 MemoryManager::MemoryManager() {
@@ -344,19 +352,30 @@ void MemoryManager::CopySparseMemoryBatch(std::span<const SparseCopyRequest> req
         if (request.size == 0) {
             continue;
         }
-        ASSERT(request.destination != nullptr);
-        ASSERT_MSG(IsValidMapping(request.source), "Attempted to access invalid address {:#x}",
-                   request.source);
+        if (request.destination == nullptr) [[unlikely]] {
+            ValidateSparseCopyDestination(request.destination);
+        }
 
         SparseCopyPlan* plan = nullptr;
+        SparseCopyPlan* cache_entry = nullptr;
         if (request.size <= std::numeric_limits<u32>::max()) {
             auto& cached =
                 sparse_copy_plan_cache[SparseCopyPlanIndex(request.source, request.size)];
+            cache_entry = &cached;
             if (cached.valid && cached.owner == this && cached.source == request.source &&
                 cached.size == request.size && cached.generation == mapping_generation) {
                 plan = &cached;
-            } else if (build_plan(request.source, request.size, cached)) {
-                plan = &cached;
+            }
+        }
+
+        if (plan == nullptr) {
+            const bool valid_mapping = IsValidMapping(request.source);
+            if (!valid_mapping) [[unlikely]] {
+                ValidateSparseCopyMapping(valid_mapping, request.source);
+            }
+            if (cache_entry != nullptr &&
+                build_plan(request.source, request.size, *cache_entry)) {
+                plan = cache_entry;
             }
         }
 

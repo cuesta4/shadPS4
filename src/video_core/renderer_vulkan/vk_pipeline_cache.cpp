@@ -710,17 +710,26 @@ void AddBindingStart(SpecializationFingerprintBuilder& builder,
 struct StageRawDependencyKey {
     std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
     u64 fetch_shader_revision{};
-
-    bool operator==(const StageRawDependencyKey&) const noexcept = default;
 };
 
-[[nodiscard]] StageRawDependencyKey MakeRawDependencyKey(
-    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data,
-    u64 fetch_shader_revision) {
-    StageRawDependencyKey key{};
-    std::ranges::copy(user_data, key.user_data.begin());
-    key.fetch_shader_revision = fetch_shader_revision;
-    return key;
+[[nodiscard]] bool MatchesUserData(
+    const StageRawDependencyKey& expected,
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data) noexcept {
+#if defined(__AVX2__)
+    const auto* expected_words = expected.user_data.data();
+    const auto* current_words = user_data.data();
+    __m256i difference = _mm256_xor_si256(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(expected_words)),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_words)));
+    difference = _mm256_or_si256(
+        difference,
+        _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(expected_words + 8)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_words + 8))));
+    return _mm256_testz_si256(difference, difference) != 0;
+#else
+    return std::ranges::equal(expected.user_data, user_data);
+#endif
 }
 
 struct GraphicsDependencyKey {
@@ -728,8 +737,6 @@ struct GraphicsDependencyKey {
     std::array<StageRawDependencyKey, MaxShaderStages> stage_keys{};
     std::array<VAddr, MaxShaderStages> stage_bases{};
     u32 active_mask{};
-
-    bool operator==(const GraphicsDependencyKey&) const noexcept = default;
 };
 
 struct StageCurrentEntry {
@@ -748,46 +755,89 @@ struct PipelineCache::OptimizationState {
     Common::PerformanceTelemetry::Gate telemetry_enabled{};
     std::array<StageCurrentEntry, MaxShaderStages> current_stages{};
 
-    [[nodiscard]] std::optional<GraphicsDependencyKey> BuildGraphicsDependency(
-        PipelineCache& cache);
+    [[nodiscard]] bool MatchesGraphicsDependency(PipelineCache& cache);
+    [[nodiscard]] bool CaptureGraphicsDependency(PipelineCache& cache);
 };
 
-SHAD_NO_INLINE std::optional<GraphicsDependencyKey>
-PipelineCache::OptimizationState::BuildGraphicsDependency(PipelineCache& cache) {
-    GraphicsDependencyKey dependency{};
-    dependency.fixed_generation = cache.liverpool->GraphicsPipelineGeneration();
+SHAD_NO_INLINE bool PipelineCache::OptimizationState::MatchesGraphicsDependency(
+    PipelineCache& cache) {
+    const u32 expected_active_mask = graphics_dependency.active_mask;
+    for (u32 logical_index = 0; logical_index < MaxShaderStages; ++logical_index) {
+        const bool active = cache.infos[logical_index] != nullptr;
+        if (active != ((expected_active_mask >> logical_index) & 1U)) {
+            return false;
+        }
+        if (!active) {
+            continue;
+        }
+        const auto& stage_cache = current_stages[logical_index];
+        if (!stage_cache.program || cache.infos[logical_index] != &stage_cache.program->info) {
+            return false;
+        }
+        const auto* shader_program =
+            cache.liverpool->regs.ProgramForStage(static_cast<u32>(stage_cache.stage));
+        if (!shader_program || !shader_program->Address<u32*>()) {
+            return false;
+        }
+        const VAddr program_base = shader_program->Address<VAddr>();
+        auto& program = *stage_cache.program;
+        if (!program.specialization_plan_ready || !program.specialization_plan_cacheable ||
+            program_base != stage_cache.program_base ||
+            program_base != graphics_dependency.stage_bases[logical_index] ||
+            !MatchesUserData(graphics_dependency.stage_keys[logical_index],
+                             shader_program->user_data)) {
+            return false;
+        }
+
+        program.info.pgm_base = program_base;
+        program.info.user_data = shader_program->user_data;
+        const auto cached_fetch_shader = GetCachedFetchShader(program);
+        if (!cached_fetch_shader.IsUsable(program.info) ||
+            cached_fetch_shader.revision !=
+                graphics_dependency.stage_keys[logical_index].fetch_shader_revision) {
+            return false;
+        }
+    }
+    return true;
+}
+
+SHAD_NO_INLINE bool PipelineCache::OptimizationState::CaptureGraphicsDependency(
+    PipelineCache& cache) {
+    graphics_dependency = {};
+    graphics_dependency.fixed_generation = cache.liverpool->GraphicsPipelineGeneration();
     for (u32 logical_index = 0; logical_index < MaxShaderStages; ++logical_index) {
         if (!cache.infos[logical_index]) {
             continue;
         }
         const auto& stage_cache = current_stages[logical_index];
         if (!stage_cache.program || cache.infos[logical_index] != &stage_cache.program->info) {
-            return std::nullopt;
+            return false;
         }
         const auto* shader_program =
             cache.liverpool->regs.ProgramForStage(static_cast<u32>(stage_cache.stage));
         if (!shader_program || !shader_program->Address<u32*>()) {
-            return std::nullopt;
+            return false;
         }
         const VAddr program_base = shader_program->Address<VAddr>();
         auto& program = *stage_cache.program;
         if (!BuildSpecializationPlan(program) || program_base != stage_cache.program_base) {
-            return std::nullopt;
+            return false;
         }
 
         program.info.pgm_base = program_base;
         program.info.user_data = shader_program->user_data;
         const auto cached_fetch_shader = GetCachedFetchShader(program);
         if (!cached_fetch_shader.IsUsable(program.info)) {
-            return std::nullopt;
+            return false;
         }
 
-        dependency.active_mask |= 1U << logical_index;
-        dependency.stage_bases[logical_index] = program_base;
-        dependency.stage_keys[logical_index] =
-            MakeRawDependencyKey(shader_program->user_data, cached_fetch_shader.revision);
+        graphics_dependency.active_mask |= 1U << logical_index;
+        graphics_dependency.stage_bases[logical_index] = program_base;
+        auto& stage_dependency = graphics_dependency.stage_keys[logical_index];
+        std::ranges::copy(shader_program->user_data, stage_dependency.user_data.begin());
+        stage_dependency.fetch_shader_revision = cached_fetch_shader.revision;
     }
-    return dependency;
+    return true;
 }
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
@@ -1081,8 +1131,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
     if (opt.graphics_valid && opt.graphics_cacheable && opt.graphics_pipeline &&
         liverpool->GraphicsPipelineGeneration() == opt.graphics_dependency.fixed_generation) {
-        const auto dependency = opt.BuildGraphicsDependency(*this);
-        if (dependency && *dependency == opt.graphics_dependency) {
+        if (opt.MatchesGraphicsDependency(*this)) {
             if (opt.telemetry_enabled) {
                 Common::PerformanceTelemetry::AddEnabled(
                     Common::PerformanceTelemetry::Counter::PipelineHits, 1);
@@ -1095,12 +1144,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     opt.graphics_pipeline = pipeline;
     opt.graphics_valid = pipeline != nullptr;
     opt.graphics_cacheable = pipeline && CanReuseGraphicsPipeline();
-    if (opt.graphics_cacheable) {
-        if (const auto dependency = opt.BuildGraphicsDependency(*this)) {
-            opt.graphics_dependency = *dependency;
-        } else {
-            opt.graphics_cacheable = false;
-        }
+    if (opt.graphics_cacheable && !opt.CaptureGraphicsDependency(*this)) {
+        opt.graphics_cacheable = false;
     }
     return pipeline;
 }

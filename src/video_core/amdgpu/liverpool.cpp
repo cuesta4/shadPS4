@@ -660,49 +660,52 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, u32 ib_dept
 #define SHAD_LOCAL_FORCE_INLINE __attribute__((always_inline)) inline
 #endif
 
-SHAD_LOCAL_FORCE_INLINE bool Liverpool::WriteGraphicsRegisters(u32 first_register,
-                                                                const u32* payload,
-                                                                u32 word_count) {
-    if (word_count == 1) [[likely]] {
-        if (first_register >= Regs::NumRegs) [[unlikely]] {
-            return InvalidGraphicsRegisterRange(first_register, word_count);
-        }
-        u32* const destination = &regs.reg_array[first_register];
-        if (*destination == *payload) [[likely]] {
-            return false;
-        }
-        const bool pipeline_state_changed =
-            (GraphicsPipelineRegisterMask[first_register / 64] &
-             (1ULL << (first_register & 63U))) != 0;
-        *destination = *payload;
-        ++graphics_state_generation;
-        graphics_pipeline_generation += pipeline_state_changed;
-        return true;
+template <u32 NumWords>
+SHAD_LOCAL_FORCE_INLINE bool Liverpool::WriteGraphicsRegistersSmall(u32 first_register,
+                                                                     const u32* payload) {
+    static_assert(NumWords == 1 || NumWords == 2);
+    if (first_register > Regs::NumRegs - NumWords) [[unlikely]] {
+        return InvalidGraphicsRegisterRange(first_register, NumWords);
     }
 
-    if (word_count == 2) {
-        if (first_register > Regs::NumRegs - 2) [[unlikely]] {
-            return InvalidGraphicsRegisterRange(first_register, word_count);
+    u32* const destination = &regs.reg_array[first_register];
+    if constexpr (NumWords == 1) {
+        const u32 new_value = *payload;
+        if (*destination == new_value) [[likely]] {
+            return false;
         }
-        u32* const destination = &regs.reg_array[first_register];
+        const bool pipeline_state_changed = PipelineRegisterBits<1>(first_register) != 0;
+        *destination = new_value;
+        ++graphics_state_generation;
+        graphics_pipeline_generation += pipeline_state_changed;
+    } else {
         u64 old_values{};
         u64 new_values{};
         std::memcpy(&old_values, destination, sizeof(old_values));
         std::memcpy(&new_values, payload, sizeof(new_values));
-        if (old_values == new_values) [[likely]] {
+        const u64 different = old_values ^ new_values;
+        if (different == 0) [[likely]] {
             return false;
         }
-        bool pipeline_state_changed = false;
-        for (u32 i = 0; i < 2; ++i) {
-            const u32 register_index = first_register + i;
-            pipeline_state_changed |= destination[i] != payload[i] &&
-                                      (GraphicsPipelineRegisterMask[register_index / 64] &
-                                       (1ULL << (register_index & 63U))) != 0;
-        }
+        const u32 changed_registers = static_cast<u32>(static_cast<u32>(different) != 0) |
+                                      (static_cast<u32>(different >> 32) != 0) << 1;
+        const bool pipeline_state_changed =
+            (changed_registers & PipelineRegisterBits<2>(first_register)) != 0;
         std::memcpy(destination, &new_values, sizeof(new_values));
         ++graphics_state_generation;
         graphics_pipeline_generation += pipeline_state_changed;
-        return true;
+    }
+    return true;
+}
+
+SHAD_LOCAL_FORCE_INLINE bool Liverpool::WriteGraphicsRegisters(u32 first_register,
+                                                                const u32* payload,
+                                                                u32 word_count) {
+    if (word_count == 1) [[likely]] {
+        return WriteGraphicsRegistersSmall<1>(first_register, payload);
+    }
+    if (word_count == 2) {
+        return WriteGraphicsRegistersSmall<2>(first_register, payload);
     }
 
     if (first_register > Regs::NumRegs || word_count > Regs::NumRegs - first_register) [[unlikely]] {
@@ -1097,8 +1100,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 const u32 word_count = count - 1;
                 [[maybe_unused]] bool changed;
-                if (word_count <= 2) [[likely]] {
-                    changed = WriteGraphicsRegisters(reg_addr, payload, word_count);
+                if (word_count == 1) [[likely]] {
+                    changed = WriteGraphicsRegistersSmall<1>(reg_addr, payload);
+                } else if (word_count == 2) {
+                    changed = WriteGraphicsRegistersSmall<2>(reg_addr, payload);
                 } else if (word_count == 8) {
                     changed = WriteGraphicsRegisters8(reg_addr, payload);
                 } else if (reg_addr > Regs::NumRegs ||
@@ -1143,8 +1148,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                            telemetry_enabled);
                 } else {
                     const u32 reg_addr = Regs::ShRegWordOffset + set_data->reg_offset;
-                    if (word_count <= 2) [[likely]] {
-                        changed = WriteGraphicsRegisters(reg_addr, payload, word_count);
+                    if (word_count == 2) [[likely]] {
+                        changed = WriteGraphicsRegistersSmall<2>(reg_addr, payload);
+                    } else if (word_count == 1) {
+                        changed = WriteGraphicsRegistersSmall<1>(reg_addr, payload);
                     } else if (word_count == 4) {
                         changed = WriteGraphicsRegisters4(reg_addr, payload);
                     } else if (word_count == 8) {

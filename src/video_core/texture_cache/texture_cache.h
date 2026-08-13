@@ -323,8 +323,14 @@ private:
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
-    /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    /// Touch the image in the LRU cache at most once per GC tick.
+    void TouchImage(Image& image) {
+        if (image.lru_tick != gc_tick) [[unlikely]] {
+            TouchImageSlow(image);
+        }
+    }
+
+    void TouchImageSlow(Image& image);
 
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);
@@ -337,16 +343,9 @@ private:
 
 private:
     struct ExactImageCacheKey {
-        VAddr guest_address{};
-        u32 guest_size{};
-        Extent3D size{};
-        SubresourceExtent resources{};
-        vk::Format pixel_format{vk::Format::eUndefined};
-        AmdGpu::ImageType type{};
-        bool exact_format{};
-
-        bool operator==(const ExactImageCacheKey&) const = default;
+        std::array<u64, 6> words{};
     };
+    static_assert(sizeof(ExactImageCacheKey) == 48);
 
     struct ExactImageCacheEntry {
         ExactImageCacheKey key{};

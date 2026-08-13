@@ -6,6 +6,8 @@
 #include <limits>
 #include <span>
 
+#include <immintrin.h>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/performance_telemetry.h"
@@ -28,23 +30,46 @@
 
 namespace Vulkan {
 
-[[nodiscard]] AmdGpu::Buffer GetResolvedBuffer(const Shader::Info& info, u32 index) {
-    ASSERT(index < info.buffers.size());
-    ASSERT(info.resolved_buffers.size() == info.buffers.size());
+static SHAD_NO_INLINE void ValidateResolvedSharp(size_t index, size_t descriptor_count,
+                                                 size_t resolved_count) {
+    ASSERT(index < descriptor_count);
+    ASSERT(resolved_count == descriptor_count);
+}
+
+#if defined(_MSC_VER)
+#define SHAD_RASTERIZER_FORCE_INLINE __forceinline
+#else
+#define SHAD_RASTERIZER_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
+[[nodiscard]] static SHAD_RASTERIZER_FORCE_INLINE AmdGpu::Buffer GetResolvedBuffer(
+    const Shader::Info& info, u32 index) {
+    if (index >= info.buffers.size() || info.resolved_buffers.size() != info.buffers.size())
+        [[unlikely]] {
+        ValidateResolvedSharp(index, info.buffers.size(), info.resolved_buffers.size());
+    }
     return info.resolved_buffers[index];
 }
 
-[[nodiscard]] AmdGpu::Image GetResolvedImage(const Shader::Info& info, u32 index) {
-    ASSERT(index < info.images.size());
-    ASSERT(info.resolved_images.size() == info.images.size());
+[[nodiscard]] static SHAD_RASTERIZER_FORCE_INLINE AmdGpu::Image GetResolvedImage(
+    const Shader::Info& info, u32 index) {
+    if (index >= info.images.size() || info.resolved_images.size() != info.images.size())
+        [[unlikely]] {
+        ValidateResolvedSharp(index, info.images.size(), info.resolved_images.size());
+    }
     return info.resolved_images[index];
 }
 
-[[nodiscard]] AmdGpu::Sampler GetResolvedSampler(const Shader::Info& info, u32 index) {
-    ASSERT(index < info.samplers.size());
-    ASSERT(info.resolved_samplers.size() == info.samplers.size());
+[[nodiscard]] static SHAD_RASTERIZER_FORCE_INLINE AmdGpu::Sampler GetResolvedSampler(
+    const Shader::Info& info, u32 index) {
+    if (index >= info.samplers.size() || info.resolved_samplers.size() != info.samplers.size())
+        [[unlikely]] {
+        ValidateResolvedSharp(index, info.samplers.size(), info.resolved_samplers.size());
+    }
     return info.resolved_samplers[index];
 }
+
+#undef SHAD_RASTERIZER_FORCE_INLINE
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -60,6 +85,78 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 static SHAD_NO_INLINE void ReportUnsupportedWindowOffset() {
     LOG_ERROR(Render_Vulkan,
               "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
+}
+
+[[nodiscard]] static u64 DescriptorWriteKey0(const vk::WriteDescriptorSet& write) noexcept {
+    return static_cast<u64>(write.dstBinding) |
+           (static_cast<u64>(write.dstArrayElement) << 32);
+}
+
+[[nodiscard]] static u64 DescriptorWriteKey1(const vk::WriteDescriptorSet& write) noexcept {
+    return static_cast<u64>(write.descriptorCount) |
+           (static_cast<u64>(static_cast<u32>(write.descriptorType)) << 32);
+}
+
+[[nodiscard]] static bool DescriptorInfoEqual(const vk::DescriptorBufferInfo& lhs,
+                                              const vk::DescriptorBufferInfo& rhs) noexcept {
+    static_assert(sizeof(vk::Buffer) == sizeof(u64));
+    const u64 different = (std::bit_cast<u64>(lhs.buffer) ^ std::bit_cast<u64>(rhs.buffer)) |
+                          (lhs.offset ^ rhs.offset) | (lhs.range ^ rhs.range);
+    return different == 0;
+}
+
+[[nodiscard]] static bool DescriptorInfoEqual(const vk::DescriptorImageInfo& lhs,
+                                              const vk::DescriptorImageInfo& rhs) noexcept {
+    static_assert(sizeof(vk::Sampler) == sizeof(u64));
+    static_assert(sizeof(vk::ImageView) == sizeof(u64));
+    const u64 different =
+        (std::bit_cast<u64>(lhs.sampler) ^ std::bit_cast<u64>(rhs.sampler)) |
+        (std::bit_cast<u64>(lhs.imageView) ^ std::bit_cast<u64>(rhs.imageView)) |
+        (static_cast<u32>(lhs.imageLayout) ^ static_cast<u32>(rhs.imageLayout));
+    return different == 0;
+}
+
+template <typename Info>
+[[nodiscard]] static bool DescriptorInfosEqual(const Info* lhs, const Info* rhs,
+                                               const u32 count) noexcept {
+    if (count == 1) [[likely]] {
+        return DescriptorInfoEqual(*lhs, *rhs);
+    }
+    for (u32 index = 0; index < count; ++index) {
+        if (!DescriptorInfoEqual(lhs[index], rhs[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Vector, typename Info>
+static void AppendDescriptorInfos(Vector& destination, const Info* source, const u32 count) {
+    if (count == 1) [[likely]] {
+        destination.push_back(*source);
+    } else {
+        destination.insert(destination.end(), source, source + count);
+    }
+}
+
+static SHAD_NO_INLINE void ReportDescriptorStateOverflow() {
+    ASSERT(false);
+}
+
+static SHAD_NO_INLINE void ValidateTextureBindingIndex(size_t index, size_t limit) {
+    ASSERT(index < limit);
+}
+
+static SHAD_NO_INLINE void ValidateSingleImageBinding(u32 count) {
+    ASSERT(count == 1);
+}
+
+static SHAD_NO_INLINE void ValidateFeedbackLoopBinding(bool force_general) {
+    ASSERT_MSG(!force_general, "Having image both as storage and render target is unsupported");
+}
+
+static SHAD_NO_INLINE void ValidateDepthTargetView(u32 levels, bool needs_rebind) {
+    ASSERT(levels == 1 && !needs_rebind);
 }
 
 [[nodiscard]] static vk::Viewport MakeViewport(const Instance& instance, const AmdGpu::Regs& regs,
@@ -120,6 +217,25 @@ static SHAD_NO_INLINE void ReportUnsupportedWindowOffset() {
         .offset = {scissor.top_left_x, scissor.top_left_y},
         .extent = {scissor.GetWidth(), scissor.GetHeight()},
     };
+}
+
+[[nodiscard]] static u32 ActiveViewportMask(const AmdGpu::Regs& regs) noexcept {
+    static_assert(AmdGpu::NUM_VIEWPORTS == 16);
+    static_assert(sizeof(AmdGpu::ViewportBounds) == 6 * sizeof(u32));
+    const auto* base = reinterpret_cast<const int*>(regs.viewports.data());
+    const __m256i low_indices = _mm256_setr_epi32(0, 6, 12, 18, 24, 30, 36, 42);
+    const __m256i high_indices = _mm256_setr_epi32(48, 54, 60, 66, 72, 78, 84, 90);
+    const __m256i magnitude_mask = _mm256_set1_epi32(0x7fffffff);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i low =
+        _mm256_and_si256(_mm256_i32gather_epi32(base, low_indices, sizeof(u32)), magnitude_mask);
+    const __m256i high =
+        _mm256_and_si256(_mm256_i32gather_epi32(base, high_indices, sizeof(u32)), magnitude_mask);
+    const u32 inactive_low = static_cast<u32>(
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(low, zero))));
+    const u32 inactive_high = static_cast<u32>(
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(high, zero))));
+    return (~inactive_low & 0xffu) | ((~inactive_high & 0xffu) << 8);
 }
 
 static SHAD_NO_INLINE void SetMultipleViewportScissorState(
@@ -599,27 +715,29 @@ void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
         if (write.pImageInfo == nullptr && !is_buffer) {
             continue;
         }
-        ASSERT(state.writes.size() < state.writes.capacity());
+        if (state.writes.size() >= state.writes.capacity()) [[unlikely]] {
+            ReportDescriptorStateOverflow();
+        }
         const u32 first_info = is_buffer ? static_cast<u32>(state.buffer_infos.size())
                                          : static_cast<u32>(state.image_infos.size());
         state.writes.push_back({
-            .binding = write.dstBinding,
-            .array_element = write.dstArrayElement,
-            .count = write.descriptorCount,
+            .key0 = DescriptorWriteKey0(write),
+            .key1 = DescriptorWriteKey1(write),
             .first_info = first_info,
-            .type = write.descriptorType,
             .is_buffer = is_buffer,
         });
         if (is_buffer) {
-            ASSERT(state.buffer_infos.size() + write.descriptorCount <=
-                   state.buffer_infos.capacity());
-            state.buffer_infos.insert(state.buffer_infos.end(), write.pBufferInfo,
-                                      write.pBufferInfo + write.descriptorCount);
+            if (state.buffer_infos.size() + write.descriptorCount >
+                state.buffer_infos.capacity()) [[unlikely]] {
+                ReportDescriptorStateOverflow();
+            }
+            AppendDescriptorInfos(state.buffer_infos, write.pBufferInfo, write.descriptorCount);
         } else {
-            ASSERT(state.image_infos.size() + write.descriptorCount <=
-                   state.image_infos.capacity());
-            state.image_infos.insert(state.image_infos.end(), write.pImageInfo,
-                                     write.pImageInfo + write.descriptorCount);
+            if (state.image_infos.size() + write.descriptorCount >
+                state.image_infos.capacity()) [[unlikely]] {
+                ReportDescriptorStateOverflow();
+            }
+            AppendDescriptorInfos(state.image_infos, write.pImageInfo, write.descriptorCount);
         }
     }
     state.valid = true;
@@ -643,23 +761,17 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         const bool is_cacheable = write.pImageInfo != nullptr || is_buffer;
         if (is_cacheable && can_reuse && cached_write_index < cached.writes.size()) {
             const auto& old_write = cached.writes[cached_write_index];
-            unchanged = old_write.binding == write.dstBinding &&
-                        old_write.array_element == write.dstArrayElement &&
-                        old_write.count == write.descriptorCount &&
-                        old_write.type == write.descriptorType && old_write.is_buffer == is_buffer;
-            for (u32 info_index = 0; unchanged && info_index < write.descriptorCount;
-                 ++info_index) {
-                if (is_buffer) {
-                    const auto& lhs = cached.buffer_infos[old_write.first_info + info_index];
-                    const auto& rhs = write.pBufferInfo[info_index];
-                    unchanged = lhs.buffer == rhs.buffer && lhs.offset == rhs.offset &&
-                                lhs.range == rhs.range;
-                } else {
-                    const auto& lhs = cached.image_infos[old_write.first_info + info_index];
-                    const auto& rhs = write.pImageInfo[info_index];
-                    unchanged = lhs.sampler == rhs.sampler && lhs.imageView == rhs.imageView &&
-                                lhs.imageLayout == rhs.imageLayout;
-                }
+            const u64 metadata_difference =
+                (old_write.key0 ^ DescriptorWriteKey0(write)) |
+                (old_write.key1 ^ DescriptorWriteKey1(write)) |
+                static_cast<u64>(old_write.is_buffer != is_buffer);
+            unchanged = metadata_difference == 0;
+            if (unchanged && is_buffer) {
+                const auto* lhs = cached.buffer_infos.data() + old_write.first_info;
+                unchanged = DescriptorInfosEqual(lhs, write.pBufferInfo, write.descriptorCount);
+            } else if (unchanged) {
+                const auto* lhs = cached.image_infos.data() + old_write.first_info;
+                unchanged = DescriptorInfosEqual(lhs, write.pImageInfo, write.descriptorCount);
             }
             ++cached_write_index;
         } else if (is_cacheable) {
@@ -1047,15 +1159,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     const u32 stage_index = static_cast<u32>(stage.l_stage);
-    ASSERT(stage_index < MaxShaderStages);
+    if (stage_index >= MaxShaderStages) [[unlikely]] {
+        ValidateTextureBindingIndex(stage_index, MaxShaderStages);
+    }
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
         const auto tsharp = GetResolvedImage(stage, image_index);
+#ifdef _DEBUG
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
+#endif
 
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
@@ -1093,7 +1209,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (u32 i = 0; i < num_bindings; ++i) {
             const u32 cache_index = image_bindings.size();
-            ASSERT(cache_index < Shader::NUM_IMAGES);
+            if (cache_index >= Shader::NUM_IMAGES) [[unlikely]] {
+                ValidateTextureBindingIndex(cache_index, Shader::NUM_IMAGES);
+            }
 
             auto& cached = cached_image_bindings[stage_index][cache_index];
             if (cached.owner != &stage) {
@@ -1119,7 +1237,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 auto& [image_id, desc] = image_bindings.emplace_back(
                     std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
                 if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                    ASSERT(num_bindings == 1);
+                    if (num_bindings != 1) [[unlikely]] {
+                        ValidateSingleImageBinding(num_bindings);
+                    }
                     desc.view_info.range.base.level += image_desc.constant_mip_index;
                     desc.view_info.range.extent.levels = 1;
                 } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
@@ -1323,8 +1443,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
 
         if (image->binding.is_bound) {
-            ASSERT_MSG(!image->binding.force_general,
-                       "Having image both as storage and render target is unsupported");
+            if (image->binding.force_general) [[unlikely]] {
+                ValidateFeedbackLoopBinding(image->binding.force_general);
+            }
             image->Transit(instance.IsAttachmentFeedbackLoopLayoutSupported()
                                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
                                : vk::ImageLayout::eGeneral,
@@ -1393,7 +1514,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile_address, slice, false);
-        ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
+        if (desc.view_info.range.extent.levels != 1 || image.binding.needs_rebind) [[unlikely]] {
+            ValidateDepthTargetView(desc.view_info.range.extent.levels,
+                                    image.binding.needs_rebind);
+        }
 
         const bool has_stencil = image.info.props.has_stencil;
         // Stencil writes can be enabled while depth writes are off.
@@ -1666,21 +1790,10 @@ void Rasterizer::UpdateViewportScissorState() const {
     }
 
     auto& dynamic_state = scheduler.GetDynamicState();
-    u32 first = AmdGpu::NUM_VIEWPORTS;
-#pragma clang loop unroll(disable)
-    for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; ++i) {
-        const u32 xscale = std::bit_cast<u32>(regs.viewports[i].xscale);
-        if ((xscale << 1) == 0) {
-            continue;
-        }
-        if (first != AmdGpu::NUM_VIEWPORTS) [[unlikely]] {
-            SetMultipleViewportScissorState(instance, regs, scsr, dynamic_state);
-            return;
-        }
-        first = i;
-    }
+    const u32 active_viewports = ActiveViewportMask(regs);
+    const u32 first = std::countr_zero(active_viewports);
 
-    if (first == AmdGpu::NUM_VIEWPORTS) {
+    if (active_viewports == 0) {
         constexpr vk::Viewport empty_viewport{
             .x = -1.0f,
             .y = -1.0f,
@@ -1694,6 +1807,11 @@ void Rasterizer::UpdateViewportScissorState() const {
             .extent = {1, 1},
         };
         dynamic_state.SetSingleViewportScissor(empty_viewport, empty_scissor);
+        return;
+    }
+
+    if (!std::has_single_bit(active_viewports)) [[unlikely]] {
+        SetMultipleViewportScissorState(instance, regs, scsr, dynamic_state);
         return;
     }
 

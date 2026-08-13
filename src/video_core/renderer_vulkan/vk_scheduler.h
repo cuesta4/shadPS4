@@ -51,7 +51,18 @@ struct RenderState {
     u16 num_color_attachments;
 
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
+        if (std::memcmp(&width, &other.width, sizeof(width) * 4) != 0 ||
+            std::memcmp(&depth_stencil_attachment, &other.depth_stencil_attachment,
+                        sizeof(RenderAttachment)) != 0) {
+            return false;
+        }
+        for (u32 index = 0; index < num_color_attachments; ++index) {
+            if (std::memcmp(&color_attachments[index], &other.color_attachments[index],
+                            sizeof(RenderAttachment)) != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
@@ -90,8 +101,12 @@ struct StencilOps {
     vk::CompareOp compare_op{};
 
     bool operator==(const StencilOps& other) const {
-        return fail_op == other.fail_op && pass_op == other.pass_op &&
-               depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
+        const u32 different =
+            (static_cast<u32>(fail_op) ^ static_cast<u32>(other.fail_op)) |
+            (static_cast<u32>(pass_op) ^ static_cast<u32>(other.pass_op)) |
+            (static_cast<u32>(depth_fail_op) ^ static_cast<u32>(other.depth_fail_op)) |
+            (static_cast<u32>(compare_op) ^ static_cast<u32>(other.compare_op));
+        return different == 0;
     }
 };
 struct DynamicState {
@@ -194,12 +209,20 @@ struct DynamicState {
     }
 
     void SetSingleViewportScissor(const vk::Viewport& viewport, const vk::Rect2D& scissor) {
-        if (viewports.size() != 1 || viewports.front() != viewport) {
+        const bool viewport_different =
+            viewports.size() != 1 ||
+            ((viewports.front().x != viewport.x) | (viewports.front().y != viewport.y) |
+             (viewports.front().width != viewport.width) |
+             (viewports.front().height != viewport.height) |
+             (viewports.front().minDepth != viewport.minDepth) |
+             (viewports.front().maxDepth != viewport.maxDepth));
+        if (viewport_different) {
             viewports.clear();
             viewports.push_back(viewport);
             dirty_state.viewports = true;
         }
-        if (scissors.size() != 1 || scissors.front() != scissor) {
+        if (scissors.size() != 1 ||
+            std::memcmp(&scissors.front(), &scissor, sizeof(scissor)) != 0) {
             scissors.clear();
             scissors.push_back(scissor);
             dirty_state.scissors = true;
@@ -250,8 +273,8 @@ struct DynamicState {
     }
 
     void SetDepthBias(const float constant, const float clamp, const float slope) {
-        if (depth_bias_constant != constant || depth_bias_clamp != clamp ||
-            depth_bias_slope != slope) {
+        if ((depth_bias_constant != constant) | (depth_bias_clamp != clamp) |
+            (depth_bias_slope != slope)) {
             depth_bias_constant = constant;
             depth_bias_clamp = clamp;
             depth_bias_slope = slope;
@@ -332,7 +355,10 @@ struct DynamicState {
     }
 
     void SetBlendConstants(const std::array<float, 4> blend_constants_) {
-        if (blend_constants != blend_constants_) {
+        if ((blend_constants[0] != blend_constants_[0]) |
+            (blend_constants[1] != blend_constants_[1]) |
+            (blend_constants[2] != blend_constants_[2]) |
+            (blend_constants[3] != blend_constants_[3])) {
             blend_constants = blend_constants_;
             dirty_state.blend_constants = true;
         }
@@ -346,7 +372,8 @@ struct DynamicState {
     }
 
     void SetColorWriteMasks(const ColorWriteMasks& color_write_masks_) {
-        if (!std::ranges::equal(color_write_masks, color_write_masks_)) {
+        if (std::memcmp(color_write_masks.data(), color_write_masks_.data(),
+                        sizeof(color_write_masks)) != 0) {
             color_write_masks = color_write_masks_;
             dirty_state.color_write_masks = true;
         }
