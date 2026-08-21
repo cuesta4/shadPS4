@@ -1462,9 +1462,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
     for (u32 i = 0; i < stage.buffers.size(); ++i) {
         const auto& desc = stage.buffers[i];
         const auto vsharp = GetResolvedBuffer(stage, i);
-        const bool is_storage = desc.IsStorage(vsharp);
-        const u64 alignment =
-            is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
+        const u64 alignment = instance.StorageMinAlignment();
 
         auto& pending = pending_buffer_bindings.emplace_back(PendingBufferBinding{
             .desc = &desc,
@@ -1473,7 +1471,6 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
             .unified_binding = binding.unified++,
             .buffer_binding = binding.buffer++,
             .set_write_index = set_write_index++,
-            .is_storage = is_storage,
         });
 
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
@@ -1650,8 +1647,7 @@ void Rasterizer::FinalizeBuffers(Shader::PushData& push_data, bool stream_only) 
         set_write.dstBinding = pending.unified_binding;
         set_write.dstArrayElement = 0;
         set_write.descriptorCount = 1;
-        set_write.descriptorType = pending.is_storage ? vk::DescriptorType::eStorageBuffer
-                                                      : vk::DescriptorType::eUniformBuffer;
+        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         pending.finalized = true;
     }

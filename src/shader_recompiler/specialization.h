@@ -46,7 +46,6 @@ static_assert(std::is_trivially_copyable_v<VsAttribSpecialization>);
 
 struct BufferSpecialization {
     u32 stride : 14;
-    u32 is_storage : 1;
     u32 is_formatted : 1;
     u32 swizzle_enable : 1;
     u32 data_format : 6;
@@ -62,9 +61,9 @@ struct BufferSpecialization {
         u32 rhs_bits;
         std::memcpy(&lhs_bits, this, sizeof(lhs_bits));
         std::memcpy(&rhs_bits, &other, sizeof(rhs_bits));
-        constexpr u32 BaseMask = (1U << 17) - 1;
-        constexpr u32 FormattedMask = ((1U << 10) - 1) << 17;
-        constexpr u32 SwizzleMask = ((1U << 4) - 1) << 27;
+        constexpr u32 BaseMask = (1U << 16) - 1;
+        constexpr u32 FormattedMask = ((1U << 10) - 1) << 16;
+        constexpr u32 SwizzleMask = ((1U << 4) - 1) << 26;
         const u32 delta = lhs_bits ^ rhs_bits;
         if ((delta & BaseMask) != 0) {
             return false;
@@ -261,7 +260,6 @@ struct SamplerSpecialization {
     const BufferResource& desc, AmdGpu::Buffer sharp) noexcept {
     BufferSpecialization spec{};
     spec.stride = sharp.GetStride();
-    spec.is_storage = desc.IsStorage(sharp);
     spec.is_formatted = desc.is_formatted;
     spec.swizzle_enable = sharp.swizzle_enable;
     if (spec.is_formatted) {

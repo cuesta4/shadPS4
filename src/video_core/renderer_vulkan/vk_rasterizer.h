@@ -193,7 +193,6 @@ private:
         u32 set_write_index{};
         u16 stream_index{std::numeric_limits<u16>::max()};
         VideoCore::BufferCache::StreamCopySource stream_source{};
-        bool is_storage{};
         bool finalized{};
     };
     boost::container::static_vector<PendingBufferBinding, Shader::NUM_BUFFERS>

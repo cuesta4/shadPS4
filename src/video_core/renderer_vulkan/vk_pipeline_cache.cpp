@@ -408,9 +408,8 @@ void AddVsAttribFingerprint(SpecializationFingerprintBuilder& builder,
 
 void AddBufferFingerprint(SpecializationFingerprintBuilder& builder,
                           const Shader::BufferSpecialization& spec) noexcept {
-    builder.Add(spec.stride | (static_cast<u64>(spec.is_storage) << 14) |
-                (static_cast<u64>(spec.is_formatted) << 15) |
-                (static_cast<u64>(spec.swizzle_enable) << 16));
+    builder.Add(spec.stride | (static_cast<u64>(spec.is_formatted) << 14) |
+                (static_cast<u64>(spec.swizzle_enable) << 15));
     if (spec.is_formatted) {
         builder.Add(spec.data_format | (static_cast<u64>(spec.num_format) << 8) |
                     (static_cast<u64>(spec.num_conversion) << 16));
