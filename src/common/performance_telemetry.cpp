@@ -966,6 +966,7 @@ constexpr std::array CounterNames{
     "fastpath_wait_progress_submits",
     "virtual_fence_forced_completions",
     "virtual_wait_fallback",
+    "virtual_fence_retired",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 

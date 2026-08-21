@@ -117,9 +117,37 @@ void GpuAuthorityTracker::RegisterVirtualFence(const VirtualGpuFence& fence) {
         return;
     }
     std::scoped_lock lock{tracker_mutex};
+    if (const auto it = active_virtual_fences.find(fence.label_addr);
+        it != active_virtual_fences.end()) {
+        RetireVirtualFenceLocked(it->second);
+    }
     auto fence_ptr = std::make_shared<VirtualGpuFence>(fence);
     active_virtual_fences[fence.label_addr] = fence_ptr;
     virtual_fences_by_seq[fence.virtual_fence_seq] = fence_ptr;
+}
+
+void GpuAuthorityTracker::RetireVirtualFenceLocked(
+    const std::shared_ptr<VirtualGpuFence>& fence) {
+    if (!fence->gpu_complete) {
+        return;
+    }
+    const auto generation = label_generations.find(fence->label_addr);
+    const bool stale_generation =
+        generation == label_generations.end() || generation->second != fence->label_generation;
+    if (!fence->wait_consumed && !stale_generation) {
+        return;
+    }
+    const auto seq_it = virtual_fences_by_seq.find(fence->virtual_fence_seq);
+    if (seq_it == virtual_fences_by_seq.end() || seq_it->second != fence) {
+        return;
+    }
+    virtual_fences_by_seq.erase(seq_it);
+    const auto active_it = active_virtual_fences.find(fence->label_addr);
+    if (active_it != active_virtual_fences.end() && active_it->second == fence) {
+        active_virtual_fences.erase(active_it);
+    }
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::VirtualFenceRetired);
 }
 
 std::vector<std::shared_ptr<GpuAuthorityEntry>> GpuAuthorityTracker::FindOverlaps(
@@ -230,12 +258,14 @@ std::shared_ptr<VirtualGpuFence> GpuAuthorityTracker::MatchVirtualWait(
     }
     fence->wait_consumed = true;
     fence->wait_packet_seq = wait_pkt;
+    RetireVirtualFenceLocked(fence);
     return fence;
 }
 
 void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_tick) {
     std::shared_ptr<VirtualGpuFence> fence;
     u64 current_gen = 0;
+    Common::PerformanceTelemetry::AsyncLabelAction action;
     {
         std::scoped_lock lock{tracker_mutex};
         const auto it = virtual_fences_by_seq.find(virtual_fence_seq);
@@ -243,15 +273,24 @@ void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_t
             return;
         }
         fence = it->second;
+        if (fence->gpu_complete) {
+            RetireVirtualFenceLocked(fence);
+            return;
+        }
         const auto gen_it = label_generations.find(fence->label_addr);
         current_gen = gen_it != label_generations.end() ? gen_it->second : 0;
+        fence->gpu_complete = true;
+        if (fence->label_generation == current_gen) {
+            *reinterpret_cast<u32*>(fence->label_addr) = fence->expected_value;
+            fence->host_label_written = true;
+            action = Common::PerformanceTelemetry::AsyncLabelAction::Wrote;
+        } else {
+            action = Common::PerformanceTelemetry::AsyncLabelAction::StaleGenerationSkipped;
+        }
     }
 
     const u64 completed_tick = rasterizer ? rasterizer->KnownGpuTick() : 0;
-    fence->gpu_complete = true;
-    if (fence->label_generation == current_gen) {
-        *reinterpret_cast<u32*>(fence->label_addr) = fence->expected_value;
-        fence->host_label_written = true;
+    if (action == Common::PerformanceTelemetry::AsyncLabelAction::Wrote) {
         if (rasterizer) {
             rasterizer->NotifyMemoryWrite(fence->label_addr, sizeof(u32),
                                           VideoCore::MemoryWriteSource::CommandProcessor);
@@ -264,7 +303,7 @@ void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_t
             .current_generation = current_gen,
             .producer_tick = fence->producer_tick,
             .current_completed_tick = completed_tick,
-            .action = Common::PerformanceTelemetry::AsyncLabelAction::Wrote,
+            .action = action,
         });
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AsyncLabelWrites);
     } else {
@@ -276,9 +315,13 @@ void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_t
             .current_generation = current_gen,
             .producer_tick = fence->producer_tick,
             .current_completed_tick = completed_tick,
-            .action = Common::PerformanceTelemetry::AsyncLabelAction::StaleGenerationSkipped,
+            .action = action,
         });
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StaleLabelCallbacks);
+    }
+    {
+        std::scoped_lock lock{tracker_mutex};
+        RetireVirtualFenceLocked(fence);
     }
 }
 
@@ -296,9 +339,10 @@ void GpuAuthorityTracker::EnsureVirtualFenceComplete(
             return;
         }
         fence = it->second;
-    }
-    if (fence->gpu_complete && fence->host_label_written) {
-        return;
+        if (fence->gpu_complete) {
+            RetireVirtualFenceLocked(fence);
+            return;
+        }
     }
     const u64 start_ts = Common::PerformanceTelemetry::Timestamp();
     u8 was_submitted = 0;
@@ -316,7 +360,6 @@ void GpuAuthorityTracker::EnsureVirtualFenceComplete(
             waited = 1;
         }
     }
-    fence->gpu_complete = true;
     SignalAsyncLabel(fence->virtual_fence_seq, fence->producer_tick);
     const u64 end_ts = Common::PerformanceTelemetry::Timestamp();
     const u64 duration = end_ts >= start_ts ? end_ts - start_ts : 0;
@@ -344,7 +387,7 @@ void GpuAuthorityTracker::EnsureAllVirtualFencesComplete(
     {
         std::scoped_lock lock{tracker_mutex};
         for (const auto& [seq, fence] : virtual_fences_by_seq) {
-            if (!fence->gpu_complete || !fence->host_label_written) {
+            if (!fence->gpu_complete) {
                 pending_seqs.push_back(seq);
             }
         }

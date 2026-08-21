@@ -714,6 +714,7 @@ enum class Counter : u16 {
     FastpathWaitProgressSubmits,
     VirtualFenceForcedCompletions,
     VirtualWaitFallback,
+    VirtualFenceRetired,
     Count,
 };
 

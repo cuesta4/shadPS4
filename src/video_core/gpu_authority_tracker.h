@@ -166,6 +166,7 @@ public:
                                     u64 subresource_range);
 
 private:
+    void RetireVirtualFenceLocked(const std::shared_ptr<VirtualGpuFence>& fence);
     void RefreshAuthorityReadWatches(VAddr addr, size_t size);
 
     mutable std::recursive_mutex tracker_mutex;
