@@ -8,6 +8,7 @@
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/performance_telemetry.h"
 #include "common/singleton.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -214,6 +215,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
         // Run the game's entry function
         params.entry_addr = module->GetEntryAddress();
+        Common::PerformanceTelemetry::ScopedGuestExecutionThread guest_thread_scope{};
         RunMainEntry(&params);
     });
 }

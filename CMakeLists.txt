@@ -1095,6 +1095,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/gpu_authority_tracker.cpp
+               src/video_core/gpu_authority_tracker.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
                src/video_core/renderer_vulkan/vk_common.cpp
@@ -1266,8 +1268,8 @@ target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAlloca
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
 target_link_libraries(shadps4 PRIVATE libprotobuf)
-target_link_libraries(shadps4 PRIVATE ZArchive::zarchive)
-target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}")
+target_link_libraries(shadps4 PRIVATE ZArchive::zarchive libzstd_static)
+target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}" "${CMAKE_CURRENT_SOURCE_DIR}/externals/zstd/lib")
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     target_link_libraries(shadps4 PRIVATE "/usr/lib/libusb.so")
@@ -1280,6 +1282,7 @@ target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config
 
 if (ENABLE_DETAILED_TELEMETRY)
     target_compile_definitions(shadps4 PRIVATE SHADPS4_ENABLE_DETAILED_TELEMETRY)
+    set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "shadps4-instrumentado")
 endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 

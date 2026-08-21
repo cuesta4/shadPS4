@@ -3,17 +3,19 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <queue>
 #include <semaphore>
 #include <span>
 #include <thread>
 #include <vector>
-#include <queue>
 
 #include "common/assert.h"
+#include "common/performance_telemetry.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -123,6 +125,10 @@ public:
         }
     }
 
+    [[nodiscard]] bool IsGpuThread() const noexcept {
+        return std::this_thread::get_id() == gpu_id;
+    }
+
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
@@ -207,6 +213,13 @@ private:
     void ProcessEventWriteEop(const PM4CmdEventWriteEop& packet);
     void ProcessEventWriteEos(const PM4CmdEventWriteEos& packet);
 
+    bool TrackDeferredGpuCompletion(u32 queue_id, VAddr address = 0, u64 value = 0,
+                                    u32 num_bytes = 0);
+    bool TryBypassGpuCompletionWait(u32 queue_id, VAddr address, u32 function, u32 mask,
+                                    u32 reference);
+    void FlushPendingGpuCompletionsForWait();
+    void RefreshPendingGpuCompletions();
+
     bool ArmMemoryWait(u32 queue_id, VAddr address);
     void CancelMemoryWait(u32 queue_id);
     void WakeMemoryWait(u32 queue_id) noexcept;
@@ -235,6 +248,29 @@ private:
     std::array<MemoryWaitContext, NumTotalQueues> memory_waits{};
     std::atomic<u64> ready_queue_mask{};
     std::atomic<u64> blocked_queue_mask{};
+
+    struct PendingGpuFenceWord {
+        VAddr address{};
+        u32 value{};
+        u8 queue_id{};
+        bool barriered{};
+    };
+    static_assert(sizeof(PendingGpuFenceWord) == 16);
+    static constexpr u32 MaxPendingGpuFenceWords = 64;
+    std::array<PendingGpuFenceWord, MaxPendingGpuFenceWords> pending_gpu_fence_words{};
+    u64 pending_gpu_completion_tick{};
+    u32 pending_gpu_completion_count{};
+    u32 pending_gpu_fence_word_count{};
+
+    struct SyncPacketState {
+        Common::PerformanceTelemetry::FenceSeq fence_seq{};
+        Common::PerformanceTelemetry::FenceGen generation{};
+        Common::PerformanceTelemetry::PacketSeq packet_seq{};
+        VAddr label_addr{};
+        u64 label_value{};
+    };
+    SyncPacketState last_sync_packet{};
+    Common::PerformanceTelemetry::WaitSeq last_wait_seq{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};

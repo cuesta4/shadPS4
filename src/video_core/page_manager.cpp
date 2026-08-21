@@ -16,6 +16,7 @@
 #include "common/signal_context.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "video_core/gpu_authority_tracker.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -53,18 +54,14 @@ struct PageManager::Impl {
         // And buffers cannot overlap, thus only 1 can exist per page.
         u8 num_read_watchers : 1;
 
-        Core::MemoryPermission WritePerm() const noexcept {
-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
-                                           : Core::MemoryPermission::None;
-        }
-
-        Core::MemoryPermission ReadPerm() const noexcept {
-            return num_read_watchers == 0 ? Core::MemoryPermission::Read
-                                          : Core::MemoryPermission::None;
-        }
-
         Core::MemoryPermission Perms() const noexcept {
-            return ReadPerm() | WritePerm();
+            if (num_read_watchers > 0) {
+                return Core::MemoryPermission::None;
+            }
+            if (num_write_watchers > 0) {
+                return Core::MemoryPermission::Read;
+            }
+            return Core::MemoryPermission::ReadWrite;
         }
 
         template <s32 delta, bool is_read>
@@ -105,6 +102,39 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
+
+    template <s32 delta, bool is_read>
+    u8 ApplyPageDelta(size_t page_index, PageState& state) {
+        if constexpr (is_read) {
+            std::scoped_lock lock{read_watch_mutex};
+            if constexpr (delta == 1) {
+                auto& ref = read_watch_refcounts[page_index];
+                ++ref;
+                if (ref == 1) {
+                    state.num_read_watchers = 1;
+                    return 1;
+                }
+                return static_cast<u8>(std::min<u16>(ref, 255));
+            } else if constexpr (delta == -1) {
+                auto it = read_watch_refcounts.find(page_index);
+                if (it != read_watch_refcounts.end()) {
+                    if (it.value() > 1) {
+                        --it.value();
+                        return static_cast<u8>(std::min<u16>(it.value(), 255));
+                    }
+                    read_watch_refcounts.erase(it);
+                }
+                state.num_read_watchers = 0;
+                return 0;
+            } else {
+                auto it = read_watch_refcounts.find(page_index);
+                return it != read_watch_refcounts.end() ? static_cast<u8>(std::min<u16>(it.value(), 255)) : 0;
+            }
+        } else {
+            return state.AddDelta<delta, false>();
+        }
+    }
+
 #ifdef ENABLE_USERFAULTFD
     Impl(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
@@ -212,7 +242,7 @@ struct PageManager::Impl {
     }
 
     void OnUnmap(VAddr address, size_t size) {
-        // No-op
+        VideoCore::GpuAuthorityTracker::Instance().HandleUnmap(address, size);
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
@@ -227,9 +257,47 @@ struct PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
+            VideoCore::GpuAuthorityTracker::Instance().HandleCpuWrite(addr, 8);
+            const bool handled_write = rasterizer->InvalidateMemory(addr, 8);
+            // After handling write-watchers, check if the page still has
+            // semantic read-watchers. If so, disarm them to prevent a
+            // livelock where the page stays at PAGE_NOACCESS because
+            // num_read_watchers > 0 even though no write-watchers exist.
+            const bool handled_read_watch = rasterizer->HandleWriteFaultOnReadWatchedPage(addr, 8, context);
+            if (!handled_write && !handled_read_watch) {
+                // Watchdog: if neither handler resolved the fault, force-unprotect the page
+                // to prevent infinite re-execution of the faulting instruction.
+                static thread_local VAddr last_fault_page{};
+                static thread_local u32 fault_repeat_count{};
+                const VAddr fault_page = addr & ~0xFFFULL;
+                if (fault_page == last_fault_page) {
+                    ++fault_repeat_count;
+                    if (fault_repeat_count >= 16) {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                        Common::PerformanceTelemetry::Add(
+                            Common::PerformanceTelemetry::Counter::SemanticFaultLivelockBreaks);
+#endif
+                        auto* memory = Core::Memory::Instance();
+                        if (memory) {
+                            memory->GetAddressSpace().Protect(
+                                fault_page, 4096, Core::MemoryPermission::ReadWrite);
+                        }
+                        fault_repeat_count = 0;
+                        last_fault_page = 0;
+                        return true;
+                    }
+                } else {
+                    last_fault_page = fault_page;
+                    fault_repeat_count = 1;
+                }
+                return false;
+            }
+            return true;
         } else {
-            return rasterizer->ReadMemory(addr, 8);
+            if (VideoCore::GpuAuthorityTracker::Instance().HandleCpuRead(addr, 8)) {
+                return true;
+            }
+            return rasterizer->ReadMemory(addr, 8, context);
         }
         return false;
     }
@@ -275,7 +343,7 @@ struct PageManager::Impl {
             PageState& state = cached_pages[page];
 
             // Apply the change to the page state
-            const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
+            const u8 new_count = ApplyPageDelta<track ? 1 : -1, is_read>(page, state);
 
             if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -340,7 +408,8 @@ struct PageManager::Impl {
 
             // Apply the change to the page state
             const u8 new_count =
-                update ? state.AddDelta<track ? 1 : -1, is_read>() : state.AddDelta<0, is_read>();
+                update ? ApplyPageDelta<track ? 1 : -1, is_read>(base_page + page, state)
+                       : ApplyPageDelta<0, is_read>(base_page + page, state);
 
             if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -363,7 +432,7 @@ struct PageManager::Impl {
                     range_begin = base_page + page;
                     potential_range_bytes = PM_PAGE_SIZE;
                 }
-                // Extend current rango up to potential range
+                // Extend current range up to potential range
                 range_bytes = potential_range_bytes;
             }
         }
@@ -463,23 +532,30 @@ struct PageManager::Impl {
         return true;
     }
 
-    void NotifyWrite(VAddr address, u64 size, MemoryWriteSource source) {
+    MemoryWriteNotifyResult NotifyWrite(VAddr address, u64 size, MemoryWriteSource source) {
         if (size == 0 || size - 1 > std::numeric_limits<VAddr>::max() - address) [[unlikely]] {
-            return;
+            return {};
         }
 
         const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
-        if (!telemetry_enabled &&
-            active_write_watches.load(std::memory_order_acquire) == 0) [[likely]] {
-            return;
+        const bool had_active_watches =
+            active_write_watches.load(std::memory_order_acquire) != 0;
+        if (!telemetry_enabled && !had_active_watches) [[likely]] {
+            return {};
         }
-        NotifyWriteSlow(address, size, source);
+        return NotifyWriteSlow(address, size, source);
     }
 
-    SHAD_NO_INLINE void NotifyWriteSlow(VAddr address, u64 size, MemoryWriteSource source) {
+    SHAD_NO_INLINE MemoryWriteNotifyResult NotifyWriteSlow(VAddr address, u64 size,
+                                                           MemoryWriteSource source) {
         const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
-        Common::PerformanceTelemetry::ScopedDuration duration{
-            telemetry_enabled, Common::PerformanceTelemetry::Counter::MemoryNotifyNs};
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::MemoryNotify>
+            duration{telemetry_enabled};
+        // Preserve the original post-dispatch watch check. Watches can be armed or cancelled
+        // between the fast-path snapshot and this slow-path entry.
+        const bool had_active_watches =
+            active_write_watches.load(std::memory_order_acquire) != 0;
         const VAddr first_page = PageManager::GetPageAddr(address);
         const VAddr last_page = PageManager::GetPageAddr(address + size - 1);
         const u64 page_count = ((last_page - first_page) >> PM_PAGE_BITS) + 1;
@@ -489,10 +565,40 @@ struct PageManager::Impl {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::MemoryNotifyPages, page_count);
             Common::PerformanceTelemetry::AddEnabled(NotifyCounter(source), 1);
+            Common::PerformanceTelemetry::AddEnabled(
+                had_active_watches
+                    ? Common::PerformanceTelemetry::Counter::MemoryNotifyActiveWatchCalls
+                    : Common::PerformanceTelemetry::Counter::MemoryNotifyNoWatchCalls,
+                1);
+            Common::PerformanceTelemetry::GuestMemoryWriteOrigin origin = Common::PerformanceTelemetry::GuestMemoryWriteOrigin::GuestCpu;
+            switch (source) {
+            case MemoryWriteSource::Cpu:
+                origin = Common::PerformanceTelemetry::GuestMemoryWriteOrigin::GuestCpu;
+                break;
+            case MemoryWriteSource::CommandProcessor:
+                origin = Common::PerformanceTelemetry::GuestMemoryWriteOrigin::Pm4WriteData;
+                break;
+            case MemoryWriteSource::GpuCompletion:
+                origin = Common::PerformanceTelemetry::GuestMemoryWriteOrigin::FenceSignal;
+                break;
+            default:
+                origin = Common::PerformanceTelemetry::GuestMemoryWriteOrigin::EmulatorInternal;
+                break;
+            }
+            const auto access_seq = Common::PerformanceTelemetry::NextCpuAccessSeq();
+            Common::PerformanceTelemetry::RecordCpuMemoryAccess(Common::PerformanceTelemetry::CpuAccessSample{
+                .cpu_access_seq = access_seq,
+                .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                .thread_id = 0,
+                .access_type = Common::PerformanceTelemetry::CpuAccessType::Write,
+                .write_origin = origin,
+                .guest_addr = address,
+                .size = size,
+            });
         }
 
-        if (active_write_watches.load(std::memory_order_acquire) == 0) [[likely]] {
-            return;
+        if (!had_active_watches) [[likely]] {
+            return {};
         }
         const u64 epoch = memory_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
 
@@ -540,6 +646,11 @@ struct PageManager::Impl {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::MemoryWatchWakeups, callback_count);
         }
+        return {
+            .matched_pages = static_cast<u32>(pages.size()),
+            .callbacks = static_cast<u32>(callback_count),
+            .had_active_watches = true,
+        };
     }
 
     [[nodiscard]] static Common::PerformanceTelemetry::Counter NotifyCounter(
@@ -560,6 +671,22 @@ struct PageManager::Impl {
         UNREACHABLE();
     }
 
+    bool HasReadWatcher(VAddr address) const {
+        const size_t page = address >> PM_PAGE_BITS;
+        if (page >= cached_pages.size()) return false;
+        return cached_pages[page].num_read_watchers > 0;
+    }
+
+    void TemporarilyUnprotect(VAddr address, u64 size) {
+        const size_t page = address >> PM_PAGE_BITS;
+        const VAddr page_addr = page << PM_PAGE_BITS;
+        Core::MemoryPermission perms = Core::MemoryPermission::ReadWrite;
+        if (page < cached_pages.size() && cached_pages[page].num_write_watchers > 0) {
+            perms = Core::MemoryPermission::Read;
+        }
+        Protect(page_addr, 4096, perms);
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -569,6 +696,8 @@ struct PageManager::Impl {
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
     std::mutex mapping_mutex;
     boost::icl::interval_set<VAddr> gpu_mappings;
+    std::mutex read_watch_mutex;
+    tsl::robin_map<size_t, u16> read_watch_refcounts;
     std::mutex write_watch_mutex;
     tsl::robin_map<VAddr, WatchedPage> watched_pages;
     std::atomic<u64> active_write_watches{};
@@ -598,13 +727,22 @@ bool PageManager::CancelWriteWatch(MemoryWriteWatch watch) {
     return impl->CancelWriteWatch(watch);
 }
 
-void PageManager::NotifyWrite(VAddr address, u64 size, MemoryWriteSource source) {
-    impl->NotifyWrite(address, size, source);
+MemoryWriteNotifyResult PageManager::NotifyWrite(VAddr address, u64 size,
+                                                 MemoryWriteSource source) {
+    return impl->NotifyWrite(address, size, source);
 }
 
-template <bool track>
+template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
-    impl->UpdatePageWatchers<track, false>(addr, size);
+    impl->UpdatePageWatchers<track, is_read>(addr, size);
+}
+
+bool PageManager::HasReadWatcher(VAddr address) const {
+    return impl->HasReadWatcher(address);
+}
+
+void PageManager::TemporarilyUnprotect(VAddr address, u64 size) const {
+    impl->TemporarilyUnprotect(address, size);
 }
 
 template <bool track, bool is_read>
@@ -612,8 +750,10 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask)
     impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
 
-template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
-template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, false>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
                                                                    RegionBits& mask) const;
 template void PageManager::UpdatePageWatchersForRegion<true, false>(VAddr base_addr,

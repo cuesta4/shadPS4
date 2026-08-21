@@ -5,11 +5,13 @@
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
+#include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -89,6 +91,13 @@ struct ImageReadbackToken {
     u64 image_uid;
 };
 
+struct ImageTelemetryWritebackState {
+    u64 content_epoch{};
+    u64 previous_epoch{};
+    u64 previous_backing{};
+    Common::PerformanceTelemetry::ImageWriter writer{};
+};
+
 struct Image {
     Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
           Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
@@ -141,15 +150,52 @@ struct Image {
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);
 
-    void CopyImage(Image& src_image);
-    void CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset);
-    void CopyMip(Image& src_image, u32 mip, u32 slice);
+    void CopyImage(Image& src_image,
+                   Common::PerformanceTelemetry::ImageWriter writer =
+                       Common::PerformanceTelemetry::ImageWriter::Transfer);
+    void CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset,
+                             Common::PerformanceTelemetry::ImageWriter writer =
+                                 Common::PerformanceTelemetry::ImageWriter::Transfer);
+    void CopyMip(Image& src_image, u32 mip, u32 slice,
+                 Common::PerformanceTelemetry::ImageWriter writer =
+                     Common::PerformanceTelemetry::ImageWriter::Transfer);
 
     void Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
-                 const VideoCore::SubresourceRange& mrt1_range);
-    void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range);
+                 const VideoCore::SubresourceRange& mrt1_range,
+                 Common::PerformanceTelemetry::ImageWriter writer =
+                     Common::PerformanceTelemetry::ImageWriter::Transfer);
+    void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range,
+               Common::PerformanceTelemetry::ImageWriter writer =
+                   Common::PerformanceTelemetry::ImageWriter::Transfer);
 
     void SetBackingSamples(u32 num_samples, bool copy_backing = true);
+
+    void MarkWrite(Common::PerformanceTelemetry::ImageWriter writer) noexcept {
+        ++content_epoch;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        telemetry_last_writer = writer;
+#else
+        static_cast<void>(writer);
+#endif
+    }
+
+    [[nodiscard]] ImageTelemetryWritebackState TelemetryWritebackState() const noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        return {content_epoch, telemetry_last_scheduled_epoch,
+                telemetry_last_scheduled_backing, telemetry_last_writer};
+#else
+        return {};
+#endif
+    }
+
+    void TelemetryMarkScheduled(u64 backing_image) noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        telemetry_last_scheduled_epoch = content_epoch;
+        telemetry_last_scheduled_backing = backing_image;
+#else
+        static_cast<void>(backing_image);
+#endif
+    }
 
 public:
     const Vulkan::Instance* instance;
@@ -190,6 +236,12 @@ public:
     u64 lru_tick{};
     u64 tick_accessed_last{};
     u64 hash{};
+    u64 content_epoch{};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    u64 telemetry_last_scheduled_epoch{};
+    u64 telemetry_last_scheduled_backing{};
+    Common::PerformanceTelemetry::ImageWriter telemetry_last_writer{};
+#endif
 
     struct {
         u32 texture : 1;

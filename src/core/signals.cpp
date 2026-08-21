@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -8,6 +9,7 @@
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -112,6 +114,10 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         break;
     case EXCEPTION_BREAKPOINT:
     case EXCEPTION_SINGLE_STEP:
+        if (code == EXCEPTION_SINGLE_STEP &&
+            const_cast<SignalDispatch*>(signals)->HandleSingleStepException(pExp)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         guest_info._si_signo = POSIX_SIGTRAP;
         guest_info._si_code = POSIX_TRAP_BRKPT;
         break;
@@ -280,12 +286,17 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         }
         break;
     }
-    case SIGILL:
-        if (signals->DispatchIllegalInstruction(raw_context)) {
+    case SIGTRAP:
+        if (const_cast<SignalDispatch*>(signals)->HandleSingleStepException(raw_context)) {
             return;
         }
+        [[fallthrough]];
+    case SIGILL:
+        if (sig == SIGILL && signals->DispatchIllegalInstruction(raw_context)) {
+            return;
+        }
+        [[fallthrough]];
     case SIGFPE:
-    case SIGTRAP:
     case SIGSYS: {
         if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
             return;
@@ -377,6 +388,47 @@ bool SignalDispatch::DispatchIllegalInstruction(void* context) const {
         }
     }
     return false;
+}
+
+static thread_local boost::container::small_vector<std::pair<VAddr, u64>, 4> t_single_step_rearm_pages;
+
+void SignalDispatch::RequestSingleStepRearm(void* context, VAddr page_addr, u64 size) {
+#if defined(_WIN32)
+    auto* exp = static_cast<EXCEPTION_POINTERS*>(context);
+    if (!exp || !exp->ContextRecord) return;
+    t_single_step_rearm_pages.push_back({page_addr, size});
+    exp->ContextRecord->EFlags |= 0x100;
+#elif defined(ARCH_X86_64) && !defined(__APPLE__) && !defined(__FreeBSD__)
+    auto* uctx = static_cast<ucontext_t*>(context);
+    if (!uctx) return;
+    t_single_step_rearm_pages.push_back({page_addr, size});
+    uctx->uc_mcontext.gregs[REG_EFL] |= 0x100;
+#endif
+}
+
+bool SignalDispatch::HandleSingleStepException(void* context) {
+    if (t_single_step_rearm_pages.empty()) {
+        return false;
+    }
+#if defined(_WIN32)
+    auto* exp = static_cast<EXCEPTION_POINTERS*>(context);
+    if (exp && exp->ContextRecord) {
+        exp->ContextRecord->EFlags &= ~0x100;
+    }
+#elif defined(ARCH_X86_64) && !defined(__APPLE__) && !defined(__FreeBSD__)
+    auto* uctx = static_cast<ucontext_t*>(context);
+    if (uctx) {
+        uctx->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+    }
+#endif
+    auto* memory = Memory::Instance();
+    if (memory) {
+        for (const auto& [page_addr, size] : t_single_step_rearm_pages) {
+            memory->GetAddressSpace().Protect(page_addr, size, MemoryPermission::None);
+        }
+    }
+    t_single_step_rearm_pages.clear();
+    return true;
 }
 
 } // namespace Core

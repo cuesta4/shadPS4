@@ -11,9 +11,11 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/performance_telemetry.h"
+#include "common/signal_context.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/signals.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -21,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/gpu_authority_tracker.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -265,9 +268,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(this);
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(nullptr);
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
@@ -280,6 +286,198 @@ void Rasterizer::CpSync() {
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
                            vk::PipelineStageFlagBits::eDrawIndirect,
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
+}
+
+void Rasterizer::AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size) {
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AcquireMemCalls);
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::Pm4AcquireMem, static_cast<u64>(cp_coher_cntl),
+        base_address);
+
+    vk::PipelineStageFlags2 src_stages = vk::PipelineStageFlagBits2::eNone;
+    vk::AccessFlags2 src_access = vk::AccessFlagBits2::eNone;
+    vk::PipelineStageFlags2 dst_stages = vk::PipelineStageFlagBits2::eNone;
+    vk::AccessFlags2 dst_access = vk::AccessFlagBits2::eNone;
+
+    if (cp_coher_cntl & (1u << 8)) {
+        src_stages |= vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+        src_access |= vk::AccessFlagBits2::eColorAttachmentWrite;
+    }
+    if (cp_coher_cntl & (1u << 9)) {
+        src_stages |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                      vk::PipelineStageFlagBits2::eLateFragmentTests;
+        src_access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    }
+    if (cp_coher_cntl & ((1u << 14) | (1u << 15))) {
+        src_stages |= vk::PipelineStageFlagBits2::eComputeShader |
+                      vk::PipelineStageFlagBits2::eAllGraphics |
+                      vk::PipelineStageFlagBits2::eTransfer;
+        src_access |= vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite |
+                      vk::AccessFlagBits2::eMemoryWrite;
+    }
+
+    if (src_stages == vk::PipelineStageFlagBits2::eNone) {
+        src_stages = vk::PipelineStageFlagBits2::eAllGraphics |
+                     vk::PipelineStageFlagBits2::eComputeShader |
+                     vk::PipelineStageFlagBits2::eTransfer;
+        src_access = vk::AccessFlagBits2::eColorAttachmentWrite |
+                     vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                     vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite |
+                     vk::AccessFlagBits2::eMemoryWrite;
+    }
+
+    if (cp_coher_cntl & ((1u << 13) | (1u << 14))) {
+        dst_stages |= vk::PipelineStageFlagBits2::eFragmentShader |
+                      vk::PipelineStageFlagBits2::eVertexShader |
+                      vk::PipelineStageFlagBits2::eComputeShader;
+        dst_access |= vk::AccessFlagBits2::eShaderRead;
+    }
+    if (cp_coher_cntl & (1u << 10)) {
+        dst_stages |= vk::PipelineStageFlagBits2::eAllGraphics |
+                      vk::PipelineStageFlagBits2::eComputeShader;
+        dst_access |= vk::AccessFlagBits2::eUniformRead;
+    }
+
+    if (dst_stages == vk::PipelineStageFlagBits2::eNone) {
+        dst_stages = vk::PipelineStageFlagBits2::eAllGraphics |
+                     vk::PipelineStageFlagBits2::eComputeShader |
+                     vk::PipelineStageFlagBits2::eTransfer;
+        dst_access = vk::AccessFlagBits2::eShaderRead |
+                     vk::AccessFlagBits2::eColorAttachmentRead |
+                     vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                     vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
+                     vk::AccessFlagBits2::eMemoryRead;
+    }
+
+    scheduler.EndRendering();
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = src_stages,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stages,
+        .dstAccessMask = dst_access,
+    };
+    auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AcquireMemBarriers);
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::VulkanPipelineBarrier,
+        static_cast<u64>(src_stages), static_cast<u64>(dst_stages));
+}
+
+void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::EventWriteFlushCalls);
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::Pm4EventWrite, static_cast<u64>(event_type), 0);
+
+    vk::PipelineStageFlags2 src_stages = vk::PipelineStageFlagBits2::eNone;
+    vk::AccessFlags2 src_access = vk::AccessFlagBits2::eNone;
+
+    switch (event_type) {
+    case AmdGpu::EventType::CacheFlush:
+    case AmdGpu::EventType::CacheFlushTs:
+    case AmdGpu::EventType::CacheFlushAndInvEvent:
+    case AmdGpu::EventType::CacheFlushAndInvTsEvent:
+        src_stages = vk::PipelineStageFlagBits2::eAllGraphics |
+                     vk::PipelineStageFlagBits2::eComputeShader |
+                     vk::PipelineStageFlagBits2::eTransfer;
+        src_access = vk::AccessFlagBits2::eColorAttachmentWrite |
+                     vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                     vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+        break;
+    case AmdGpu::EventType::FlushAndInvCbDataTs:
+    case AmdGpu::EventType::FlushAndInvCbMeta:
+    case AmdGpu::EventType::FlushAndInvCbPixelData:
+        src_stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+        src_access = vk::AccessFlagBits2::eColorAttachmentWrite;
+        break;
+    case AmdGpu::EventType::FlushAndInvDbDataTs:
+    case AmdGpu::EventType::FlushAndInvDbMeta:
+    case AmdGpu::EventType::DbCacheFlushAndInv:
+        src_stages = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                     vk::PipelineStageFlagBits2::eLateFragmentTests;
+        src_access = vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        break;
+    case AmdGpu::EventType::CsPartialFlush:
+    case AmdGpu::EventType::CsDone:
+        src_stages = vk::PipelineStageFlagBits2::eComputeShader;
+        src_access = vk::AccessFlagBits2::eShaderWrite;
+        break;
+    case AmdGpu::EventType::VsPartialFlush:
+    case AmdGpu::EventType::PsPartialFlush:
+        src_stages = vk::PipelineStageFlagBits2::eAllGraphics;
+        src_access = vk::AccessFlagBits2::eShaderWrite |
+                     vk::AccessFlagBits2::eColorAttachmentWrite;
+        break;
+    default:
+        return;
+    }
+
+    scheduler.EndRendering();
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = src_stages,
+        .srcAccessMask = src_access,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                        vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
+                         vk::AccessFlagBits2::eMemoryRead,
+    };
+    auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::EventWriteFlushBarriers);
+    Common::PerformanceTelemetry::RecordEnabled(
+        Common::PerformanceTelemetry::EventType::VulkanPipelineBarrier,
+        static_cast<u64>(src_stages), static_cast<u64>(barrier.dstStageMask));
+}
+
+void Rasterizer::FullGpuBarrier() {
+    scheduler.EndRendering();
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eTransferRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                         vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
+                         vk::AccessFlagBits2::eTransferWrite,
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BruteForceBarriers);
+}
+
+void Rasterizer::GpuFenceWait() {
+    FullGpuBarrier();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GpuFenceWaitBarriers);
+}
+
+u64 Rasterizer::CurrentTick() const noexcept {
+    return scheduler.CurrentTick();
+}
+
+u64 Rasterizer::KnownGpuTick() const noexcept {
+    return scheduler.KnownGpuTick();
 }
 
 bool Rasterizer::FilterDraw() {
@@ -330,6 +528,9 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::RenderPrepare>
+        duration{telemetry_enabled};
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -348,7 +549,16 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::RenderImageDesc>
+                desc_duration{telemetry_enabled};
+            std::construct_at(&desc, col_buf, hint);
+        }
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::RenderColorAttachments, 1);
+        }
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
@@ -359,8 +569,17 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::RenderImageDesc>
+                desc_duration{telemetry_enabled};
+            std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                              htile_address, hint);
+        }
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::RenderDepthAttachments, 1);
+        }
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
@@ -404,7 +623,8 @@ void Rasterizer::EliminateFastClear() {
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
-    image.Clear(clear_value, desc.view_info.range);
+    image.Clear(clear_value, desc.view_info.range,
+                Common::PerformanceTelemetry::ImageWriter::GraphicsDraw);
     ScopeMarkerEnd();
 }
 
@@ -458,6 +678,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
 }
@@ -544,6 +765,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
+    MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
 }
@@ -582,6 +804,7 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
 
     ResetBindings();
 }
@@ -622,14 +845,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
+    MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
 
     ResetBindings();
 }
 
-u64 Rasterizer::Flush() {
+u64 Rasterizer::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
-    scheduler.Flush(info);
+    scheduler.Flush(info, reason);
     return current_tick;
 }
 
@@ -642,12 +866,17 @@ void Rasterizer::OnSubmit() {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
     }
-    texture_cache.ProcessDownloadImages();
+    texture_cache.ProcessDownloadImages(
+        Common::PerformanceTelemetry::WritebackTrigger::GuestSubmit);
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
+    Flush(Common::PerformanceTelemetry::SubmitReason::GuestSubmit);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::DescriptorPrepare>
+        prepare_duration{telemetry_enabled};
     if (pipeline->IsCompute() &&
         (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
          IsComputeImageClear(pipeline))) [[unlikely]] {
@@ -661,27 +890,51 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
     pending_buffer_bindings.clear();
+    potential_write_images.clear();
 
     bool uses_dma = false;
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(liverpool->regs);
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DescriptorUserData>
+            user_data_duration{telemetry_enabled};
+        push_data = MakeUserData(liverpool->regs);
+    }
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        stage->PushUd(binding, push_data);
-        PrepareBuffers(*stage, binding);
-        FinalizeBuffers(push_data, false);
-        BindTextures(*stage, binding);
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DescriptorUserData>
+                user_data_duration{telemetry_enabled};
+            stage->PushUd(binding, push_data);
+        }
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DescriptorBuffers>
+                buffer_duration{telemetry_enabled};
+            PrepareBuffers(*stage, binding);
+            FinalizeBuffers(push_data, false);
+        }
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DescriptorTextures>
+                texture_duration{telemetry_enabled};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 
     if (pipeline->IsCompute()) {
         buffer_cache.FinalizeStreamCopyBatch();
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DescriptorBuffers>
+            buffer_duration{telemetry_enabled};
         FinalizeBuffers(push_data, true);
     }
 
@@ -706,6 +959,9 @@ void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
     state.pipeline = pipeline;
     state.command_buffer = scheduler.CommandBuffer();
     state.push_descriptor_epoch = scheduler.GraphicsPushDescriptorEpoch();
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    state.layout_signature = pipeline->DescriptorLayoutSignature();
+#endif
     state.writes.clear();
     state.image_infos.clear();
     state.buffer_infos.clear();
@@ -743,6 +999,168 @@ void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
     state.valid = true;
 }
 
+void Rasterizer::MarkImageWrites(Common::PerformanceTelemetry::ImageWriter writer,
+                                 bool include_render_targets) {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const bool record_telemetry = telemetry_enabled;
+    const auto producer_seq =
+        record_telemetry ? Common::PerformanceTelemetry::NextProducerSeq() : 0;
+    const auto prod_class = (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw)
+                                ? Common::PerformanceTelemetry::ProducerClass::GraphicsDraw
+                                : Common::PerformanceTelemetry::ProducerClass::ComputeDispatch;
+    if (record_telemetry) {
+        Common::PerformanceTelemetry::RecordProducerBegin(
+            Common::PerformanceTelemetry::ProducerBeginSample{
+                .producer_seq = producer_seq,
+                .packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+                .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                .producer_type = prod_class,
+                .queue_id =
+                    (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw) ? u32{0}
+                                                                                        : u32{1},
+            });
+    }
+
+    u32 write_count = 0;
+    u64 total_write_bytes = 0;
+#endif
+
+    if (include_render_targets) {
+        for (const auto image_id : bound_images) {
+            auto& image = texture_cache.GetImage(image_id);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            if (record_telemetry) {
+                const auto access_path =
+                    image.info.props.is_depth
+                        ? Common::PerformanceTelemetry::ConsumerAccessPath::DepthAttachment
+                        : Common::PerformanceTelemetry::ConsumerAccessPath::ColorAttachment;
+                Common::PerformanceTelemetry::CheckConsumerOverlap(
+                    producer_seq, Common::PerformanceTelemetry::CurrentPacketSeq(), prod_class,
+                    image.info.guest_address, image.info.guest_size, access_path, image.image_uid,
+                    image.content_epoch,
+                    Common::PerformanceTelemetry::ConsumerConfidence::ExactResourceAndVersion);
+                if (Common::PerformanceTelemetry::HasActiveReadbackSourceWatch(
+                        image.image_uid, image.content_epoch)) {
+                    Common::PerformanceTelemetry::ResolveReadbackSourceWatch(
+                        image.image_uid, image.content_epoch, image.info.guest_address,
+                        image.info.guest_size,
+                        Common::PerformanceTelemetry::TerminalKind::GpuRead, producer_seq,
+                        Common::PerformanceTelemetry::CurrentPacketSeq());
+                }
+            }
+#endif
+            if (image.binding.is_target) {
+                image.MarkWrite(writer);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                if (record_telemetry) {
+                    const auto write_kind =
+                        image.info.props.is_depth
+                            ? Common::PerformanceTelemetry::ResourceWriteKind::DepthTarget
+                            : Common::PerformanceTelemetry::ResourceWriteKind::ColorTarget;
+                    Common::PerformanceTelemetry::RecordResourceWrite(
+                        Common::PerformanceTelemetry::ResourceWriteSample{
+                            .producer_seq = producer_seq,
+                            .resource_id = image.image_uid,
+                            .resource_type = Common::PerformanceTelemetry::ResourceType::Image,
+                            .guest_addr = image.info.guest_address,
+                            .guest_size = image.info.guest_size,
+                            .version = image.content_epoch,
+                            .vk_handle_id = 0,
+                            .format = static_cast<u32>(image.info.pixel_format),
+                            .width = image.info.size.width,
+                            .height = image.info.size.height,
+                            .depth = image.info.size.depth,
+                            .pitch = image.info.pitch,
+                            .tiling = static_cast<u32>(image.info.tile_mode),
+                            .write_kind = write_kind,
+                            .stage =
+                                (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw)
+                                    ? u32{0}
+                                    : u32{1},
+                            .queue_id =
+                                (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw)
+                                    ? u32{0}
+                                    : u32{1},
+                        });
+                    ++write_count;
+                    total_write_bytes += image.info.guest_size;
+                }
+#endif
+            }
+        }
+    }
+    for (const auto image_id : potential_write_images) {
+        auto& image = texture_cache.GetImage(image_id);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (record_telemetry) {
+            Common::PerformanceTelemetry::CheckConsumerOverlap(
+                producer_seq, Common::PerformanceTelemetry::CurrentPacketSeq(), prod_class,
+                image.info.guest_address, image.info.guest_size,
+                Common::PerformanceTelemetry::ConsumerAccessPath::StorageImage, image.image_uid,
+                image.content_epoch,
+                Common::PerformanceTelemetry::ConsumerConfidence::ExactResourceAndVersion);
+            if (Common::PerformanceTelemetry::HasActiveReadbackSourceWatch(
+                    image.image_uid, image.content_epoch)) {
+                Common::PerformanceTelemetry::ResolveReadbackSourceWatch(
+                    image.image_uid, image.content_epoch, image.info.guest_address,
+                    image.info.guest_size, Common::PerformanceTelemetry::TerminalKind::GpuRead,
+                    producer_seq, Common::PerformanceTelemetry::CurrentPacketSeq());
+            }
+        }
+#endif
+        if (!include_render_targets || !image.binding.is_target) {
+            image.MarkWrite(writer);
+            if (writer == Common::PerformanceTelemetry::ImageWriter::ComputeDispatch) {
+                texture_cache.ScheduleComputeDownload(image_id);
+            }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            if (record_telemetry) {
+                Common::PerformanceTelemetry::RecordResourceWrite(
+                    Common::PerformanceTelemetry::ResourceWriteSample{
+                        .producer_seq = producer_seq,
+                        .resource_id = image.image_uid,
+                        .resource_type = Common::PerformanceTelemetry::ResourceType::Image,
+                        .guest_addr = image.info.guest_address,
+                        .guest_size = image.info.guest_size,
+                        .version = image.content_epoch,
+                        .vk_handle_id = 0,
+                        .format = static_cast<u32>(image.info.pixel_format),
+                        .width = image.info.size.width,
+                        .height = image.info.size.height,
+                        .depth = image.info.size.depth,
+                        .pitch = image.info.pitch,
+                        .tiling = static_cast<u32>(image.info.tile_mode),
+                        .write_kind =
+                            Common::PerformanceTelemetry::ResourceWriteKind::StorageImage,
+                        .stage =
+                            (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw)
+                                ? u32{0}
+                                : u32{1},
+                        .queue_id =
+                            (writer == Common::PerformanceTelemetry::ImageWriter::GraphicsDraw)
+                                ? u32{0}
+                                : u32{1},
+                    });
+                ++write_count;
+                total_write_bytes += image.info.guest_size;
+            }
+#endif
+        }
+    }
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (record_telemetry) {
+        Common::PerformanceTelemetry::RecordProducerEnd(
+            Common::PerformanceTelemetry::ProducerEndSample{
+                .producer_seq = producer_seq,
+                .write_range_count = write_count,
+                .write_bytes = total_write_bytes,
+                .write_resource_count = write_count,
+            });
+    }
+#endif
+}
+
 void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
     if (pipeline->IsCompute() || !pipeline->UsesPushDescriptors()) {
         pipeline->BindResources(set_writes, buffer_barriers, push_data);
@@ -750,47 +1168,122 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
     }
 
     const auto& cached = descriptor_state;
+    const u32 state_reason =
+        static_cast<u32>(!cached.valid) |
+        (static_cast<u32>(cached.pipeline != pipeline) << 1) |
+        (static_cast<u32>(cached.command_buffer != scheduler.CommandBuffer()) << 2) |
+        (static_cast<u32>(cached.push_descriptor_epoch !=
+                          scheduler.GraphicsPushDescriptorEpoch())
+         << 3);
     const bool can_reuse = cached.valid && cached.pipeline == pipeline &&
                            cached.command_buffer == scheduler.CommandBuffer() &&
                            cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch();
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (telemetry_enabled && cached.valid && cached.pipeline != pipeline &&
+        cached.command_buffer == scheduler.CommandBuffer() &&
+        cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch() &&
+        Common::PerformanceTelemetry::ShouldSampleDescriptorCrossPipelineEnabled()) {
+        const bool exact_state = [&] {
+            u32 old_index = 0;
+            for (const auto& write : set_writes) {
+                const bool is_buffer = write.pBufferInfo != nullptr;
+                if ((write.pImageInfo == nullptr && !is_buffer) ||
+                    old_index >= cached.writes.size()) {
+                    return false;
+                }
+                const auto& old_write = cached.writes[old_index++];
+                if (old_write.key0 != DescriptorWriteKey0(write) ||
+                    old_write.key1 != DescriptorWriteKey1(write) ||
+                    old_write.is_buffer != is_buffer) {
+                    return false;
+                }
+                if (is_buffer) {
+                    if (old_write.first_info + write.descriptorCount >
+                            cached.buffer_infos.size() ||
+                        !DescriptorInfosEqual(cached.buffer_infos.data() + old_write.first_info,
+                                              write.pBufferInfo, write.descriptorCount)) {
+                        return false;
+                    }
+                } else if (old_write.first_info + write.descriptorCount >
+                               cached.image_infos.size() ||
+                           !DescriptorInfosEqual(cached.image_infos.data() + old_write.first_info,
+                                                 write.pImageInfo, write.descriptorCount)) {
+                    return false;
+                }
+            }
+            return old_index == cached.writes.size();
+        }();
+        Common::PerformanceTelemetry::RecordDescriptorCrossPipelineEnabled(
+            exact_state, cached.layout_signature == pipeline->DescriptorLayoutSignature());
+    }
+#endif
     partial_set_writes.clear();
     u32 cached_write_index = 0;
-    for (const auto& write : set_writes) {
-        bool unchanged = false;
-        const bool is_buffer = write.pBufferInfo != nullptr;
-        const bool is_cacheable = write.pImageInfo != nullptr || is_buffer;
-        if (is_cacheable && can_reuse && cached_write_index < cached.writes.size()) {
-            const auto& old_write = cached.writes[cached_write_index];
-            const u64 metadata_difference =
-                (old_write.key0 ^ DescriptorWriteKey0(write)) |
-                (old_write.key1 ^ DescriptorWriteKey1(write)) |
-                static_cast<u64>(old_write.is_buffer != is_buffer);
-            unchanged = metadata_difference == 0;
-            if (unchanged && is_buffer) {
-                const auto* lhs = cached.buffer_infos.data() + old_write.first_info;
-                unchanged = DescriptorInfosEqual(lhs, write.pBufferInfo, write.descriptorCount);
-            } else if (unchanged) {
-                const auto* lhs = cached.image_infos.data() + old_write.first_info;
-                unchanged = DescriptorInfosEqual(lhs, write.pImageInfo, write.descriptorCount);
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DescriptorCompare>
+            compare_duration{telemetry_enabled};
+        for (const auto& write : set_writes) {
+            bool unchanged = false;
+            u32 reason = state_reason;
+            const bool is_buffer = write.pBufferInfo != nullptr;
+            const bool is_cacheable = write.pImageInfo != nullptr || is_buffer;
+            if (is_cacheable && can_reuse && cached_write_index < cached.writes.size()) {
+                const auto& old_write = cached.writes[cached_write_index];
+                const u64 metadata_difference =
+                    (old_write.key0 ^ DescriptorWriteKey0(write)) |
+                    (old_write.key1 ^ DescriptorWriteKey1(write)) |
+                    static_cast<u64>(old_write.is_buffer != is_buffer);
+                unchanged = metadata_difference == 0;
+                reason |= static_cast<u32>(metadata_difference != 0) << 6;
+                if (unchanged && is_buffer) {
+                    const auto* lhs = cached.buffer_infos.data() + old_write.first_info;
+                    unchanged =
+                        DescriptorInfosEqual(lhs, write.pBufferInfo, write.descriptorCount);
+                    reason |= static_cast<u32>(!unchanged) << 7;
+                } else if (unchanged) {
+                    const auto* lhs = cached.image_infos.data() + old_write.first_info;
+                    unchanged =
+                        DescriptorInfosEqual(lhs, write.pImageInfo, write.descriptorCount);
+                    reason |= static_cast<u32>(!unchanged) << 8;
+                }
+                ++cached_write_index;
+            } else if (is_cacheable) {
+                reason |= static_cast<u32>(can_reuse) << 5;
+                ++cached_write_index;
+            } else {
+                reason |= 1u << 4;
             }
-            ++cached_write_index;
-        } else if (is_cacheable) {
-            ++cached_write_index;
-        }
-        if (!unchanged) {
-            partial_set_writes.push_back(write);
-        }
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                unchanged ? Common::PerformanceTelemetry::Counter::DescriptorHits
-                          : Common::PerformanceTelemetry::Counter::DescriptorMisses,
-                1);
+            if (!unchanged) {
+                partial_set_writes.push_back(write);
+            }
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::RecordDescriptorDecisionEnabled(unchanged ? 0
+                                                                                        : reason);
+            }
         }
     }
 
-    auto& writes = can_reuse ? partial_set_writes : set_writes;
-    pipeline->BindResources(writes, buffer_barriers, push_data);
-    CaptureDescriptorState(pipeline);
+    if (partial_set_writes.empty()) {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::DescriptorHits, 1);
+        }
+        std::vector<vk::WriteDescriptorSet> empty_writes;
+        pipeline->BindResources(empty_writes, buffer_barriers, push_data);
+    } else {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::DescriptorMisses, 1);
+        }
+        pipeline->BindResources(partial_set_writes, buffer_barriers, push_data);
+    }
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DescriptorCapture>
+            capture_duration{telemetry_enabled};
+        CaptureDescriptorState(pipeline);
+    }
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -883,14 +1376,18 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
     if (instance.IsMaintenance8Supported() ||
         src_image.info.props.is_depth == dst_image.info.props.is_depth) {
-        dst_image.CopyImage(src_image);
+        dst_image.CopyImage(src_image, Common::PerformanceTelemetry::ImageWriter::ComputeHle);
     } else {
         const auto& copy_buffer =
             buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::DeviceLocal);
-        dst_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0);
+        dst_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0,
+                                      Common::PerformanceTelemetry::ImageWriter::ComputeHle);
     }
     dst_image.flags |= VideoCore::ImageFlagBits::GpuModified;
     dst_image.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    buffer_cache.InvalidateMemory(dst_image.info.guest_address, dst_image.info.guest_size);
+    page_manager.NotifyWrite(dst_image.info.guest_address, dst_image.info.guest_size,
+                             VideoCore::MemoryWriteSource::CommandProcessor);
     return true;
 }
 
@@ -948,9 +1445,12 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
-    image1.Clear(clear, range);
+    image1.Clear(clear, range, Common::PerformanceTelemetry::ImageWriter::ComputeHle);
     image1.flags |= VideoCore::ImageFlagBits::GpuModified;
     image1.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    buffer_cache.InvalidateMemory(image1.info.guest_address, image1.info.guest_size);
+    page_manager.NotifyWrite(image1.info.guest_address, image1.info.guest_size,
+                             VideoCore::MemoryWriteSource::CommandProcessor);
     return true;
 }
 
@@ -980,7 +1480,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             pending.size = size;
             if (!desc.is_written && size <= VideoCore::BufferCache::CACHING_PAGESIZE &&
-                !buffer_cache.IsRegionGpuModified(vsharp.base_address, size)) {
+                !buffer_cache.HasGpuReadSource(vsharp.base_address, size)) {
                 pending.stream_source = VideoCore::BufferCache::StreamCopySource::Guest;
                 pending.stream_index =
                     buffer_cache.QueueStreamCopy(VideoCore::BufferCache::StreamCopyRequest{
@@ -1132,13 +1632,15 @@ void Rasterizer::FinalizeBuffers(Shader::PushData& push_data, bool stream_only) 
             ASSERT(adjust % 4 == 0);
             push_data.AddOffset(pending.buffer_binding, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, pending.size + adjust);
-            if (auto barrier =
-                    vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                          : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
+            const vk::AccessFlags2 shader_access =
+                desc.is_written
+                    ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+                    : vk::AccessFlagBits2::eShaderRead;
+            if (auto barrier = vk_buffer->GetBarrier(shader_access,
+                                                     vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
             }
-            if (desc.is_written && desc.is_formatted) {
+            if (desc.is_written) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, pending.size);
             }
         }
@@ -1290,9 +1792,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
+            if (is_storage &&
+                std::ranges::find(potential_write_images, image_id) == potential_write_images.end()) {
+                potential_write_images.emplace_back(image_id);
+            }
 
             auto& image = texture_cache.GetImage(image_id);
-            texture_cache.PrepareTexture(image_id, desc);
+            if (True(image.flags & VideoCore::ImageFlagBits::GpuModified) || image.usage.render_target || image.usage.depth_target) {
+                Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::RenderTargetSampledAsTexture);
+            }
+            texture_cache.PrepareTexture(image_id, desc, stage.l_stage == Shader::LogicalStage::Compute);
             const u64 topology_epoch = texture_cache.TopologyEpoch();
             const bool view_cache_hit = cached_view.valid && cached_view.image_id == image_id &&
                                         cached_view.image_uid == image.image_uid &&
@@ -1387,6 +1896,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::RenderStateBuild>
+        duration{telemetry_enabled};
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -1403,6 +1915,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         auto* image = &texture_cache.GetImage(image_id);
         if (image->binding.needs_rebind) {
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    Common::PerformanceTelemetry::Counter::RenderTargetRebinds, 1);
+            }
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
             cached_color_target_views[cb].valid = false;
@@ -1579,7 +2095,8 @@ void Rasterizer::Resolve() {
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->regs.color_buffers[0].Address(),
                                  liverpool->regs.color_buffers[1].Address()));
-    mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range);
+    mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range,
+                       Common::PerformanceTelemetry::ImageWriter::GraphicsDraw);
     ScopeMarkerEnd();
 }
 
@@ -1640,6 +2157,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     scheduler.CommandBuffer().copyImage(read_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                                         write_image.GetImage(),
                                         vk::ImageLayout::eTransferDstOptimal, region);
+    write_image.MarkWrite(Common::PerformanceTelemetry::ImageWriter::Transfer);
 
     ScopeMarkerEnd();
 }
@@ -1670,25 +2188,101 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     return true;
 }
 
-bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
+bool Rasterizer::ReadMemory(VAddr addr, u64 size, void* context) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::SemanticReadFaults);
+    const u32 thread_id =
+#if defined(_WIN32)
+        GetCurrentThreadId();
+#else
+        static_cast<u32>(pthread_self());
+#endif
+    const VAddr rip = context ? reinterpret_cast<VAddr>(Common::GetRip(context)) : 0;
+    Common::PerformanceTelemetry::CheckCpuReadObservation(addr, size, thread_id, rip, [this](VAddr a, u64 s) {
+        DisarmSemanticReadWatch(a, s);
+    });
+#endif
     buffer_cache.ReadMemory(addr, size);
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (context && page_manager.HasReadWatcher(addr)) {
+        page_manager.TemporarilyUnprotect(addr, size);
+        Core::Signals::Instance()->RequestSingleStepRearm(context, addr & ~0xFFFULL, 4096);
+    }
+#else
+    if (page_manager.HasReadWatcher(addr)) {
+        DisarmSemanticReadWatch(addr, size);
+    }
+#endif
     return true;
 }
 
-void Rasterizer::NotifyMemoryWrite(VAddr addr, u64 size, VideoCore::MemoryWriteSource source) {
-    page_manager.NotifyWrite(addr, size, source);
+void Rasterizer::ArmSemanticReadWatch(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return;
+    }
+    page_manager.UpdatePageWatchers<true, true>(addr, size);
 }
 
-bool Rasterizer::ProcessDownloadImages() {
-    return texture_cache.ProcessDownloadImages();
+void Rasterizer::DisarmSemanticReadWatch(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return;
+    }
+    page_manager.UpdatePageWatchers<false, true>(addr, size);
 }
 
-void Rasterizer::DeferGpuCompletion(Common::UniqueFunction<void>&& callback) {
-    scheduler.DeferPriorityOperation(std::move(callback));
+bool Rasterizer::HandleWriteFaultOnReadWatchedPage(VAddr addr, u64 size, void* context) {
+    if (!page_manager.HasReadWatcher(addr)) {
+        return false;
+    }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const u32 thread_id =
+#if defined(_WIN32)
+        GetCurrentThreadId();
+#else
+        static_cast<u32>(pthread_self());
+#endif
+    const VAddr rip = context ? reinterpret_cast<VAddr>(Common::GetRip(context)) : 0;
+    Common::PerformanceTelemetry::HandleWriteFaultOnWatchedPage(addr, size, thread_id, rip,
+        [this](VAddr a, u64 s) {
+            DisarmSemanticReadWatch(a, s);
+        });
+#endif
+    if (page_manager.HasReadWatcher(addr)) {
+        page_manager.TemporarilyUnprotect(addr, size);
+        Core::Signals::Instance()->RequestSingleStepRearm(context, addr & ~0xFFFULL, 4096);
+    }
+    return true;
+}
+
+VideoCore::MemoryWriteNotifyResult Rasterizer::NotifyMemoryWrite(
+    VAddr addr, u64 size, VideoCore::MemoryWriteSource source) {
+    return page_manager.NotifyWrite(addr, size, source);
+}
+
+bool Rasterizer::ProcessDownloadImages(const VideoCore::TextureCache::DownloadContext& context,
+                                       bool* gpu_resident) {
+    return texture_cache.ProcessDownloadImages(context, gpu_resident);
+}
+
+bool Rasterizer::ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
+                                       u32 trigger_control, u32 trigger_data_control,
+                                       bool* gpu_resident) {
+    return texture_cache.ProcessDownloadImages(trigger, trigger_control, trigger_data_control,
+                                               gpu_resident);
+}
+
+void Rasterizer::WaitTick(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason) {
+    scheduler.Wait(tick, reason);
+}
+
+void Rasterizer::DeferGpuCompletion(Common::UniqueFunction<void>&& callback,
+                                    const Common::PerformanceTelemetry::PendingOpTraceToken& trace) {
+    scheduler.DeferPriorityOperation(std::move(callback), trace);
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
@@ -1725,30 +2319,53 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::DynamicTotal>
+        total_duration{telemetry_enabled};
     const u64 generation = liverpool->GraphicsStateGeneration();
-    const bool state_unchanged = dynamic_state_generation == generation &&
-                                 dynamic_state_pipeline == pipeline &&
-                                 dynamic_state_indexed == is_indexed &&
-                                 dynamic_state_feedback_loop == attachment_feedback_loop;
-    if (state_unchanged) [[likely]] {
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::DynamicStateHits, 1);
+    const u32 reason_mask =
+        static_cast<u32>(dynamic_state_generation != generation) |
+        (static_cast<u32>(dynamic_state_pipeline != pipeline) << 1) |
+        (static_cast<u32>(dynamic_state_indexed != is_indexed) << 2) |
+        (static_cast<u32>(dynamic_state_feedback_loop != attachment_feedback_loop) << 3);
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordDynamicStateDecisionEnabled(reason_mask);
+    }
+    if (reason_mask != 0) [[unlikely]] {
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DynamicViewport>
+                duration{telemetry_enabled};
+            UpdateViewportScissorState();
         }
-    } else {
-        UpdateViewportScissorState();
-        UpdateDepthStencilState();
-        UpdatePrimitiveState(is_indexed);
-        UpdateRasterizationState();
-        UpdateColorBlendingState(pipeline);
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DynamicDepthStencil>
+                duration{telemetry_enabled};
+            UpdateDepthStencilState();
+        }
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DynamicPrimitive>
+                duration{telemetry_enabled};
+            UpdatePrimitiveState(is_indexed);
+        }
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DynamicRasterization>
+                duration{telemetry_enabled};
+            UpdateRasterizationState();
+        }
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DynamicBlend>
+                duration{telemetry_enabled};
+            UpdateColorBlendingState(pipeline);
+        }
         dynamic_state_generation = generation;
         dynamic_state_pipeline = pipeline;
         dynamic_state_indexed = is_indexed;
         dynamic_state_feedback_loop = attachment_feedback_loop;
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::DynamicStateMisses, 1);
-        }
     }
 
     auto& dynamic_state = scheduler.GetDynamicState();

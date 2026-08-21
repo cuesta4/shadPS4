@@ -36,6 +36,12 @@ struct MemoryWriteWatch {
 using MemoryWriteCallback =
     void (*)(void* user_data, VAddr page, u64 epoch, MemoryWriteSource source) noexcept;
 
+struct MemoryWriteNotifyResult {
+    u32 matched_pages{};
+    u32 callbacks{};
+    bool had_active_watches{};
+};
+
 class PageManager {
     // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
     // Use the same page size as the tracker.
@@ -65,11 +71,17 @@ public:
     bool CancelWriteWatch(MemoryWriteWatch watch);
 
     /// Notifies one-shot observers after a guest-memory write becomes visible.
-    void NotifyWrite(VAddr address, u64 size, MemoryWriteSource source);
+    MemoryWriteNotifyResult NotifyWrite(VAddr address, u64 size, MemoryWriteSource source);
 
     /// Updates watches in the pages touching the specified region.
-    template <bool track>
+    template <bool track, bool is_read = false>
     void UpdatePageWatchers(VAddr addr, u64 size) const;
+
+    /// Returns true if the page containing address has active read watchers.
+    [[nodiscard]] bool HasReadWatcher(VAddr address) const;
+
+    /// Temporarily unprotects the page (e.g. for single-stepping after a fault).
+    void TemporarilyUnprotect(VAddr address, u64 size) const;
 
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>

@@ -674,7 +674,7 @@ Frame* Presenter::PrepareLastFrame() {
     frame->ready_semaphore = scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
-    scheduler.Flush(info);
+    scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild);
     return frame;
 }
 
@@ -785,7 +785,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
-    draw_scheduler.Flush(info);
+    draw_scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild);
     return frame;
 }
 
@@ -858,13 +858,16 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->ready_semaphore = scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
-    scheduler.Flush(info);
+    scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild);
     return frame;
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    const u64 present_start_ns =
+        telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
     Common::PerformanceTelemetry::ScopedDuration present_duration{
-        Common::PerformanceTelemetry::Counter::PresentCpuNs,
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::PresentCpuNs,
         Common::PerformanceTelemetry::EventType::PresentCpu, frame->id};
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -1101,21 +1104,36 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
-    scheduler.Flush(info);
+    scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentSubmit);
 
     // Present to swapchain.
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        const u64 wait_start =
+            telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        std::unique_lock submit_lock{Scheduler::submit_mutex};
+        const u64 lock_acquired =
+            telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::DriverPresentCalls);
+        const u64 driver_start =
+            telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
         const bool presented = [&] {
             Common::PerformanceTelemetry::ScopedDuration present_driver_duration{
                 Common::PerformanceTelemetry::Counter::DriverPresentNs,
                 Common::PerformanceTelemetry::EventType::DriverPresent, frame->id};
             return swapchain.Present();
         }();
+        const u64 driver_end =
+            telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
         if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
+        if (telemetry_enabled) {
+            const u64 hold_end = Common::PerformanceTelemetry::Timestamp();
+            submit_lock.unlock();
+            Common::PerformanceTelemetry::RecordPresentTimingEnabled(
+                lock_acquired - wait_start, driver_end - driver_start,
+                hold_end - lock_acquired);
         }
     }
 
@@ -1124,6 +1142,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         Common::PerformanceTelemetry::Record(
             Common::PerformanceTelemetry::EventType::FramePresented, frame->id);
         DebugState.IncFlipFrameNum();
+        Common::PerformanceTelemetry::RecordFrameSample(frame->id, present_start_ns);
     }
 }
 

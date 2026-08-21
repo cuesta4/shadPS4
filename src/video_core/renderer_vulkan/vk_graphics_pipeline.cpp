@@ -514,6 +514,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
     }
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    SetDescriptorLayoutSignature(bindings);
+#endif
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

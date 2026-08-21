@@ -34,6 +34,7 @@ namespace VideoCore {
 using BufferId = Common::SlotId;
 
 class TextureCache;
+struct Image;
 class MemoryTracker;
 class PageManager;
 
@@ -171,6 +172,15 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Returns true when the newest contents are resident in either a buffer or an aliased image.
+    [[nodiscard]] bool HasGpuReadSource(VAddr addr, size_t size);
+
+    /// Marks a linear image as the newest GPU source without changing buffer-cache topology.
+    [[nodiscard]] bool TrackImageReadback(Image& image, u32 copy_size);
+
+    /// Marks RAM as current after a deferred image readback is materialized.
+    void CompleteImageReadback(VAddr addr, u32 size);
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
 
@@ -243,6 +253,7 @@ private:
 
     struct StreamCopyScratch;
     struct StreamSliceReuseState;
+    struct StreamBatchReuseState;
     struct VertexIndexState;
 
     const Vulkan::Instance& instance;
@@ -254,6 +265,7 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
+    StreamBuffer transient_read_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;
@@ -265,6 +277,8 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
+    RangeSet image_alias_ranges;
+    RangeSet pending_image_readback_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
     std::atomic<u64> topology_epoch{1};
@@ -276,6 +290,7 @@ private:
     bool stream_copy_finalized{};
     std::unique_ptr<StreamCopyScratch> stream_copy_scratch;
     std::unique_ptr<StreamSliceReuseState> stream_slice_reuse;
+    std::unique_ptr<StreamBatchReuseState> stream_batch_reuse;
     std::unique_ptr<VertexIndexState> vertex_index_state;
 };
 

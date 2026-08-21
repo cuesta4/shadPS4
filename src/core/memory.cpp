@@ -16,6 +16,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/performance_telemetry.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -28,29 +29,43 @@ namespace Core {
 
 namespace {
 
-constexpr size_t SparseCopyPlanCacheSize = 64;
-constexpr size_t SparseCopyPlanMaxRuns = 4;
 constexpr size_t NonTemporalCopyThreshold = 8 * 1024;
-static_assert(std::has_single_bit(SparseCopyPlanCacheSize));
+constexpr size_t DenseCopySpanWays = 4;
 
-struct SparseCopyPlan {
-    const MemoryManager* owner{};
-    VAddr source{};
-    u64 generation{};
-    u32 size{};
-    u8 run_count{};
-    u8 mapped_mask{};
-    bool valid{};
-    std::array<u32, SparseCopyPlanMaxRuns> run_sizes{};
+struct DenseCopySpan {
+    VAddr begin{};
+    VAddr end{};
+
+    [[nodiscard]] bool Contains(VAddr source, u64 size) const noexcept {
+        return source >= begin && source < end && size <= end - source;
+    }
 };
 
-thread_local std::array<SparseCopyPlan, SparseCopyPlanCacheSize> sparse_copy_plan_cache{};
+struct DenseCopyCache {
+    const MemoryManager* owner{};
+    u64 generation{};
+    DenseCopySpan hot{};
+    std::array<DenseCopySpan, DenseCopySpanWays - 1> secondary{};
+    u8 next_replacement{};
 
-[[nodiscard]] size_t SparseCopyPlanIndex(VAddr source, u64 size) noexcept {
-    u64 value = (source >> 4) ^ (source >> 29) ^ (size * 0x9E3779B185EBCA87ULL);
-    value ^= value >> 32;
-    return static_cast<size_t>(value) & (SparseCopyPlanCacheSize - 1);
-}
+    void Reset(const MemoryManager* new_owner, u64 new_generation) noexcept {
+        owner = new_owner;
+        generation = new_generation;
+        hot = {};
+        secondary = {};
+        next_replacement = 0;
+    }
+
+    void Insert(DenseCopySpan span) noexcept {
+        if (hot.end != 0) {
+            secondary[next_replacement] = hot;
+            next_replacement = (next_replacement + 1) % secondary.size();
+        }
+        hot = span;
+    }
+};
+
+thread_local DenseCopyCache dense_copy_cache{};
 
 [[nodiscard]] bool CopyMappedBytes(const u8* source, u8* destination, size_t size,
                                    bool allow_non_temporal) noexcept {
@@ -280,73 +295,153 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* destination, u64 size) {
     CopySparseMemoryBatch(std::span<const SparseCopyRequest>{&request, 1}, size);
 }
 
+bool MemoryManager::ResolveMappedSpan(VAddr source, u64 size, VAddr& span_begin,
+                                      VAddr& span_end) {
+    const auto upper = vma_map.upper_bound(source);
+    if (upper == vma_map.begin()) [[unlikely]] {
+        return false;
+    }
+    auto vma = std::prev(upper);
+    const auto& area = vma->second;
+    if (!area.IsMapped() || source < area.base || source - area.base >= area.size) {
+        return false;
+    }
+
+    span_begin = area.base;
+    span_end = area.base + area.size;
+    for (++vma; vma != vma_map.end() && vma->second.IsMapped() &&
+                vma->second.base == span_end;
+         ++vma) {
+        span_end += vma->second.size;
+    }
+    return size <= span_end - source;
+}
+
+SHAD_NO_INLINE bool MemoryManager::CopySparseMemoryCold(const SparseCopyRequest& request,
+                                                        bool allow_non_temporal,
+                                                        SparseCopyStats* stats) {
+    const bool valid_mapping = IsValidMapping(request.source, request.size);
+    if (!valid_mapping) [[unlikely]] {
+        ValidateSparseCopyMapping(valid_mapping, request.source);
+    }
+
+    bool used_non_temporal = false;
+    VAddr source = request.source;
+    u8* destination = request.destination;
+    u64 remaining = request.size;
+    auto vma = FindVMA(source);
+    while (remaining != 0) {
+        const u64 run_size =
+            std::min<u64>(vma->second.size - (source - vma->second.base), remaining);
+        bool run_non_temporal{};
+        if (vma->second.IsMapped()) {
+            run_non_temporal = CopyMappedBytes(std::bit_cast<const u8*>(source), destination,
+                                               run_size, allow_non_temporal);
+            if (stats != nullptr) {
+                ++stats->mapped_runs;
+                stats->mapped_bytes += run_size;
+            }
+        } else {
+            run_non_temporal = ZeroBytes(destination, run_size, allow_non_temporal);
+            if (stats != nullptr) {
+                ++stats->zero_runs;
+                stats->zero_bytes += run_size;
+            }
+        }
+        if (stats != nullptr && run_non_temporal) {
+            ++stats->non_temporal_runs;
+            stats->non_temporal_bytes += run_size;
+        }
+        used_non_temporal |= run_non_temporal;
+        remaining -= run_size;
+        source += run_size;
+        destination += run_size;
+        ++vma;
+    }
+    return used_non_temporal;
+}
+
 void MemoryManager::CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests,
-                                          u64 total_size) {
+                                          u64 total_size, bool telemetry_staging_batch,
+                                          bool telemetry_staging_sampled,
+                                          bool allow_non_temporal) {
     if (requests.empty()) {
         return;
     }
 
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StagingSparseCopy>
+        sparse_copy_duration{telemetry_staging_batch};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const bool record_sparse = telemetry_staging_batch && telemetry_staging_sampled;
+    Common::PerformanceTelemetry::StagingSparseCopySample sparse_sample{};
+    if (record_sparse) {
+        sparse_sample.requested_bytes = total_size;
+    }
+    const bool record_sparse_phases =
+        telemetry_staging_batch &&
+        Common::PerformanceTelemetry::ShouldSampleStagingSparsePhaseEnabled();
+    const u64 sparse_shared_start_ns =
+        record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+    u64 sparse_lock_ns{};
+    u64 sparse_dense_lookup_ns{};
+    u64 sparse_span_refill_ns{};
+    u64 sparse_cold_ns{};
+    u64 sparse_payload_ns{};
+    u64 sparse_finish_ns{};
+    VAddr previous_source_end{};
+    uintptr_t previous_destination_end{};
+    u64 previous_request_size{};
+    bool previous_single_mapped{};
+    bool merge_chain{};
+#else
+    static_cast<void>(telemetry_staging_sampled);
+#endif
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const u64 sparse_lock_start_ns =
+        record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+#endif
     std::shared_lock lk{mutex};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (record_sparse_phases) {
+        sparse_lock_ns += Common::PerformanceTelemetry::Timestamp() - sparse_lock_start_ns;
+    }
+#endif
     bool used_non_temporal = false;
-    const bool allow_non_temporal = total_size >= NonTemporalCopyThreshold;
+    const bool use_non_temporal =
+        allow_non_temporal && total_size >= NonTemporalCopyThreshold;
 
-    const auto copy_reference = [this](VAddr source, u8* destination, u64 size) {
-        auto vma = FindVMA(source);
-        while (size != 0) {
-            const u64 copy_size = std::min<u64>(vma->second.size - (source - vma->first), size);
-            if (vma->second.IsMapped()) {
-                std::memcpy(destination, std::bit_cast<const u8*>(source), copy_size);
-            } else {
-                std::memset(destination, 0, copy_size);
+    auto& dense_cache = dense_copy_cache;
+    if (dense_cache.owner != this || dense_cache.generation != mapping_generation) {
+        dense_cache.Reset(this, mapping_generation);
+    }
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const auto record_merge = [&](const SparseCopyRequest& request, bool single_mapped) {
+        if (!record_sparse) {
+            return;
+        }
+        const uintptr_t destination = reinterpret_cast<uintptr_t>(request.destination);
+        if (single_mapped && previous_single_mapped && previous_source_end == request.source &&
+            previous_destination_end == destination) {
+            ++sparse_sample.mergeable_pairs;
+            if (!merge_chain) {
+                sparse_sample.mergeable_bytes += previous_request_size;
             }
-            size -= copy_size;
-            source += copy_size;
-            destination += copy_size;
-            ++vma;
+            sparse_sample.mergeable_bytes += request.size;
+            merge_chain = true;
+        } else {
+            merge_chain = false;
+        }
+        previous_single_mapped = single_mapped;
+        if (single_mapped) {
+            previous_source_end = request.source + request.size;
+            previous_destination_end = destination + request.size;
+            previous_request_size = request.size;
         }
     };
-
-    const auto build_plan = [this](VAddr source, u64 size, SparseCopyPlan& plan) {
-        if (size > std::numeric_limits<u32>::max()) {
-            return false;
-        }
-
-        plan = {};
-        plan.owner = this;
-        plan.source = source;
-        plan.generation = mapping_generation;
-        plan.size = static_cast<u32>(size);
-        plan.valid = true;
-
-        auto vma = FindVMA(source);
-        u64 remaining = size;
-        while (remaining != 0) {
-            const u64 run_size = std::min<u64>(vma->second.size - (source - vma->first), remaining);
-            const bool mapped = vma->second.IsMapped();
-            if (plan.run_count != 0 &&
-                (((plan.mapped_mask >> (plan.run_count - 1)) & 1U) != 0) == mapped) {
-                const u64 merged_size =
-                    static_cast<u64>(plan.run_sizes[plan.run_count - 1]) + run_size;
-                if (merged_size > std::numeric_limits<u32>::max()) {
-                    return false;
-                }
-                plan.run_sizes[plan.run_count - 1] = static_cast<u32>(merged_size);
-            } else {
-                if (plan.run_count == SparseCopyPlanMaxRuns) {
-                    return false;
-                }
-                plan.run_sizes[plan.run_count] = static_cast<u32>(run_size);
-                if (mapped) {
-                    plan.mapped_mask |= static_cast<u8>(1U << plan.run_count);
-                }
-                ++plan.run_count;
-            }
-            remaining -= run_size;
-            source += run_size;
-            ++vma;
-        }
-        return true;
-    };
+#endif
 
     for (const auto& request : requests) {
         if (request.size == 0) {
@@ -355,51 +450,155 @@ void MemoryManager::CopySparseMemoryBatch(std::span<const SparseCopyRequest> req
         if (request.destination == nullptr) [[unlikely]] {
             ValidateSparseCopyDestination(request.destination);
         }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (record_sparse) {
+            ++sparse_sample.requests;
+            sparse_sample.copied_bytes += request.size;
+        }
+        const u64 lookup_start_ns =
+            record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+#endif
 
-        SparseCopyPlan* plan = nullptr;
-        SparseCopyPlan* cache_entry = nullptr;
-        if (request.size <= std::numeric_limits<u32>::max()) {
-            auto& cached =
-                sparse_copy_plan_cache[SparseCopyPlanIndex(request.source, request.size)];
-            cache_entry = &cached;
-            if (cached.valid && cached.owner == this && cached.source == request.source &&
-                cached.size == request.size && cached.generation == mapping_generation) {
-                plan = &cached;
+        // 0 = miss, 1 = hot span, 2 = secondary span, 3 = newly resolved dense span.
+        u8 dense_path{};
+        if (dense_cache.hot.Contains(request.source, request.size)) {
+            dense_path = 1;
+        } else {
+            for (auto& span : dense_cache.secondary) {
+                if (span.Contains(request.source, request.size)) {
+                    std::swap(span, dense_cache.hot);
+                    dense_path = 2;
+                    break;
+                }
             }
         }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (record_sparse_phases) {
+            sparse_dense_lookup_ns += Common::PerformanceTelemetry::Timestamp() - lookup_start_ns;
+        }
+#endif
 
-        if (plan == nullptr) {
-            const bool valid_mapping = IsValidMapping(request.source);
-            if (!valid_mapping) [[unlikely]] {
-                ValidateSparseCopyMapping(valid_mapping, request.source);
+        if (dense_path == 0) {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            const u64 refill_start_ns =
+                record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+#endif
+            DenseCopySpan span{};
+            if (ResolveMappedSpan(request.source, request.size, span.begin, span.end)) {
+                dense_cache.Insert(span);
+                dense_path = 3;
             }
-            if (cache_entry != nullptr &&
-                build_plan(request.source, request.size, *cache_entry)) {
-                plan = cache_entry;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            if (record_sparse_phases) {
+                sparse_span_refill_ns +=
+                    Common::PerformanceTelemetry::Timestamp() - refill_start_ns;
             }
+#endif
         }
 
-        if (plan == nullptr) {
-            copy_reference(request.source, request.destination, request.size);
+        if (dense_path != 0) [[likely]] {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            if (record_sparse) {
+                ++sparse_sample.mapped_runs;
+                sparse_sample.mapped_bytes += request.size;
+                switch (dense_path) {
+                case 1:
+                    ++sparse_sample.dense_hot_hits;
+                    sparse_sample.dense_hot_bytes += request.size;
+                    break;
+                case 2:
+                    ++sparse_sample.dense_cache_hits;
+                    sparse_sample.dense_cache_bytes += request.size;
+                    break;
+                case 3:
+                    ++sparse_sample.dense_refills;
+                    break;
+                default:
+                    std::unreachable();
+                }
+            }
+            record_merge(request, true);
+            const u64 payload_start_ns =
+                record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+#endif
+            const bool copied_non_temporal =
+                CopyMappedBytes(std::bit_cast<const u8*>(request.source), request.destination,
+                                request.size, use_non_temporal);
+            used_non_temporal |= copied_non_temporal;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            if (record_sparse && copied_non_temporal) {
+                ++sparse_sample.non_temporal_runs;
+                sparse_sample.non_temporal_bytes += request.size;
+            }
+            if (record_sparse_phases) {
+                sparse_payload_ns +=
+                    Common::PerformanceTelemetry::Timestamp() - payload_start_ns;
+            }
+#endif
             continue;
         }
 
-        VAddr source = request.source;
-        u8* destination = request.destination;
-        for (u32 run_index = 0; run_index < plan->run_count; ++run_index) {
-            const u32 run_size = plan->run_sizes[run_index];
-            if (((plan->mapped_mask >> run_index) & 1U) != 0) {
-                used_non_temporal |= CopyMappedBytes(std::bit_cast<const u8*>(source), destination,
-                                                     run_size, allow_non_temporal);
-            } else {
-                used_non_temporal |= ZeroBytes(destination, run_size, allow_non_temporal);
-            }
-            source += run_size;
-            destination += run_size;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        SparseCopyStats cold_stats{};
+        const u64 cold_start_ns =
+            record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+        SparseCopyStats* const cold_stats_ptr = record_sparse ? &cold_stats : nullptr;
+#else
+        SparseCopyStats* const cold_stats_ptr = nullptr;
+#endif
+        used_non_temporal |= CopySparseMemoryCold(request, use_non_temporal, cold_stats_ptr);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (record_sparse_phases) {
+            sparse_cold_ns += Common::PerformanceTelemetry::Timestamp() - cold_start_ns;
         }
+        if (record_sparse) {
+            ++sparse_sample.copy_reference_fallbacks;
+            ++sparse_sample.dense_fallback_requests;
+            sparse_sample.reference_bytes += request.size;
+            sparse_sample.dense_fallback_bytes += request.size;
+            sparse_sample.mapped_runs += cold_stats.mapped_runs;
+            sparse_sample.zero_runs += cold_stats.zero_runs;
+            sparse_sample.mapped_bytes += cold_stats.mapped_bytes;
+            sparse_sample.zero_bytes += cold_stats.zero_bytes;
+            sparse_sample.non_temporal_runs += cold_stats.non_temporal_runs;
+            sparse_sample.non_temporal_bytes += cold_stats.non_temporal_bytes;
+        }
+        record_merge(request, cold_stats.mapped_runs == 1 && cold_stats.zero_runs == 0);
+#endif
     }
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const u64 sparse_finish_start_ns =
+        record_sparse_phases ? Common::PerformanceTelemetry::Timestamp() : 0;
+#endif
     FinishNonTemporalCopies(used_non_temporal);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (record_sparse_phases) {
+        sparse_finish_ns += Common::PerformanceTelemetry::Timestamp() - sparse_finish_start_ns;
+    }
+    const u64 sparse_shared_ns =
+        record_sparse_phases
+            ? Common::PerformanceTelemetry::Timestamp() - sparse_shared_start_ns
+            : 0;
+    if (record_sparse) {
+        sparse_sample.non_temporal_fences += used_non_temporal;
+        Common::PerformanceTelemetry::RecordStagingSparseCopyEnabled(sparse_sample);
+    }
+    if (record_sparse_phases) {
+        using Common::PerformanceTelemetry::RecordTimerSampleDurationEnabled;
+        using Common::PerformanceTelemetry::TimerSite;
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseSharedTotal, sparse_shared_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseLock, sparse_lock_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseDenseLookup,
+                                         sparse_dense_lookup_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseSpanRefill,
+                                         sparse_span_refill_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseColdPath, sparse_cold_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparsePayloadCopy,
+                                         sparse_payload_ns);
+        RecordTimerSampleDurationEnabled(TimerSite::StagingSparseFinish, sparse_finish_ns);
+    }
+#endif
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,

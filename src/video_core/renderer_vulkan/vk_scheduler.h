@@ -12,6 +12,7 @@
 #include <queue>
 
 #include "common/assert.h"
+#include "common/performance_telemetry.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -401,17 +402,20 @@ public:
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info);
+    void Flush(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason =
+                                     Common::PerformanceTelemetry::SubmitReason::Generic);
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
-    void Flush();
+    void Flush(Common::PerformanceTelemetry::SubmitReason reason =
+                   Common::PerformanceTelemetry::SubmitReason::Generic);
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason =
+                            Common::PerformanceTelemetry::HostWaitReason::Unknown);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -440,6 +444,11 @@ public:
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore.CurrentTick();
+    }
+
+    /// Returns the last timeline tick known to have completed on the GPU.
+    [[nodiscard]] u64 KnownGpuTick() const noexcept {
+        return master_semaphore.KnownGpuTick();
     }
 
     /// Returns a monotonic epoch incremented whenever graphics push-descriptor state is disturbed
@@ -505,17 +514,19 @@ public:
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
-    void DeferOperation(Common::UniqueFunction<void>&& func) {
+    void DeferOperation(Common::UniqueFunction<void>&& func,
+                        const Common::PerformanceTelemetry::PendingOpTraceToken& trace = {}) {
         std::unique_lock lk(pending_ops_mutex);
-        pending_ops.emplace(std::move(func), CurrentTick());
+        pending_ops.emplace(std::move(func), CurrentTick(), trace);
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
-    void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func,
+                                const Common::PerformanceTelemetry::PendingOpTraceToken& trace = {}) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), CurrentTick(), trace);
         }
         priority_pending_ops_cv.notify_one();
     }
@@ -525,7 +536,7 @@ public:
 private:
     void AllocateWorkerCommandBuffers();
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -555,6 +566,7 @@ private:
     struct PendingOp {
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
+        Common::PerformanceTelemetry::PendingOpTraceToken trace{};
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;

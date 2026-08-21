@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
+#include "common/performance_telemetry.h"
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
@@ -136,6 +137,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                                MemoryMapFlags::Fixed, VMAType::Code, name);
     ASSERT_MSG(result == ORBIS_OK, "Failed to map trampoline area for module {}", name);
     RegisterPatchModule(*out_addr, aligned_base_size, trampoline_addr, TrampolineSize);
+    Common::PerformanceTelemetry::GuestExecutableRegistry::RegisterRange(
+        trampoline_vaddr, trampoline_vaddr + TrampolineSize);
 #endif
 
     LOG_INFO(Core_Linker, "======== Load Module to Memory ========");
@@ -167,6 +170,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             ASSERT_MSG(result == ORBIS_OK, "Failed to map segment at {:#x} for module {}",
                        segment_vaddr, name);
             elf.LoadSegment(segment_vaddr, phdr.p_offset, phdr.p_filesz);
+            if ((phdr.p_flags & PF_EXEC) != 0) {
+                Common::PerformanceTelemetry::GuestExecutableRegistry::RegisterRange(
+                    segment_vaddr, segment_vaddr + segment_size);
+            }
         }
         if (info.num_segments < 4) {
             auto& segment = info.segments[info.num_segments++];

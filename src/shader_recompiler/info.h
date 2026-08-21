@@ -7,6 +7,7 @@
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
@@ -194,11 +195,19 @@ struct Info : InfoPersistent {
         bnd.user_data += ud_mask.NumRegs();
     }
 
-    void RefreshFlatBuf() {
-        flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
-        ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
-        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+    void RefreshFlatBuf(bool telemetry_enabled = false) {
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::StageFlatCopy>
+                copy_duration{telemetry_enabled, static_cast<u32>(l_stage)};
+            flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+            ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+            std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        }
         if (srt_info.walker_func) {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::StageSrtWalker>
+                walker_duration{telemetry_enabled, static_cast<u32>(l_stage)};
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
     }

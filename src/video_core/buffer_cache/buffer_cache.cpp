@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 #include <boost/container/static_vector.hpp>
@@ -18,6 +19,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/gpu_authority_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -27,7 +29,7 @@ namespace VideoCore {
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
-static constexpr size_t DownloadBufferSize = 32_MB;
+static constexpr size_t DownloadBufferSize = 256_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
@@ -92,6 +94,13 @@ struct BufferCache::StreamCopyScratch {
     struct CanonicalCopy {
         StreamCopyRequest request{};
         u64 relative_offset{};
+        u64 absolute_offset{};
+        u32 capture_offset{};
+        u16 reuse_set{};
+        u8 reuse_way{std::numeric_limits<u8>::max()};
+        bool captured{};
+        bool compare_candidate{};
+        bool reused{};
     };
 
     struct RequestMap {
@@ -139,6 +148,81 @@ struct BufferCache::StreamSliceReuseState {
     [[nodiscard]] u8* Shadow(size_t set_index, size_t way) noexcept {
         return shadow.get() + (set_index * WayCount + way) * CACHING_PAGESIZE;
     }
+};
+
+struct BufferCache::StreamBatchReuseState {
+    static constexpr size_t WayCount = 2;
+    static constexpr size_t SetCount = 64;
+    static constexpr u8 NoWay = std::numeric_limits<u8>::max();
+    static constexpr u8 MismatchThreshold = 2;
+    static constexpr u8 CooldownLength = 8;
+    static_assert(std::has_single_bit(SetCount));
+
+    struct Entry {
+        VAddr address{};
+        u64 generation{};
+        u64 tick{};
+        u32 size{};
+        u32 offset{};
+        u8 mismatch_streak{};
+        u8 cooldown{};
+        bool shadow_valid{};
+        bool valid{};
+    };
+
+    struct Set {
+        std::array<Entry, WayCount> ways{};
+        u8 next_replacement{};
+    };
+
+    [[nodiscard]] static size_t SetIndex(VAddr address, u64 size) noexcept {
+        u64 value = (address >> 4) ^ (address >> 31) ^ (size * 0x9E3779B185EBCA87ULL);
+        value ^= value >> 29;
+        return static_cast<size_t>(value) & (SetCount - 1);
+    }
+
+    [[nodiscard]] Entry* Find(VAddr address, u64 size, size_t& set_index,
+                              size_t& way_index) noexcept {
+        set_index = SetIndex(address, size);
+        auto& set = sets[set_index];
+        for (way_index = 0; way_index < WayCount; ++way_index) {
+            auto& entry = set.ways[way_index];
+            if (entry.valid && entry.address == address && entry.size == size) {
+                return &entry;
+            }
+        }
+        way_index = NoWay;
+        return nullptr;
+    }
+
+    [[nodiscard]] Entry& Select(VAddr address, u64 size) noexcept {
+        size_t set_index{};
+        size_t way_index{};
+        if (Entry* entry = Find(address, size, set_index, way_index)) {
+            return *entry;
+        }
+        auto& set = sets[set_index];
+        for (auto& entry : set.ways) {
+            if (!entry.valid) {
+                return entry;
+            }
+        }
+        auto& entry = set.ways[set.next_replacement];
+        set.next_replacement = (set.next_replacement + 1) % WayCount;
+        return entry;
+    }
+
+    [[nodiscard]] u8* Shadow(size_t set_index, size_t way_index) noexcept {
+        return shadow.get() + (set_index * WayCount + way_index) * CACHING_PAGESIZE;
+    }
+
+    std::array<Set, SetCount> sets{};
+    std::unique_ptr<u8[]> shadow =
+        std::make_unique_for_overwrite<u8[]>(SetCount * WayCount * CACHING_PAGESIZE);
+    std::unique_ptr<u8[]> capture =
+        std::make_unique_for_overwrite<u8[]>(MaxStreamCopyRequests * CACHING_PAGESIZE);
+    std::array<Core::MemoryManager::SparseCopyRequest, MaxStreamCopyRequests> capture_copies{};
+    std::array<u16, MaxStreamCopyRequests> capture_canonicals{};
 };
 
 struct BufferCache::VertexIndexState {
@@ -212,19 +296,34 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
+      transient_read_buffer{instance, scheduler, MemoryUsage::Upload, UboStreamBufferSize},
       download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize},
       device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize},
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
+    Vulkan::SetObjectName(instance.GetDevice(), transient_read_buffer.Handle(),
+                          "Transient Read Stream");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     stream_copy_scratch = std::make_unique<StreamCopyScratch>();
     stream_slice_reuse = std::make_unique<StreamSliceReuseState>();
+    stream_batch_reuse = std::make_unique<StreamBatchReuseState>();
     vertex_index_state = std::make_unique<VertexIndexState>();
+
+    using Common::PerformanceTelemetry::RecordStagingMemoryTypeEnabled;
+    using Common::PerformanceTelemetry::StagingMemoryKind;
+    RecordStagingMemoryTypeEnabled(StagingMemoryKind::CurrentStream,
+                                   stream_buffer.MemoryTypeIndex(),
+                                   stream_buffer.MemoryHeapIndex(),
+                                   stream_buffer.MemoryPropertyFlags());
+    RecordStagingMemoryTypeEnabled(StagingMemoryKind::HostDirect,
+                                   transient_read_buffer.MemoryTypeIndex(),
+                                   transient_read_buffer.MemoryHeapIndex(),
+                                   transient_read_buffer.MemoryPropertyFlags());
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -300,8 +399,15 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     if (requests.empty()) {
         return;
     }
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    const bool telemetry_staging_sampled =
+        telemetry_enabled && Common::PerformanceTelemetry::ShouldSampleStagingBatchEnabled();
+    const auto telemetry_source = [](StreamCopySource source) noexcept {
+        return static_cast<Common::PerformanceTelemetry::StagingSource>(source);
+    };
 
     auto& scratch = *stream_copy_scratch;
+    auto& reuse = *stream_batch_reuse;
     if (++scratch.hash_generation == 0) {
         for (auto& slot : scratch.hash_table) {
             slot.generation = 0;
@@ -334,16 +440,149 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     };
 
     if (requests.size() == 1) {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingStreamSingle>
+            duration{telemetry_enabled};
         const auto& request = requests.front();
-        const auto [destination, offset] = stream_buffer.Map(request.size, request.alignment);
+        StreamBatchReuseState::Entry* reuse_entry{};
+        bool captured{};
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
+                reuse_duration{telemetry_enabled};
+            if (request.deduplicate && request.source_type == StreamCopySource::Guest &&
+                request.size <= CACHING_PAGESIZE) {
+                size_t set_index{};
+                size_t way_index{};
+                auto* entry =
+                    reuse.Find(request.guest_address, request.size, set_index, way_index);
+                if (entry != nullptr &&
+                    entry->generation == transient_read_buffer.Generation() &&
+                    entry->tick == scheduler.CurrentTick() &&
+                    entry->offset % request.alignment == 0) {
+                    reuse_entry = entry;
+                    if (entry->cooldown != 0) {
+                        --entry->cooldown;
+                        if (telemetry_staging_sampled) {
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::
+                                    StagingReuseCooldownSkips,
+                                1);
+                        }
+                    } else {
+                        const Core::MemoryManager::SparseCopyRequest copy{
+                            .source = request.guest_address,
+                            .destination = reuse.capture.get(),
+                            .size = request.size,
+                        };
+                        {
+                            Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                                Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                            memory->CopySparseMemoryBatch(
+                                std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
+                                request.size, telemetry_enabled, telemetry_staging_sampled, false);
+                        }
+                        captured = true;
+                        if (!entry->shadow_valid) {
+                            entry->mismatch_streak = 0;
+                            if (telemetry_staging_sampled) {
+                                Common::PerformanceTelemetry::AddEnabled(
+                                    Common::PerformanceTelemetry::Counter::StagingReuseWarmups,
+                                    1);
+                                Common::PerformanceTelemetry::AddEnabled(
+                                    Common::PerformanceTelemetry::Counter::
+                                        StagingReuseWarmupBytes,
+                                    request.size);
+                            }
+                        } else {
+                            if (telemetry_staging_sampled) {
+                                Common::PerformanceTelemetry::AddEnabled(
+                                    Common::PerformanceTelemetry::Counter::
+                                        StagingReuseCandidates,
+                                    1);
+                                Common::PerformanceTelemetry::AddEnabled(
+                                    Common::PerformanceTelemetry::Counter::
+                                        StagingReuseCandidateBytes,
+                                    request.size);
+                            }
+                            if (std::memcmp(reuse.capture.get(),
+                                            reuse.Shadow(set_index, way_index),
+                                            request.size) == 0) {
+                                entry->mismatch_streak = 0;
+                                entry->cooldown = 0;
+                                results.front() = {
+                                    .buffer = &transient_read_buffer,
+                                    .offset = entry->offset,
+                                };
+                                if (telemetry_enabled) {
+                                    Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+                                        Common::PerformanceTelemetry::StagingSite::StreamSingle,
+                                        0);
+                                    Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+                                        Common::PerformanceTelemetry::StagingSite::StreamSingle,
+                                        telemetry_source(request.source_type), request.size);
+                                    Common::PerformanceTelemetry::RecordStagingBackendEnabled(
+                                        Common::PerformanceTelemetry::StagingBackend::HostDirect,
+                                        0);
+                                    if (telemetry_staging_sampled) {
+                                        Common::PerformanceTelemetry::AddEnabled(
+                                            Common::PerformanceTelemetry::Counter::
+                                                StagingReuseHits,
+                                            1);
+                                        Common::PerformanceTelemetry::AddEnabled(
+                                            Common::PerformanceTelemetry::Counter::
+                                                StagingReuseAvoidedBytes,
+                                            request.size);
+                                    }
+                                }
+                                return;
+                            }
+                            if (++entry->mismatch_streak >=
+                                StreamBatchReuseState::MismatchThreshold) {
+                                entry->mismatch_streak = 0;
+                                entry->cooldown = StreamBatchReuseState::CooldownLength;
+                            }
+                            if (telemetry_staging_sampled) {
+                                Common::PerformanceTelemetry::AddEnabled(
+                                    Common::PerformanceTelemetry::Counter::
+                                        StagingReuseMismatches,
+                                    1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const auto [destination, offset] =
+            transient_read_buffer.Map(request.size, request.alignment);
         if (destination == nullptr) [[unlikely]] {
             ValidateStreamCopyDestination(destination);
         }
-        Common::PerformanceTelemetry::Add(
-            Common::PerformanceTelemetry::Counter::StagingBytes, request.size);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+                Common::PerformanceTelemetry::StagingSite::StreamSingle, request.size);
+            Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+                Common::PerformanceTelemetry::StagingSite::StreamSingle,
+                telemetry_source(request.source_type), request.size);
+        }
         switch (request.source_type) {
         case StreamCopySource::Guest:
-            memory->CopySparseMemory(request.guest_address, destination, request.size);
+            if (captured) {
+                std::memcpy(destination, reuse.capture.get(), request.size);
+            } else {
+                const Core::MemoryManager::SparseCopyRequest copy{
+                    .source = request.guest_address,
+                    .destination = destination,
+                    .size = request.size,
+                };
+                {
+                    Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                        Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                    memory->CopySparseMemoryBatch(
+                        std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
+                        request.size, telemetry_enabled, telemetry_staging_sampled);
+                }
+            }
             break;
         case StreamCopySource::Host:
             std::memcpy(destination, request.host_address, request.size);
@@ -352,144 +591,426 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             std::memset(destination, 0, request.size);
             break;
         }
-        stream_buffer.Commit();
-        results.front() = {.buffer = &stream_buffer, .offset = offset};
+        transient_read_buffer.Commit();
+        if (request.deduplicate && request.source_type == StreamCopySource::Guest &&
+            request.size <= CACHING_PAGESIZE) {
+            if (reuse_entry == nullptr) {
+                reuse_entry = &reuse.Select(request.guest_address, request.size);
+                reuse_entry->mismatch_streak = 0;
+                reuse_entry->cooldown = 0;
+            }
+            const size_t set_index =
+                StreamBatchReuseState::SetIndex(request.guest_address, request.size);
+            const size_t way_index =
+                reuse_entry == &reuse.sets[set_index].ways[0] ? 0 : 1;
+            *reuse_entry = {
+                .address = request.guest_address,
+                .generation = transient_read_buffer.Generation(),
+                .tick = scheduler.CurrentTick(),
+                .size = static_cast<u32>(request.size),
+                .offset = static_cast<u32>(offset),
+                .mismatch_streak = reuse_entry->mismatch_streak,
+                .cooldown = reuse_entry->cooldown,
+                .shadow_valid = captured,
+                .valid = true,
+            };
+            if (captured) {
+                std::memcpy(reuse.Shadow(set_index, way_index), reuse.capture.get(),
+                            request.size);
+            }
+        }
+        results.front() = {.buffer = &transient_read_buffer, .offset = offset};
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordStagingBackendEnabled(
+                Common::PerformanceTelemetry::StagingBackend::HostDirect, request.size);
+        }
         return;
     }
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StagingStreamBatch>
+        batch_duration{telemetry_enabled};
 
+    Common::PerformanceTelemetry::StagingBatchSample batch_sample{
+        .requests = static_cast<u32>(requests.size()),
+    };
     u16 canonical_count = 0;
     const bool use_hash = requests.size() > 4;
-    for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
-        const auto& request = requests[request_index];
-        auto& mapping = scratch.request_map[request_index];
-        mapping = {};
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingBatchDeduplicate>
+            deduplicate_duration{telemetry_enabled};
+        for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
+            const auto& request = requests[request_index];
+            auto& mapping = scratch.request_map[request_index];
+            mapping = {};
+            if (telemetry_staging_sampled) {
+                batch_sample.requested_bytes += request.size;
+            }
 
-        s32 canonical_index = -1;
-        if (request.deduplicate && request.source_type != StreamCopySource::Zero) {
-            if (use_hash) {
-                size_t slot_index = hash_request(request);
-                for (size_t probe = 0; probe < StreamCopyScratch::HashTableSize; ++probe) {
-                    const auto& slot = scratch.hash_table[slot_index];
-                    if (slot.generation != scratch.hash_generation) {
-                        break;
+            s32 canonical_index = -1;
+            if (request.deduplicate && request.source_type != StreamCopySource::Zero) {
+                if (use_hash) {
+                    size_t slot_index = hash_request(request);
+                    for (size_t probe = 0; probe < StreamCopyScratch::HashTableSize; ++probe) {
+                        const auto& slot = scratch.hash_table[slot_index];
+                        if (slot.generation != scratch.hash_generation) {
+                            break;
+                        }
+                        if (equivalent(scratch.canonical_copies[slot.canonical].request,
+                                       request)) {
+                            canonical_index = slot.canonical;
+                            break;
+                        }
+                        slot_index =
+                            (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
                     }
-                    if (equivalent(scratch.canonical_copies[slot.canonical].request, request)) {
-                        canonical_index = slot.canonical;
-                        break;
+                } else {
+                    for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
+                        if (equivalent(scratch.canonical_copies[candidate].request, request)) {
+                            canonical_index = candidate;
+                            break;
+                        }
                     }
-                    slot_index = (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
                 }
-            } else {
-                for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
-                    if (equivalent(scratch.canonical_copies[candidate].request, request)) {
+
+                if (canonical_index >= 0) {
+                    if (telemetry_staging_sampled) {
+                        ++batch_sample.exact_reuses;
+                    }
+                } else {
+                    const u64 request_start = source_key(request);
+                    for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
+                        auto& canonical = scratch.canonical_copies[candidate].request;
+                        if (!canonical.deduplicate ||
+                            canonical.source_type != request.source_type ||
+                            canonical.source_type == StreamCopySource::Zero) {
+                            continue;
+                        }
+                        const u64 canonical_start = source_key(canonical);
+                        if (request_start < canonical_start) {
+                            continue;
+                        }
+                        const u64 source_offset = request_start - canonical_start;
+                        if (source_offset > canonical.size ||
+                            request.size > canonical.size - source_offset ||
+                            source_offset % request.alignment != 0) {
+                            continue;
+                        }
+                        canonical.alignment = std::max(canonical.alignment, request.alignment);
                         canonical_index = candidate;
+                        mapping.source_offset = static_cast<u32>(source_offset);
+                        if (telemetry_staging_sampled) {
+                            ++batch_sample.subrange_reuses;
+                        }
                         break;
                     }
                 }
             }
 
             if (canonical_index < 0) {
-                const u64 request_start = source_key(request);
-                for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
-                    auto& canonical = scratch.canonical_copies[candidate].request;
-                    if (!canonical.deduplicate || canonical.source_type != request.source_type ||
-                        canonical.source_type == StreamCopySource::Zero) {
-                        continue;
+                canonical_index = canonical_count++;
+                auto& canonical = scratch.canonical_copies[canonical_index];
+                canonical = {.request = request, .relative_offset = 0};
+                if (use_hash && request.deduplicate &&
+                    request.source_type != StreamCopySource::Zero) {
+                    size_t slot_index = hash_request(request);
+                    while (scratch.hash_table[slot_index].generation ==
+                           scratch.hash_generation) {
+                        slot_index =
+                            (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
                     }
-                    const u64 canonical_start = source_key(canonical);
-                    if (request_start < canonical_start) {
-                        continue;
-                    }
-                    const u64 source_offset = request_start - canonical_start;
-                    if (source_offset > canonical.size ||
-                        request.size > canonical.size - source_offset ||
-                        source_offset % request.alignment != 0) {
-                        continue;
-                    }
-                    canonical.alignment = std::max(canonical.alignment, request.alignment);
-                    canonical_index = candidate;
-                    mapping.source_offset = static_cast<u32>(source_offset);
-                    break;
+                    scratch.hash_table[slot_index] = {
+                        .generation = scratch.hash_generation,
+                        .canonical = static_cast<u16>(canonical_index),
+                    };
+                }
+            } else {
+                auto& canonical = scratch.canonical_copies[canonical_index].request;
+                canonical.alignment = std::max(canonical.alignment, request.alignment);
+            }
+            mapping.canonical = static_cast<u16>(canonical_index);
+        }
+    }
+
+    const u64 reuse_generation = transient_read_buffer.Generation();
+    const u64 reuse_tick = scheduler.CurrentTick();
+    u16 reuse_candidate_count{};
+    u64 reuse_capture_size{};
+    u16 provisional_reuse_hits{};
+    u64 provisional_reuse_bytes{};
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
+            reuse_duration{telemetry_enabled};
+        for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+            auto& canonical = scratch.canonical_copies[canonical_index];
+            const auto& request = canonical.request;
+            if (telemetry_staging_sampled) {
+                batch_sample.canonical_bytes += request.size;
+            }
+            if (!request.deduplicate || request.source_type != StreamCopySource::Guest ||
+                request.size > CACHING_PAGESIZE) {
+                continue;
+            }
+
+            size_t set_index{};
+            size_t way_index{};
+            auto* entry = reuse.Find(request.guest_address, request.size, set_index, way_index);
+            if (entry == nullptr || entry->generation != reuse_generation ||
+                entry->tick != reuse_tick || entry->offset % request.alignment != 0) {
+                continue;
+            }
+            canonical.reuse_set = static_cast<u16>(set_index);
+            canonical.reuse_way = static_cast<u8>(way_index);
+            if (entry->cooldown != 0) {
+                --entry->cooldown;
+                if (telemetry_staging_sampled) {
+                    ++batch_sample.reuse_cooldown_skips;
+                }
+                continue;
+            }
+
+            canonical.capture_offset = static_cast<u32>(reuse_capture_size);
+            canonical.captured = true;
+            canonical.compare_candidate = entry->shadow_valid;
+            reuse.capture_canonicals[reuse_candidate_count] = canonical_index;
+            reuse.capture_copies[reuse_candidate_count++] = {
+                .source = request.guest_address,
+                .destination = reuse.capture.get() + reuse_capture_size,
+                .size = request.size,
+            };
+            reuse_capture_size += request.size;
+            if (telemetry_staging_sampled) {
+                ++batch_sample.guest_copies;
+                batch_sample.guest_bytes += request.size;
+                if (canonical.compare_candidate) {
+                    ++batch_sample.reuse_candidates;
+                    batch_sample.reuse_candidate_bytes += request.size;
+                } else {
+                    ++batch_sample.reuse_warmups;
+                    batch_sample.reuse_warmup_bytes += request.size;
                 }
             }
         }
 
-        if (canonical_index < 0) {
-            canonical_index = canonical_count++;
-            auto& canonical = scratch.canonical_copies[canonical_index];
-            canonical = {.request = request, .relative_offset = 0};
-            if (use_hash && request.deduplicate && request.source_type != StreamCopySource::Zero) {
-                size_t slot_index = hash_request(request);
-                while (scratch.hash_table[slot_index].generation == scratch.hash_generation) {
-                    slot_index = (slot_index + 1) & (StreamCopyScratch::HashTableSize - 1);
-                }
-                scratch.hash_table[slot_index] = {
-                    .generation = scratch.hash_generation,
-                    .canonical = static_cast<u16>(canonical_index),
-                };
-            }
-        } else {
-            auto& canonical = scratch.canonical_copies[canonical_index].request;
-            canonical.alignment = std::max(canonical.alignment, request.alignment);
+        {
+            Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+            memory->CopySparseMemoryBatch(
+                std::span<const Core::MemoryManager::SparseCopyRequest>{reuse.capture_copies.data(),
+                                                                         reuse_candidate_count},
+                reuse_capture_size, telemetry_enabled, telemetry_staging_sampled, false);
         }
-        mapping.canonical = static_cast<u16>(canonical_index);
+        for (u16 candidate = 0; candidate < reuse_candidate_count; ++candidate) {
+            auto& canonical =
+                scratch.canonical_copies[reuse.capture_canonicals[candidate]];
+            auto& entry = reuse.sets[canonical.reuse_set].ways[canonical.reuse_way];
+            const auto size = canonical.request.size;
+            const auto* captured = reuse.capture.get() + canonical.capture_offset;
+            if (!canonical.compare_candidate) {
+                entry.mismatch_streak = 0;
+                continue;
+            }
+            if (std::memcmp(captured,
+                            reuse.Shadow(canonical.reuse_set, canonical.reuse_way), size) == 0) {
+                canonical.reused = true;
+                canonical.absolute_offset = entry.offset;
+                entry.mismatch_streak = 0;
+                entry.cooldown = 0;
+                ++provisional_reuse_hits;
+                provisional_reuse_bytes += size;
+            } else {
+                if (++entry.mismatch_streak >= StreamBatchReuseState::MismatchThreshold) {
+                    entry.mismatch_streak = 0;
+                    entry.cooldown = StreamBatchReuseState::CooldownLength;
+                }
+                if (telemetry_staging_sampled) {
+                    ++batch_sample.reuse_mismatches;
+                }
+            }
+        }
     }
 
     u64 total_size = 0;
     u64 max_alignment = 1;
-    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-        auto& canonical = scratch.canonical_copies[canonical_index];
-        max_alignment = std::max(max_alignment, canonical.request.alignment);
-        total_size = Common::AlignUp(total_size, canonical.request.alignment);
-        canonical.relative_offset = total_size;
-        total_size += canonical.request.size;
-    }
+    const auto layout_copies = [&] {
+        total_size = 0;
+        max_alignment = 1;
+        for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+            auto& canonical = scratch.canonical_copies[canonical_index];
+            if (canonical.reused) {
+                continue;
+            }
+            max_alignment = std::max(max_alignment, canonical.request.alignment);
+            total_size = Common::AlignUp(total_size, canonical.request.alignment);
+            canonical.relative_offset = total_size;
+            total_size += canonical.request.size;
+        }
+    };
+    u8* destination{};
+    u64 base_offset{};
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingBatchLayout>
+            layout_duration{telemetry_enabled};
+        layout_copies();
+        if (total_size != 0) {
+            std::tie(destination, base_offset) =
+                transient_read_buffer.Map(total_size, max_alignment);
+        }
 
-    const auto [destination, base_offset] = stream_buffer.Map(total_size, max_alignment);
-    if (destination == nullptr) [[unlikely]] {
+        if (provisional_reuse_hits != 0 &&
+            (transient_read_buffer.Generation() != reuse_generation ||
+             scheduler.CurrentTick() != reuse_tick)) {
+            if (telemetry_staging_sampled) {
+                batch_sample.reuse_invalidations += provisional_reuse_hits;
+            }
+            for (u16 canonical_index = 0; canonical_index < canonical_count;
+                 ++canonical_index) {
+                scratch.canonical_copies[canonical_index].reused = false;
+            }
+            provisional_reuse_hits = 0;
+            provisional_reuse_bytes = 0;
+            layout_copies();
+            std::tie(destination, base_offset) =
+                transient_read_buffer.Map(total_size, max_alignment);
+        }
+    }
+    if (total_size != 0 && destination == nullptr) [[unlikely]] {
         ValidateStreamCopyDestination(destination);
     }
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
-                                      total_size);
+    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+        auto& canonical = scratch.canonical_copies[canonical_index];
+        if (!canonical.reused) {
+            canonical.absolute_offset = base_offset + canonical.relative_offset;
+        }
+    }
 
     u16 guest_copy_count = 0;
     u64 guest_copy_size = 0;
-    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-        const auto& canonical = scratch.canonical_copies[canonical_index];
-        u8* const copy_destination = destination + canonical.relative_offset;
-        switch (canonical.request.source_type) {
-        case StreamCopySource::Guest:
-            scratch.guest_copies[guest_copy_count++] = Core::MemoryManager::SparseCopyRequest{
-                .source = canonical.request.guest_address,
-                .destination = copy_destination,
-                .size = canonical.request.size,
-            };
-            guest_copy_size += canonical.request.size;
-            break;
-        case StreamCopySource::Host:
-            std::memcpy(copy_destination, canonical.request.host_address, canonical.request.size);
-            break;
-        case StreamCopySource::Zero:
-            std::memset(copy_destination, 0, canonical.request.size);
-            break;
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingBatchCopy>
+            copy_duration{telemetry_enabled};
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::StagingBatchRequestPrepare>
+                request_prepare_duration{telemetry_enabled};
+            for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+                const auto& canonical = scratch.canonical_copies[canonical_index];
+                if (canonical.reused) {
+                    continue;
+                }
+                const auto size = canonical.request.size;
+                u8* const copy_destination = destination + canonical.relative_offset;
+                switch (canonical.request.source_type) {
+                case StreamCopySource::Guest:
+                    if (canonical.captured) {
+                        std::memcpy(copy_destination,
+                                    reuse.capture.get() + canonical.capture_offset, size);
+                    } else {
+                        scratch.guest_copies[guest_copy_count++] =
+                            Core::MemoryManager::SparseCopyRequest{
+                                .source = canonical.request.guest_address,
+                                .destination = copy_destination,
+                                .size = size,
+                            };
+                        guest_copy_size += size;
+                        if (telemetry_staging_sampled) {
+                            ++batch_sample.guest_copies;
+                            batch_sample.guest_bytes += size;
+                        }
+                    }
+                    break;
+                case StreamCopySource::Host:
+                    std::memcpy(copy_destination, canonical.request.host_address, size);
+                    if (telemetry_staging_sampled) {
+                        ++batch_sample.host_copies;
+                        batch_sample.host_bytes += size;
+                    }
+                    break;
+                case StreamCopySource::Zero:
+                    std::memset(copy_destination, 0, size);
+                    if (telemetry_staging_sampled) {
+                        ++batch_sample.zero_copies;
+                        batch_sample.zero_bytes += size;
+                    }
+                    break;
+                }
+            }
+        }
+        {
+            Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+            memory->CopySparseMemoryBatch(
+                std::span<const Core::MemoryManager::SparseCopyRequest>{scratch.guest_copies.data(),
+                                                                         guest_copy_count},
+                guest_copy_size, telemetry_enabled, telemetry_staging_sampled);
+        }
+        if (total_size != 0) {
+            transient_read_buffer.Commit();
         }
     }
-    memory->CopySparseMemoryBatch(
-        std::span<const Core::MemoryManager::SparseCopyRequest>{scratch.guest_copies.data(),
-                                                                guest_copy_count},
-        guest_copy_size);
-    stream_buffer.Commit();
 
-    for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
-        const auto& mapping = scratch.request_map[request_index];
-        if (mapping.canonical == StreamCopyScratch::NoCanonicalCopy) [[unlikely]] {
-            ValidateStreamCopyMapping(mapping.canonical, StreamCopyScratch::NoCanonicalCopy);
+    const u64 committed_generation = transient_read_buffer.Generation();
+    const u64 committed_tick = scheduler.CurrentTick();
+    for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
+        const auto& canonical = scratch.canonical_copies[canonical_index];
+        const auto& request = canonical.request;
+        if (canonical.reused || !request.deduplicate ||
+            request.source_type != StreamCopySource::Guest ||
+            request.size > CACHING_PAGESIZE) {
+            continue;
         }
-        const auto& canonical = scratch.canonical_copies[mapping.canonical];
-        results[request_index] = {
-            .buffer = &stream_buffer,
-            .offset = base_offset + canonical.relative_offset + mapping.source_offset,
-        };
+
+        StreamBatchReuseState::Entry* entry{};
+        if (canonical.reuse_way != StreamBatchReuseState::NoWay) {
+            entry = &reuse.sets[canonical.reuse_set].ways[canonical.reuse_way];
+        } else {
+            entry = &reuse.Select(request.guest_address, request.size);
+            entry->mismatch_streak = 0;
+            entry->cooldown = 0;
+        }
+        entry->address = request.guest_address;
+        entry->generation = committed_generation;
+        entry->tick = committed_tick;
+        entry->size = static_cast<u32>(request.size);
+        entry->offset = static_cast<u32>(canonical.absolute_offset);
+        entry->shadow_valid = canonical.captured;
+        entry->valid = true;
+        if (canonical.captured) {
+            std::memcpy(reuse.Shadow(canonical.reuse_set, canonical.reuse_way),
+                        reuse.capture.get() + canonical.capture_offset, request.size);
+        }
+    }
+
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingBatchResults>
+            results_duration{telemetry_enabled};
+        for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
+            const auto& mapping = scratch.request_map[request_index];
+            if (mapping.canonical == StreamCopyScratch::NoCanonicalCopy) [[unlikely]] {
+                ValidateStreamCopyMapping(mapping.canonical, StreamCopyScratch::NoCanonicalCopy);
+            }
+            const auto& canonical = scratch.canonical_copies[mapping.canonical];
+            results[request_index] = {
+                .buffer = &transient_read_buffer,
+                .offset = canonical.absolute_offset + mapping.source_offset,
+            };
+        }
+    }
+    if (telemetry_enabled) {
+        batch_sample.canonical_copies = canonical_count;
+        batch_sample.allocated_bytes = total_size;
+        if (telemetry_staging_sampled) {
+            batch_sample.reuse_hits += provisional_reuse_hits;
+            batch_sample.reuse_avoided_bytes += provisional_reuse_bytes;
+        }
+        Common::PerformanceTelemetry::RecordStagingBackendEnabled(
+            Common::PerformanceTelemetry::StagingBackend::HostDirect, total_size);
+        Common::PerformanceTelemetry::RecordStagingBatchEnabled(batch_sample,
+                                                                 telemetry_staging_sampled);
     }
 }
 
@@ -657,7 +1178,7 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
             ValidateVertexRangeSize(size);
         }
         range.size = static_cast<u32>(size);
-        range.was_gpu_modified = IsRegionGpuModified(range.base_address, size);
+        range.was_gpu_modified = HasGpuReadSource(range.base_address, size);
         if (!range.was_gpu_modified && size <= CACHING_PAGESIZE) {
             range.stream_index = QueueStreamCopy(StreamCopyRequest{
                 .source_type = StreamCopySource::Guest,
@@ -678,7 +1199,7 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
     index.type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
     index.address = regs.index_base_address.Address<VAddr>() + index_offset * index_size;
     index.size = regs.num_indices * index_size;
-    index.was_gpu_modified = IsRegionGpuModified(index.address, index.size);
+    index.was_gpu_modified = HasGpuReadSource(index.address, index.size);
     if (index.size != 0 && !index.was_gpu_modified && index.size <= CACHING_PAGESIZE) {
         index.stream_index = QueueStreamCopy(StreamCopyRequest{
             .source_type = StreamCopySource::Guest,
@@ -909,7 +1430,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (!IsRegionGpuModified(address, num_bytes)) {
+        if (!HasGpuReadSource(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
             return;
@@ -926,8 +1447,8 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
-        if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
+    if (!dst_gds && !HasGpuReadSource(dst, num_bytes)) {
+        if (!src_gds && !HasGpuReadSource(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
@@ -1023,75 +1544,36 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
-        if (size == 0) {
-            const u64 offset =
-                stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-            return {&stream_buffer, static_cast<u32>(offset)};
-        }
-
-        auto& reuse = *stream_slice_reuse;
-        u64 hash = device_addr ^ (static_cast<u64>(size) << 32);
-        hash ^= hash >> 33;
-        hash *= 0xff51afd7ed558ccdULL;
-        hash ^= hash >> 33;
-        const size_t set_index = static_cast<size_t>(hash) & (StreamSliceReuseState::SetCount - 1);
-        auto& set = reuse.sets[set_index];
-
-        memory->CopySparseMemory(device_addr, reuse.scratch.data(), size);
-        StreamSliceReuseState::Entry* replacement{};
-        size_t replacement_way{};
-        for (size_t way = 0; way < StreamSliceReuseState::WayCount; ++way) {
-            auto& entry = set.ways[way];
-            if (entry.valid && entry.address == device_addr && entry.size == size) {
-                if (entry.generation == stream_buffer.Generation() &&
-                    entry.tick == scheduler.CurrentTick() &&
-                    std::memcmp(reuse.Shadow(set_index, way), reuse.scratch.data(), size) == 0) {
-                    Common::PerformanceTelemetry::Add(
-                        Common::PerformanceTelemetry::Counter::StreamSliceHits);
-                    return {&stream_buffer, entry.offset};
-                }
-                replacement = &entry;
-                replacement_way = way;
-                break;
-            }
-            if (!entry.valid && replacement == nullptr) {
-                replacement = &entry;
-                replacement_way = way;
+    if (!is_written && size <= CACHING_PAGESIZE && !HasGpuReadSource(device_addr, size)) {
+        Common::PerformanceTelemetry::CheckGuestSourceConsume(
+            device_addr, size, Common::PerformanceTelemetry::CurrentProducerSeq(),
+            Common::PerformanceTelemetry::CurrentPacketSeq(),
+            Common::PerformanceTelemetry::ResourceType::Buffer, 0,
+            Common::PerformanceTelemetry::GuestSourceConsumePath::StreamBufferCopy);
+        u64 offset = 0;
+        {
+            Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+            const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
+                device_addr, size,
+                Common::PerformanceTelemetry::GuestSourceConsumePath::StreamBufferCopy,
+                Common::PerformanceTelemetry::ResourceType::Buffer, 0);
+            if (resolved) {
+                offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
             }
         }
-        if (replacement == nullptr) {
-            replacement_way = set.next_replacement;
-            set.next_replacement = (set.next_replacement + 1) % StreamSliceReuseState::WayCount;
-            replacement = &set.ways[replacement_way];
-        }
-
-        const auto [destination, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
-        ASSERT(destination != nullptr);
-        Common::PerformanceTelemetry::Add(
-            Common::PerformanceTelemetry::Counter::StreamSliceMisses);
-        Common::PerformanceTelemetry::Add(
-            Common::PerformanceTelemetry::Counter::StagingBytes, size);
-        std::memcpy(destination, reuse.scratch.data(), size);
-        stream_buffer.Commit();
-        std::memcpy(reuse.Shadow(set_index, replacement_way), reuse.scratch.data(), size);
-        *replacement = {
-            .address = device_addr,
-            .generation = stream_buffer.Generation(),
-            .tick = scheduler.CurrentTick(),
-            .size = size,
-            .offset = static_cast<u32>(offset),
-            .valid = true,
-        };
         return {&stream_buffer, static_cast<u32>(offset)};
     }
-    if (IsBufferInvalid(buffer_id)) {
+    if (IsBufferInvalid(buffer_id) || pending_image_readback_ranges.Contains(device_addr, size)) {
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        if (buffer.has_image_alias && image_alias_ranges.Intersects(device_addr, size)) {
+            texture_cache.InvalidateMemoryFromGPU(device_addr, size);
+        }
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
@@ -1106,13 +1588,38 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
         }
     }
     // If some buffer within was GPU modified create a full buffer to avoid losing GPU data.
-    if (IsRegionGpuModified(gpu_addr, size)) {
+    if (HasGpuReadSource(gpu_addr, size)) {
         return ObtainBuffer(gpu_addr, size, false, false);
     }
     // In all other cases, just do a CPU copy to the staging buffer.
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StagingImage>
+        duration{telemetry_enabled};
     const auto [data, offset] = staging_buffer.Map(size, instance.StorageMinAlignment());
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes, size);
-    memory->CopySparseMemory(gpu_addr, data, size);
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+            Common::PerformanceTelemetry::StagingSite::Image, size);
+        Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+            Common::PerformanceTelemetry::StagingSite::Image,
+            Common::PerformanceTelemetry::StagingSource::Guest, size);
+    }
+    Common::PerformanceTelemetry::CheckGuestSourceConsume(
+        gpu_addr, size, Common::PerformanceTelemetry::CurrentProducerSeq(),
+        Common::PerformanceTelemetry::CurrentPacketSeq(),
+        Common::PerformanceTelemetry::ResourceType::Image, 0,
+        Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy);
+    {
+        Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+            Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+        const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
+            gpu_addr, size,
+            Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy,
+            Common::PerformanceTelemetry::ResourceType::Image, 0);
+        if (resolved) {
+            memory->CopySparseMemory(gpu_addr, data, size);
+        }
+    }
     staging_buffer.Commit();
     return {&staging_buffer, offset};
 }
@@ -1130,6 +1637,38 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
+bool BufferCache::HasGpuReadSource(VAddr addr, size_t size) {
+    if (pending_image_readback_ranges.Contains(addr, size) &&
+        texture_cache.FindImageContainingRange(addr, size)) {
+        return true;
+    }
+    return IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::TrackImageReadback(Image& image, u32 copy_size) {
+    const VAddr device_addr = image.info.guest_address;
+    if (image.info.props.is_tiled || image.info.resources.levels != 1 || device_addr == 0 ||
+        copy_size == 0 || copy_size > image.info.guest_size || (device_addr & 3) != 0) {
+        return false;
+    }
+
+    // Any persistent buffer for this range now contains an older image epoch. Keep the image as
+    // the authoritative source until a real buffer consumer synchronizes it through the normal
+    // cache path. This avoids creating/merging/deleting buffers while EOS is being recorded.
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, copy_size);
+    gpu_modified_ranges.Subtract(device_addr, copy_size);
+    pending_image_readback_ranges.Add(device_addr, copy_size);
+    image_alias_ranges.Add(device_addr, copy_size);
+    return true;
+}
+
+void BufferCache::CompleteImageReadback(VAddr addr, u32 size) {
+    pending_image_readback_ranges.Subtract(addr, size);
+    gpu_modified_ranges.Subtract(addr, size);
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size);
+    memory_tracker->MarkRegionAsCpuModified(addr, size);
+}
+
 bool BufferCache::IsBufferCacheEntryValid(BufferId id, u64 uid, VAddr address, u64 size) const {
     if (!id || !slot_buffers.is_allocated(id)) {
         return false;
@@ -1145,6 +1684,14 @@ u64 BufferCache::GetBufferUid(BufferId id) const {
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     ASSERT(device_addr != 0);
+    if (pending_image_readback_ranges.Contains(device_addr, size)) {
+        const ImageId image_id = texture_cache.FindImageContainingRange(device_addr, size);
+        if (image_id) {
+            const Image& image = texture_cache.GetImage(image_id);
+            device_addr = image.info.guest_address;
+            size = image.info.guest_size;
+        }
+    }
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {
@@ -1237,6 +1784,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
+    new_buffer.has_image_alias |= overlap.has_image_alias;
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -1296,6 +1844,7 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
     auto& new_buffer = slot_buffers[new_buffer_id];
+    new_buffer.has_image_alias = image_alias_ranges.Intersects(overlap.begin, size);
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
@@ -1356,6 +1905,16 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
+    if (pending_image_readback_ranges.Contains(device_addr, size) &&
+        SynchronizeBufferFromImage(buffer, device_addr, size)) {
+        return true;
+    }
+
+    VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
+        device_addr, size,
+        Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
+        Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid);
+
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -1408,10 +1967,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         });
         TouchBuffer(buffer);
     }
-    if (is_texel_buffer && !is_written) {
-        return SynchronizeBufferFromImage(buffer, device_addr, size);
-    }
-    return false;
+    return is_texel_buffer && !is_written && !IsRegionGpuModified(device_addr, size) &&
+           SynchronizeBufferFromImage(buffer, device_addr, size);
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -1419,14 +1976,38 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     if (copies.empty()) {
         return VK_NULL_HANDLE;
     }
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StagingUploadCopies>
+        duration{telemetry_enabled};
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
-                                      total_size_bytes);
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+            Common::PerformanceTelemetry::StagingSite::UploadCopies, total_size_bytes);
+        Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+            Common::PerformanceTelemetry::StagingSite::UploadCopies,
+            Common::PerformanceTelemetry::StagingSource::Guest, total_size_bytes);
+    }
     if (staging) {
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            Common::PerformanceTelemetry::CheckGuestSourceConsume(
+                device_addr, copy.size, Common::PerformanceTelemetry::CurrentProducerSeq(),
+                Common::PerformanceTelemetry::CurrentPacketSeq(),
+                Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid,
+                Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload);
+            {
+                Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                    Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
+                    device_addr, copy.size,
+                    Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
+                    Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid);
+                if (resolved) {
+                    memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                }
+            }
             // Apply the staging offset
             copy.srcOffset += offset;
         }
@@ -1442,7 +2023,22 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            Common::PerformanceTelemetry::CheckGuestSourceConsume(
+                device_addr, copy.size, Common::PerformanceTelemetry::CurrentProducerSeq(),
+                Common::PerformanceTelemetry::CurrentPacketSeq(),
+                Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid,
+                Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload);
+            {
+                Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                    Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
+                    device_addr, copy.size,
+                    Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
+                    Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid);
+                if (resolved) {
+                    memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                }
+            }
         }
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
@@ -1456,14 +2052,28 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         buffer.Fill(buffer.Offset(device_addr), size, ZmaskUncompressed);
         return true;
     }
-    const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
+    const bool pending_readback = pending_image_readback_ranges.Contains(device_addr, size);
+    const auto authority = GpuAuthorityTracker::Instance().GetAuthorityForRange(device_addr, size);
+    ImageId image_id{};
+    if (authority) {
+        if (!buffer.IsInBounds(authority->guest_begin, authority->download_size) ||
+            !texture_cache.IsGpuAuthorityImageCurrent(
+                static_cast<ImageId>(authority->image_id), authority->image_uid,
+                authority->resource_version, device_addr, size)) {
+            return false;
+        }
+        image_id = static_cast<ImageId>(authority->image_id);
+    } else {
+        image_id = pending_readback ? texture_cache.FindImageContainingRange(device_addr, size)
+                                    : texture_cache.FindImageFromRange(device_addr, size);
+    }
     if (!image_id) {
         return false;
     }
     Image& image = texture_cache.GetImage(image_id);
-    ASSERT_MSG(device_addr == image.info.guest_address,
-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
-               image.info.guest_address);
+    ASSERT_MSG(buffer.IsInBounds(image.info.guest_address, image.info.guest_size),
+               "Buffer does not contain aliased image {:x}:{:x}", image.info.guest_address,
+               image.info.guest_size);
     const u32 buf_offset = buffer.Offset(image.info.guest_address);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     u32 copy_size = 0;
@@ -1494,7 +2104,35 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    scheduler.EndRendering();
+    const auto dst_access = image.info.props.is_tiled ? vk::AccessFlagBits2::eShaderWrite
+                                                       : vk::AccessFlagBits2::eTransferWrite;
+    const auto dst_stage = image.info.props.is_tiled ? vk::PipelineStageFlagBits2::eComputeShader
+                                                      : vk::PipelineStageFlagBits2::eCopy;
+    if (const auto barrier = buffer.GetBarrier(dst_access, dst_stage, buf_offset)) {
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &*barrier,
+        });
+    }
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    Common::PerformanceTelemetry::RecordResourceLineage(Common::PerformanceTelemetry::ResourceLineageSample{
+        .source_resource_id = image.image_uid,
+        .source_resource_version = image.content_epoch,
+        .destination_resource_id = buffer.uid,
+        .destination_resource_version = 0,
+        .kind = Common::PerformanceTelemetry::ResourceLineageKind::GpuToGpu,
+    });
+#endif
+    const VAddr image_addr = image.info.guest_address;
+    memory_tracker->MarkRegionAsGpuModified(image_addr, copy_size);
+    gpu_modified_ranges.Add(image_addr, copy_size);
+    pending_image_readback_ranges.Subtract(image_addr, copy_size);
+    image_alias_ranges.Add(image_addr, copy_size);
+    buffer.has_image_alias = true;
     return true;
 }
 
@@ -1510,14 +2148,23 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StagingWriteData>
+        duration{telemetry_enabled};
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),
         .size = num_bytes,
     };
     vk::Buffer src_buffer = staging_buffer.Handle();
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::StagingBytes,
-                                      num_bytes);
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+            Common::PerformanceTelemetry::StagingSite::WriteData, num_bytes);
+        Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+            Common::PerformanceTelemetry::StagingSite::WriteData,
+            Common::PerformanceTelemetry::StagingSource::Host, num_bytes);
+    }
     if (num_bytes < StagingBufferSize) {
         const auto [staging, offset] = staging_buffer.Map(num_bytes);
         std::memcpy(staging, value, num_bytes);

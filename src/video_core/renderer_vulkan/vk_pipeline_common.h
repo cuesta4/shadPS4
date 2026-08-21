@@ -40,6 +40,12 @@ public:
         return *pipeline_layout;
     }
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    u64 DescriptorLayoutSignature() const noexcept {
+        return descriptor_layout_signature;
+    }
+#endif
+
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::LogicalStage::Compute) == Shader::MaxStageTypes - 1);
         if (is_compute) {
@@ -69,6 +75,10 @@ public:
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    void SetDescriptorLayoutSignature(
+        std::span<const vk::DescriptorSetLayoutBinding> bindings) noexcept;
+#endif
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -78,6 +88,9 @@ protected:
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    u64 descriptor_layout_signature{};
+#endif
     bool uses_push_descriptors{};
     bool is_compute;
 };

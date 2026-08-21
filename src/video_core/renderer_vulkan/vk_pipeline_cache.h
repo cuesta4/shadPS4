@@ -80,6 +80,7 @@ struct Program {
     u8 next_fetch_shader_slot{};
     bool specialization_plan_ready{};
     bool specialization_plan_cacheable{};
+    u8 specialization_plan_reasons{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)

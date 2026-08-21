@@ -121,6 +121,11 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     // Map it if it is host visible.
     VkMemoryPropertyFlags property_flags{};
     vmaGetAllocationMemoryProperties(instance->GetAllocator(), buffer.allocation, &property_flags);
+    memory_type_index = alloc_info.memoryType;
+    const auto& memory_properties = instance->GetMemoryProperties();
+    ASSERT(memory_type_index < memory_properties.memoryTypeCount);
+    memory_heap_index = memory_properties.memoryTypes[memory_type_index].heapIndex;
+    memory_property_flags = property_flags;
     if (alloc_info.pMappedData) {
         mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
     }
@@ -169,8 +174,8 @@ constexpr u64 WATCHES_RESERVE_CHUNK = 0x1000;
 StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                            MemoryUsage usage, u64 size_bytes)
     : Buffer{instance, scheduler, usage, 0, AllFlags, size_bytes} {
-    ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
-    ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
+    ReserveWatches(current_watches, current_watch_pins, WATCHES_INITIAL_RESERVE);
+    ReserveWatches(previous_watches, previous_watch_pins, WATCHES_INITIAL_RESERVE);
     const auto device = instance.GetDevice();
     Vulkan::SetObjectName(device, Handle(), "StreamBuffer({}):{:#x}", BufferTypeName(usage),
                           size_bytes);
@@ -200,6 +205,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);
+        std::swap(previous_watch_pins, current_watch_pins);
         wait_cursor = 0;
         wait_bound = 0;
     }
@@ -212,7 +218,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     return {mapped_data.data() + offset, offset};
 }
 
-void StreamBuffer::Commit() {
+void StreamBuffer::Commit(StreamBufferPinHandle pin) {
     if (!is_coherent) {
         if (usage == MemoryUsage::Download) {
             vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset,
@@ -223,24 +229,37 @@ void StreamBuffer::Commit() {
     }
 
     offset += mapped_size;
-    if (current_watch_cursor != 0 &&
-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
-        current_watches[current_watch_cursor].upper_bound = offset;
+    if (current_watch_cursor != 0 && !pin &&
+        (current_watch_pins.empty() || !current_watch_pins[current_watch_cursor - 1]) &&
+        current_watches[current_watch_cursor - 1].tick == scheduler->CurrentTick()) {
+        current_watches[current_watch_cursor - 1].upper_bound = offset;
         return;
     }
 
     if (current_watch_cursor + 1 >= current_watches.size()) {
         // Ensure that there are enough watches.
-        ReserveWatches(current_watches, WATCHES_RESERVE_CHUNK);
+        ReserveWatches(current_watches, current_watch_pins, WATCHES_RESERVE_CHUNK);
     }
 
-    auto& watch = current_watches[current_watch_cursor++];
+    if (pin && current_watch_pins.empty()) {
+        current_watch_pins.resize(current_watches.size());
+    }
+    const size_t watch_index = current_watch_cursor++;
+    auto& watch = current_watches[watch_index];
     watch.upper_bound = offset;
     watch.tick = scheduler->CurrentTick();
+    if (!current_watch_pins.empty()) {
+        current_watch_pins[watch_index] = std::move(pin);
+    }
 }
 
-void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
+void StreamBuffer::ReserveWatches(std::vector<Watch>& watches,
+                                  std::vector<StreamBufferPinHandle>& pins,
+                                  std::size_t grow_size) {
     watches.resize(watches.size() + grow_size);
+    if (!pins.empty()) {
+        pins.resize(watches.size());
+    }
 }
 
 bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_wait) {
@@ -249,10 +268,22 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        if (!scheduler->IsFree(watch.tick) && !allow_wait) {
+        auto pin = previous_watch_pins.empty() ? StreamBufferPinHandle{}
+                                               : previous_watch_pins[wait_cursor];
+        if ((!scheduler->IsFree(watch.tick) ||
+             (pin && !pin->IsReleased())) &&
+            !allow_wait) {
             return false;
         }
-        scheduler->Wait(watch.tick);
+        scheduler->Wait(watch.tick,
+                        Common::PerformanceTelemetry::HostWaitReason::StreamBufferReuse);
+        if (pin) {
+            pin->Reclaim();
+            if (!pin->IsReleased()) {
+                return false;
+            }
+            previous_watch_pins[wait_cursor].reset();
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

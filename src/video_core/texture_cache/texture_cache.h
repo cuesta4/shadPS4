@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -15,6 +16,7 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/performance_telemetry.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
@@ -31,6 +33,7 @@ struct Liverpool;
 namespace VideoCore {
 
 class BufferCache;
+struct GpuAuthorityShadow;
 class PageManager;
 
 class TextureCache {
@@ -78,6 +81,49 @@ public:
             : info{group, cpu_address}, type{BindingType::VideoOut} {}
     };
 
+    enum class DownloadPolicy : u8 {
+        LegacyEager,
+        AuthorityManaged,
+    };
+
+    enum class DownloadTrigger : u8 {
+        EventWriteEos,
+        EventWriteEop,
+        ReleaseMem,
+        ExplicitHostDemand,
+        CpuRead,
+        Unmap,
+        Other,
+    };
+
+    struct DownloadContext {
+        DownloadTrigger trigger{DownloadTrigger::Other};
+        u64 fence_seq{0};
+        u32 trigger_control{0};
+        u32 trigger_data_control{0};
+    };
+
+    struct PendingImageDownload {
+        u64 pending_seq{0};
+        ImageId image_id{0};
+        u64 image_uid{0};
+        u64 resource_id{0};
+        u64 resource_version{0};
+        VAddr guest_begin{0};
+        u32 size{0};
+        DownloadPolicy policy{DownloadPolicy::LegacyEager};
+    };
+
+    struct PendingFastpathCandidate {
+        ImageId image_id{0};
+        u64 image_uid{0};
+        u64 resource_version{0};
+        VAddr guest_addr{0};
+        u32 download_size{0};
+        u64 producer_seq{0};
+        Common::PerformanceTelemetry::PacketSeq producer_packet_seq{0};
+    };
+
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
@@ -97,7 +143,28 @@ public:
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Schedules a copy of pending images for download back to CPU memory.
-    bool ProcessDownloadImages();
+    bool ProcessDownloadImages(const DownloadContext& context, bool* gpu_resident = nullptr);
+
+    bool ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
+                               u32 trigger_control = 0, u32 trigger_data_control = 0,
+                               bool* gpu_resident = nullptr);
+
+    [[nodiscard]] bool PromotePendingDownloadAuthority(ImageId image_id, u64 image_uid,
+                                                        u64 resource_version,
+                                                        std::shared_ptr<GpuAuthorityShadow>* shadow);
+    void PruneSupersededPendingDownloads(u64 image_uid, u64 superseded_version);
+    void ScheduleComputeDownload(ImageId image_id);
+
+    [[nodiscard]] std::optional<PendingFastpathCandidate> TakePendingFastpathCandidate();
+
+    [[nodiscard]] bool IsGpuAuthorityImageCurrent(ImageId image_id, u64 image_uid,
+                                                  u64 resource_version, VAddr address,
+                                                  size_t size);
+
+    void WaitGpuAuthorityShadow(const std::shared_ptr<GpuAuthorityShadow>& shadow);
+    bool MaterializeGpuAuthority(const std::shared_ptr<GpuAuthorityShadow>& shadow,
+                                 VAddr required_addr, size_t required_size,
+                                 s8* out_validation_bytes_equal = nullptr);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -111,8 +178,11 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// Retrieves the smallest valid image that fully contains the provided range.
+    [[nodiscard]] ImageId FindImageContainingRange(VAddr address, size_t size);
+
     /// Retrieves an image view with the properties of the specified image id.
-    void PrepareTexture(ImageId image_id, const ImageDesc& desc);
+    void PrepareTexture(ImageId image_id, const ImageDesc& desc, bool is_compute = false);
 
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
@@ -128,6 +198,9 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::ImageUpdate>
+            duration;
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
@@ -294,7 +367,8 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    bool DownloadImageMemory(ImageId image_id, bool validate_identity = false);
+    bool DownloadImageMemory(ImageId image_id, bool validate_identity = false,
+                             bool track_gpu_source = false, bool* gpu_resident = nullptr);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -368,7 +442,8 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
-    std::unordered_set<ImageId> download_images;
+    std::vector<PendingImageDownload> pending_downloads;
+    u64 next_pending_download_seq{1};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
@@ -384,9 +459,11 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    std::recursive_mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
+    mutable std::mutex fastpath_candidate_mutex;
+    std::optional<PendingFastpathCandidate> pending_fastpath_candidate;
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;

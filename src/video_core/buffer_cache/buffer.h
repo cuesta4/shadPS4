@@ -8,9 +8,11 @@
 #include <utility>
 #include <vector>
 #include "common/incremental_id.h"
+#include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/buffer_cache/stream_buffer_pin.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -130,6 +132,18 @@ public:
         return buffer.bda_addr;
     }
 
+    [[nodiscard]] u32 MemoryTypeIndex() const noexcept {
+        return memory_type_index;
+    }
+
+    [[nodiscard]] u32 MemoryHeapIndex() const noexcept {
+        return memory_heap_index;
+    }
+
+    [[nodiscard]] u32 MemoryPropertyFlags() const noexcept {
+        return memory_property_flags;
+    }
+
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
@@ -148,6 +162,26 @@ public:
             .offset = offset,
             .size = size_bytes - offset,
         };
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (Common::PerformanceTelemetry::HasActiveReadbackSourceWatch(uid, 0)) {
+            Common::PerformanceTelemetry::RecordResourceBarrierLink(Common::PerformanceTelemetry::ResourceBarrierLinkSample{
+                .resource_id = uid,
+                .resource_version = 0,
+                .fence_seq = 0,
+                .readback_seq = 0,
+                .cmd_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .submit_seq = 0,
+                .old_layout = 0,
+                .new_layout = 0,
+                .src_stage = static_cast<u64>(stage),
+                .src_access = static_cast<u64>(access_mask),
+                .dst_stage = static_cast<u64>(dst_stage),
+                .dst_access = static_cast<u64>(dst_acess_mask),
+                .subresource_or_range = offset,
+                .reason_path = "buffer_barrier",
+            });
+        }
+#endif
         access_mask = dst_acess_mask;
         stage = dst_stage;
         return barrier;
@@ -160,6 +194,7 @@ public:
     bool is_picked{};
     bool is_coherent{};
     bool is_deleted{};
+    bool has_image_alias{};
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
@@ -175,6 +210,9 @@ public:
     vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
 
 private:
+    u32 memory_type_index{};
+    u32 memory_heap_index{};
+    u32 memory_property_flags{};
     static Common::IncrementalIdProvider<u64> global_uid;
 };
 
@@ -187,7 +225,7 @@ public:
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
     /// Ensures that reserved bytes of memory are available to the GPU.
-    void Commit();
+    void Commit(StreamBufferPinHandle pin = {});
 
     /// Returns the ring-buffer generation. It changes whenever allocations wrap to offset zero.
     [[nodiscard]] u64 Generation() const noexcept {
@@ -215,7 +253,8 @@ private:
     };
 
     /// Increases the amount of watches available.
-    void ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size);
+    void ReserveWatches(std::vector<Watch>& watches, std::vector<StreamBufferPinHandle>& pins,
+                        std::size_t grow_size);
 
     /// Waits pending watches until requested upper bound.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
@@ -225,9 +264,11 @@ private:
     u64 mapped_size{};
     u64 generation{1};
     std::vector<Watch> current_watches;
+    std::vector<StreamBufferPinHandle> current_watch_pins;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;
     std::vector<Watch> previous_watches;
+    std::vector<StreamBufferPinHandle> previous_watch_pins;
     std::size_t wait_cursor{};
     u64 wait_bound{};
 };

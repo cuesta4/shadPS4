@@ -75,7 +75,10 @@ void ResolveResourceList(const DescriptorList& descriptors, ResourceList& resour
 
 void ResolveStageResources(Shader::Info& info,
                            const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader,
-                           ResolvedStageResources& resolved) {
+                           ResolvedStageResources& resolved, bool telemetry_enabled) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StageResolve>
+        resolve_duration{telemetry_enabled, static_cast<u32>(info.l_stage)};
     ResolveResourceList(info.buffers, resolved.buffers, info);
     ResolveResourceList(info.images, resolved.images, info);
     ResolveResourceList(info.samplers, resolved.samplers, info);
@@ -94,48 +97,65 @@ bool BuildSpecializationPlan(Program& program) {
     }
     program.specialization_plan_ready = true;
     const auto& info = program.info;
-    program.specialization_plan_cacheable = !info.srt_info.walker_func &&
-                                            info.l_stage != LogicalStage::TessellationControl &&
-                                            info.l_stage != LogicalStage::TessellationEval;
+    using Reason = Common::PerformanceTelemetry::StageUncacheableReason;
+    u32 reasons{};
+    if (info.srt_info.walker_func) {
+        reasons |= static_cast<u32>(Reason::SrtWalker);
+    }
+    if (info.l_stage == LogicalStage::TessellationControl) {
+        reasons |= static_cast<u32>(Reason::TessellationControl);
+    }
+    if (info.l_stage == LogicalStage::TessellationEval) {
+        reasons |= static_cast<u32>(Reason::TessellationEvaluation);
+    }
     const auto valid_range = [](u32 first, u32 dwords) {
         return first + dwords <= Shader::ShaderParams::NumShaderUserData;
     };
-    if (program.specialization_plan_cacheable) {
-        for (const auto& resource : info.buffers) {
-            program.specialization_plan_cacheable &=
-                static_cast<bool>(resource.inline_cbuf) ||
-                valid_range(resource.sharp_idx, sizeof(AmdGpu::Buffer) / sizeof(u32));
-        }
-        for (const auto& resource : info.images) {
-            program.specialization_plan_cacheable &=
-                valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32));
-        }
-        for (const auto& resource : info.samplers) {
-            program.specialization_plan_cacheable &=
-                resource.is_inline_sampler ||
-                valid_range(resource.sharp_idx, sizeof(AmdGpu::Sampler) / sizeof(u32));
-        }
-        for (const auto& resource : info.fmasks) {
-            program.specialization_plan_cacheable &=
-                valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32));
-        }
-        if (info.has_fetch_shader) {
-            program.specialization_plan_cacheable &= valid_range(info.fetch_shader_sgpr_base, 2);
+    for (const auto& resource : info.buffers) {
+        if (!resource.inline_cbuf &&
+            !valid_range(resource.sharp_idx, sizeof(AmdGpu::Buffer) / sizeof(u32))) {
+            reasons |= static_cast<u32>(Reason::DescriptorOutsideUserData);
         }
     }
+    for (const auto& resource : info.images) {
+        if (!valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32))) {
+            reasons |= static_cast<u32>(Reason::DescriptorOutsideUserData);
+        }
+    }
+    for (const auto& resource : info.samplers) {
+        if (!resource.is_inline_sampler &&
+            !valid_range(resource.sharp_idx, sizeof(AmdGpu::Sampler) / sizeof(u32))) {
+            reasons |= static_cast<u32>(Reason::DescriptorOutsideUserData);
+        }
+    }
+    for (const auto& resource : info.fmasks) {
+        if (!valid_range(resource.sharp_idx, sizeof(AmdGpu::Image) / sizeof(u32))) {
+            reasons |= static_cast<u32>(Reason::DescriptorOutsideUserData);
+        }
+    }
+    if (info.has_fetch_shader && !valid_range(info.fetch_shader_sgpr_base, 2)) {
+        reasons |= static_cast<u32>(Reason::FetchPointerOutsideUserData);
+    }
+    program.specialization_plan_reasons = static_cast<u8>(reasons);
+    program.specialization_plan_cacheable = reasons == 0;
     return program.specialization_plan_cacheable;
 }
 
 void RefreshDynamicProgramData(
     Shader::Info& info, VAddr program_base,
-    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data) {
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data,
+    bool telemetry_enabled) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StageRefresh>
+        refresh_duration{telemetry_enabled, static_cast<u32>(info.l_stage)};
     info.pgm_base = program_base;
     info.user_data = user_data;
-    info.RefreshFlatBuf();
+    info.RefreshFlatBuf(telemetry_enabled);
 }
 
-void RefreshDynamicProgramData(Shader::Info& info, const Shader::ShaderParams& params) {
-    RefreshDynamicProgramData(info, params.Base(), params.user_data);
+void RefreshDynamicProgramData(Shader::Info& info, const Shader::ShaderParams& params,
+                               bool telemetry_enabled) {
+    RefreshDynamicProgramData(info, params.Base(), params.user_data, telemetry_enabled);
 }
 
 struct CachedFetchShader {
@@ -1549,18 +1569,27 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
     auto& program = *program_it.value();
     auto& info = program.info;
-    RefreshDynamicProgramData(info, params);
+    RefreshDynamicProgramData(info, params, opt.telemetry_enabled);
     const auto cached_fetch_shader = GetCachedFetchShader(program);
-    ResolveStageResources(info, cached_fetch_shader.parsed, program.resolved_resources);
+    ResolveStageResources(info, cached_fetch_shader.parsed, program.resolved_resources,
+                          opt.telemetry_enabled);
 
-    const bool cacheable =
-        BuildSpecializationPlan(program) && cached_fetch_shader.IsUsable(info);
+    const bool plan_cacheable = BuildSpecializationPlan(program);
+    const bool fetch_shader_usable = cached_fetch_shader.IsUsable(info);
+    const bool cacheable = plan_cacheable && fetch_shader_usable;
     if (cacheable) {
         const size_t current_permutation = program.current_permutation;
         if (current_permutation < program.modules.size()) [[likely]] {
             auto& module = program.modules[current_permutation];
-            if (MatchesCurrentSpecialization(module.spec, info, runtime_info, start,
-                                             cached_fetch_shader.parsed)) [[likely]] {
+            bool current_matches;
+            {
+                Common::PerformanceTelemetry::SampledDuration<
+                    Common::PerformanceTelemetry::TimerSite::StageCurrentMatch>
+                    match_duration{opt.telemetry_enabled, stage_index};
+                current_matches = MatchesCurrentSpecialization(
+                    module.spec, info, runtime_info, start, cached_fetch_shader.parsed);
+            }
+            if (current_matches) [[likely]] {
                 info.AddBindings(binding);
                 current_stage = {
                     .program = &program,
@@ -1576,9 +1605,15 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             }
         }
 
-        const size_t permutation = FindCachedPermutation(
-            program, info, runtime_info, start, cached_fetch_shader.parsed,
-            current_permutation, opt.telemetry_enabled);
+        size_t permutation;
+        {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::StageSearch>
+                search_duration{opt.telemetry_enabled, stage_index};
+            permutation = FindCachedPermutation(program, info, runtime_info, start,
+                                                cached_fetch_shader.parsed,
+                                                current_permutation, opt.telemetry_enabled);
+        }
         if (permutation != Program::InvalidPermutation) {
             auto& module = program.modules[permutation];
             program.current_permutation = permutation;
@@ -1596,8 +1631,12 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     HashCombine(params.hash, permutation)};
         }
     } else if (opt.telemetry_enabled) {
-        Common::PerformanceTelemetry::AddEnabled(
-            Common::PerformanceTelemetry::Counter::StageCacheUncacheable, 1);
+        using Reason = Common::PerformanceTelemetry::StageUncacheableReason;
+        u32 reasons = program.specialization_plan_reasons;
+        if (!fetch_shader_usable) {
+            reasons |= static_cast<u32>(Reason::FetchShaderUnavailable);
+        }
+        Common::PerformanceTelemetry::RecordStageUncacheableEnabled(stage_index, reasons);
     }
 
     if (opt.telemetry_enabled) {
@@ -1615,13 +1654,22 @@ SHAD_NO_INLINE PipelineCache::Result PipelineCache::GetProgramSlow(
     const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings& binding,
     const FetchShader* fetch_shader_) {
     auto& info = program.info;
-    if (optimization->telemetry_enabled) {
+    const bool telemetry_enabled = optimization->telemetry_enabled;
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::StageSlowPath>
+        slow_path_duration{telemetry_enabled, static_cast<u32>(l_stage)};
+    if (telemetry_enabled) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::StageSpecializationBuilds, 1);
     }
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding,
-                                            fetch_shader_);
+    auto spec = [&] {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StageSpecializationBuild>
+            specialization_duration{telemetry_enabled, static_cast<u32>(l_stage)};
+        return Shader::StageSpecialization(info, runtime_info, profile, binding, fetch_shader_);
+    }();
 
+    const size_t previous_permutation = program.current_permutation;
     size_t perm_idx = program.modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
@@ -1629,6 +1677,10 @@ SHAD_NO_INLINE PipelineCache::Result PipelineCache::GetProgramSlow(
 
     const auto it = std::ranges::find(program.modules, spec, &Program::Module::spec);
     if (it == program.modules.end()) [[unlikely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordStageSlowResultEnabled(
+                false, false, program.modules.size());
+        }
         module = CompilePermutation(program, stage, l_stage, params, runtime_info, binding,
                                     std::move(spec), perm_idx, perm_hash);
     } else {
@@ -1636,9 +1688,9 @@ SHAD_NO_INLINE PipelineCache::Result PipelineCache::GetProgramSlow(
         module = it->module;
         perm_idx = std::distance(program.modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
-        if (optimization->telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::StagePermutationHits, 1);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordStageSlowResultEnabled(
+                true, perm_idx == previous_permutation, perm_idx + 1);
         }
     }
     program.current_permutation = perm_idx;
@@ -1656,15 +1708,22 @@ SHAD_NO_INLINE PipelineCache::Result PipelineCache::CreateProgram(
     auto compile_runtime_info = runtime_info;
     const auto module =
         CompileModule(program.info, compile_runtime_info, params.code, 0, binding);
-    RefreshDynamicProgramData(program.info, params);
+    const bool telemetry_enabled = optimization->telemetry_enabled;
+    RefreshDynamicProgramData(program.info, params, telemetry_enabled);
     const auto cached_fetch_shader = GetCachedFetchShader(program);
-    ResolveStageResources(program.info, cached_fetch_shader.parsed, program.resolved_resources);
-    if (optimization->telemetry_enabled) {
+    ResolveStageResources(program.info, cached_fetch_shader.parsed, program.resolved_resources,
+                          telemetry_enabled);
+    if (telemetry_enabled) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::StageSpecializationBuilds, 1);
     }
-    auto spec = Shader::StageSpecialization(program.info, compile_runtime_info, profile, start,
-                                            cached_fetch_shader.parsed);
+    auto spec = [&] {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StageSpecializationBuild>
+            specialization_duration{telemetry_enabled, static_cast<u32>(l_stage)};
+        return Shader::StageSpecialization(program.info, compile_runtime_info, profile, start,
+                                           cached_fetch_shader.parsed);
+    }();
     const auto perm_hash = HashCombine(params.hash, 0);
 
     RegisterShaderMeta(program.info, spec.fetch_shader_data, spec, perm_hash, 0);

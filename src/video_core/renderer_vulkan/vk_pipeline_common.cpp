@@ -20,8 +20,32 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 
 Pipeline::~Pipeline() = default;
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+void Pipeline::SetDescriptorLayoutSignature(
+    std::span<const vk::DescriptorSetLayoutBinding> bindings) noexcept {
+    u64 signature = 0x9E3779B185EBCA87ULL;
+    const auto mix = [&signature](u64 value) {
+        signature ^= value + 0x9E3779B97F4A7C15ULL + (signature << 6) + (signature >> 2);
+    };
+    mix(bindings.size());
+    mix(is_compute);
+    mix(uses_push_descriptors);
+    for (const auto& binding : bindings) {
+        mix(binding.binding);
+        mix(static_cast<u32>(binding.descriptorType));
+        mix(binding.descriptorCount);
+        mix(static_cast<VkShaderStageFlags>(binding.stageFlags));
+        mix(binding.pImmutableSamplers != nullptr);
+    }
+    descriptor_layout_signature = signature;
+}
+#endif
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::DescriptorEmit>
+        emit_duration{Common::PerformanceTelemetry::Enabled()};
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;

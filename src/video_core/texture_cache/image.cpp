@@ -3,6 +3,8 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/performance_telemetry.h"
+#include "video_core/gpu_authority_tracker.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -356,6 +358,42 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         scheduler->EndRendering();
         cmdbuf = scheduler->CommandBuffer();
     }
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls,
+                                      barriers.size());
+    if (True(flags & ImageFlagBits::GpuModified) || usage.render_target || usage.depth_target) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::RenderTargetSyncBarriers, barriers.size());
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::RenderTargetTransitions, barriers.size());
+    }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (Common::PerformanceTelemetry::HasActiveReadbackSourceWatch(image_uid, content_epoch)) {
+        for (const auto& b : barriers) {
+            VideoCore::GpuAuthorityTracker::Instance().ValidateGpuConsumerBarrier(
+                image_uid, content_epoch, 0,
+                static_cast<u32>(b.oldLayout), static_cast<u32>(b.newLayout),
+                static_cast<u64>(b.srcStageMask), static_cast<u64>(b.srcAccessMask),
+                static_cast<u64>(b.dstStageMask), static_cast<u64>(b.dstAccessMask),
+                static_cast<u64>(b.subresourceRange.baseMipLevel) | (static_cast<u64>(b.subresourceRange.baseArrayLayer) << 32));
+            Common::PerformanceTelemetry::RecordResourceBarrierLink(Common::PerformanceTelemetry::ResourceBarrierLinkSample{
+                .resource_id = image_uid,
+                .resource_version = content_epoch,
+                .fence_seq = 0,
+                .readback_seq = 0,
+                .cmd_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .submit_seq = 0,
+                .old_layout = static_cast<u32>(b.oldLayout),
+                .new_layout = static_cast<u32>(b.newLayout),
+                .src_stage = static_cast<u64>(b.srcStageMask),
+                .src_access = static_cast<u64>(b.srcAccessMask),
+                .dst_stage = static_cast<u64>(b.dstStageMask),
+                .dst_access = static_cast<u64>(b.dstAccessMask),
+                .subresource_or_range = static_cast<u64>(b.subresourceRange.baseMipLevel) | (static_cast<u64>(b.subresourceRange.baseArrayLayer) << 32),
+                .reason_path = "image_transit",
+            });
+        }
+    }
+#endif
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
@@ -406,6 +444,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
     flags &= ~ImageFlagBits::Dirty;
+    MarkWrite(Common::PerformanceTelemetry::ImageWriter::CpuUpload);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
@@ -498,7 +537,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
     return std::make_pair(src_layers, dst_layers);
 }
 
-void Image::CopyImage(Image& src_image) {
+void Image::CopyImage(Image& src_image, Common::PerformanceTelemetry::ImageWriter writer) {
     const auto& src_info = src_image.info;
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
@@ -598,8 +637,19 @@ void Image::CopyImage(Image& src_image) {
 
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite(writer);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    Common::PerformanceTelemetry::RecordResourceLineage(Common::PerformanceTelemetry::ResourceLineageSample{
+        .source_resource_id = src_image.image_uid,
+        .source_resource_version = src_image.content_epoch,
+        .destination_resource_id = image_uid,
+        .destination_resource_version = content_epoch,
+        .kind = Common::PerformanceTelemetry::ResourceLineageKind::GpuToGpu,
+    });
+#endif
 }
-void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
+void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset,
+                                Common::PerformanceTelemetry::ImageWriter writer) {
     const auto& src_info = src_image.info;
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
@@ -677,9 +727,20 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
                              buffer_copies);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite(writer);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    Common::PerformanceTelemetry::RecordResourceLineage(Common::PerformanceTelemetry::ResourceLineageSample{
+        .source_resource_id = src_image.image_uid,
+        .source_resource_version = src_image.content_epoch,
+        .destination_resource_id = image_uid,
+        .destination_resource_version = content_epoch,
+        .kind = Common::PerformanceTelemetry::ResourceLineageKind::GpuToGpu,
+    });
+#endif
 }
 
-void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
+void Image::CopyMip(Image& src_image, u32 mip, u32 slice,
+                    Common::PerformanceTelemetry::ImageWriter writer) {
     const auto& src_info = src_image.info;
 
     const auto dst_dim = info.props.is_block ? 2 : 0;
@@ -722,10 +783,12 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
                      backing->state.layout, image_copy);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite(writer);
 }
 
 void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
-                    const VideoCore::SubresourceRange& mrt1_range) {
+                    const VideoCore::SubresourceRange& mrt1_range,
+                    Common::PerformanceTelemetry::ImageWriter writer) {
     SetBackingSamples(1, false);
     scheduler->EndRendering();
 
@@ -780,9 +843,11 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
 
     flags |= VideoCore::ImageFlagBits::GpuModified;
     flags &= ~VideoCore::ImageFlagBits::Dirty;
+    MarkWrite(writer);
 }
 
-void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {
+void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range,
+                  Common::PerformanceTelemetry::ImageWriter writer) {
     const vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,
@@ -795,6 +860,7 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
     const auto cmdbuf = scheduler->CommandBuffer();
     cmdbuf.clearColorImage(GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
+    MarkWrite(writer);
 }
 
 void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {

@@ -9,6 +9,7 @@
 #include <queue>
 #include <thread>
 
+#include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -46,7 +47,9 @@ public:
     void Refresh();
 
     /// Waits for a tick to be hit on the GPU
-    void Wait(u64 tick);
+    void Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason =
+                            Common::PerformanceTelemetry::HostWaitReason::Unknown,
+              const Common::PerformanceTelemetry::PendingOpTraceToken& trace = {});
 
 protected:
     friend class Scheduler;

@@ -73,6 +73,9 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    SetDescriptorLayoutSignature(bindings);
+#endif
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

@@ -9,6 +9,7 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
+#include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -63,8 +64,12 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
-    bool ReadMemory(VAddr addr, u64 size);
-    void NotifyMemoryWrite(VAddr addr, u64 size, VideoCore::MemoryWriteSource source);
+    bool ReadMemory(VAddr addr, u64 size, void* context = nullptr);
+    bool HandleWriteFaultOnReadWatchedPage(VAddr addr, u64 size, void* context);
+    void ArmSemanticReadWatch(VAddr addr, u64 size);
+    void DisarmSemanticReadWatch(VAddr addr, u64 size);
+    VideoCore::MemoryWriteNotifyResult NotifyMemoryWrite(VAddr addr, u64 size,
+                                                         VideoCore::MemoryWriteSource source);
     [[nodiscard]] VideoCore::MemoryWriteWatch ArmMemoryWriteWatch(
         VAddr addr, VideoCore::MemoryWriteCallback callback, void* user_data) {
         return page_manager.ArmWriteWatch(addr, callback, user_data);
@@ -72,14 +77,29 @@ public:
     bool CancelMemoryWriteWatch(VideoCore::MemoryWriteWatch watch) {
         return page_manager.CancelWriteWatch(watch);
     }
-    bool ProcessDownloadImages();
-    void DeferGpuCompletion(Common::UniqueFunction<void>&& callback);
+    bool ProcessDownloadImages(const VideoCore::TextureCache::DownloadContext& context,
+                               bool* gpu_resident = nullptr);
+    bool ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
+                               u32 trigger_control = 0, u32 trigger_data_control = 0,
+                               bool* gpu_resident = nullptr);
+    void WaitTick(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason =
+                                Common::PerformanceTelemetry::HostWaitReason::Unknown);
+    void DeferGpuCompletion(Common::UniqueFunction<void>&& callback,
+                            const Common::PerformanceTelemetry::PendingOpTraceToken& trace = {});
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
+    void AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size);
+    void FlushCaches(AmdGpu::EventType event_type);
+
     void CpSync();
-    u64 Flush();
+    void GpuFenceWait();
+    void FullGpuBarrier();
+    [[nodiscard]] u64 CurrentTick() const noexcept;
+    [[nodiscard]] u64 KnownGpuTick() const noexcept;
+    u64 Flush(Common::PerformanceTelemetry::SubmitReason reason =
+                  Common::PerformanceTelemetry::SubmitReason::Generic);
     void Finish();
     void OnSubmit();
 
@@ -119,6 +139,8 @@ private:
     void SynchronizeDmaBuffers();
     void BindPipelineResources(const Pipeline* pipeline);
     void CaptureDescriptorState(const Pipeline* pipeline);
+    void MarkImageWrites(Common::PerformanceTelemetry::ImageWriter writer,
+                         bool include_render_targets);
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -151,6 +173,8 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES>
+        potential_write_images;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
@@ -226,6 +250,9 @@ private:
         const Pipeline* pipeline{};
         vk::CommandBuffer command_buffer{};
         u64 push_descriptor_epoch{};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        u64 layout_signature{};
+#endif
         boost::container::static_vector<DescriptorWriteState,
                                         Shader::NUM_BUFFERS + Shader::NUM_IMAGES +
                                             Shader::NUM_SAMPLERS>

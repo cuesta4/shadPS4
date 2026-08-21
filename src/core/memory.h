@@ -253,7 +253,10 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     /// Copies a request batch whose sizes sum to total_size.
-    void CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests, u64 total_size);
+    void CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests, u64 total_size,
+                               bool telemetry_staging_batch = false,
+                               bool telemetry_staging_sampled = false,
+                               bool allow_non_temporal = true);
 
     bool TryWriteBacking(void* address, const void* data, u64 size,
                          MemoryWriteOrigin origin = MemoryWriteOrigin::CommandProcessor);
@@ -307,6 +310,21 @@ public:
     void InvalidateMemory(VAddr addr, u64 size) const;
 
 private:
+    struct SparseCopyStats {
+        u32 mapped_runs{};
+        u32 zero_runs{};
+        u32 non_temporal_runs{};
+        u64 mapped_bytes{};
+        u64 zero_bytes{};
+        u64 non_temporal_bytes{};
+    };
+
+    [[nodiscard]] bool ResolveMappedSpan(VAddr source, u64 size, VAddr& span_begin,
+                                         VAddr& span_end);
+    [[nodiscard]] bool CopySparseMemoryCold(const SparseCopyRequest& request,
+                                            bool allow_non_temporal,
+                                            SparseCopyStats* stats);
+
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
     }

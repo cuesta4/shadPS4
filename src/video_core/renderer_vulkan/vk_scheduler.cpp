@@ -30,6 +30,9 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    Common::PerformanceTelemetry::SampledDuration<
+        Common::PerformanceTelemetry::TimerSite::SchedulerBeginRendering>
+        duration;
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -92,31 +95,31 @@ void Scheduler::EndRendering() {
     current_cmdbuf.endRendering();
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
+void Scheduler::Flush(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason) {
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    SubmitExecution(info, reason);
 }
 
-void Scheduler::Flush() {
+void Scheduler::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
     SubmitInfo info{};
-    Flush(info);
+    Flush(info, reason);
 }
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
-    SubmitExecution(info);
-    Wait(presubmit_tick);
+    SubmitExecution(info, Common::PerformanceTelemetry::SubmitReason::Finish);
+    Wait(presubmit_tick, Common::PerformanceTelemetry::HostWaitReason::SchedulerFinish);
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason) {
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
-        Flush(info);
+        Flush(info, Common::PerformanceTelemetry::SubmitReason::WaitProgress);
     }
-    master_semaphore.Wait(tick);
+    master_semaphore.Wait(tick, reason);
 }
 
 void Scheduler::PopPendingOperations() {
@@ -166,11 +169,14 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
 
+    Common::PerformanceTelemetry::NextCmdBufferSeq();
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::DynamicStateInvalidations);
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -182,8 +188,12 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
+void Scheduler::SubmitExecution(SubmitInfo& info,
+                                Common::PerformanceTelemetry::SubmitReason reason) {
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    const u64 wait_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+    std::unique_lock lk{submit_mutex};
+    const u64 lock_acquired = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
     const u64 signal_value = master_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -225,11 +235,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     master_semaphore.TelemetrySubmit(signal_value);
+    const u64 driver_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
     const auto submit_result = [&] {
         Common::PerformanceTelemetry::ScopedDuration submit_duration{
             Common::PerformanceTelemetry::Counter::DriverSubmitNs};
         return instance.GetGraphicsQueue().submit(submit_info, info.fence);
     }();
+    const u64 driver_end = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     master_semaphore.Refresh();
@@ -237,13 +249,45 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+    if (telemetry_enabled) {
+        const u64 post_end = Common::PerformanceTelemetry::Timestamp();
+        lk.unlock();
+        Common::PerformanceTelemetry::RecordSubmitTimingEnabled(
+            reason, lock_acquired - wait_start, driver_start - lock_acquired,
+            driver_end - driver_start, post_end - driver_end, post_end - lock_acquired);
+        Common::PerformanceTelemetry::RecordEnabled(
+            Common::PerformanceTelemetry::EventType::VulkanSubmit, static_cast<u64>(reason),
+            signal_value);
+
+        const auto cur_cmdbuf = Common::PerformanceTelemetry::CurrentCmdBufferSeq();
+        const auto submit_seq = Common::PerformanceTelemetry::NextSubmitSeq();
+        Common::PerformanceTelemetry::RegisterSubmitTick(signal_value, submit_seq);
+        Common::PerformanceTelemetry::RegisterCmdBufferSubmit(cur_cmdbuf, submit_seq);
+        Common::PerformanceTelemetry::PromotePendingReadbacksOnSubmit(cur_cmdbuf, submit_seq, signal_value);
+        const u64 gpu_tick_val = master_semaphore.KnownGpuTick();
+        const u64 ahead_ticks = signal_value > gpu_tick_val ? signal_value - gpu_tick_val : 0;
+        Common::PerformanceTelemetry::RecordSubmitRecord(Common::PerformanceTelemetry::SubmitRecordSample{
+            .submit_seq = submit_seq,
+            .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+            .reason = reason,
+            .signal_tick = signal_value,
+            .cpu_ahead_ticks = ahead_ticks,
+            .gpu_completed_tick = gpu_tick_val,
+            .scheduler_id = 0,
+            .queue_role = 0,
+            .cmd_buffer_seq = cur_cmdbuf,
+        });
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
 
+    std::vector<PendingOp> ready_ops;
     while (!stoken.stop_requested()) {
-        PendingOp op;
+        u64 wait_tick = 0;
+        Common::PerformanceTelemetry::PendingOpTraceToken trace{};
+        ready_ops.clear();
         {
             std::unique_lock lk(priority_pending_ops_mutex);
             priority_pending_ops_cv.wait(lk, stoken,
@@ -252,25 +296,48 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
                 break;
             }
 
-            op = std::move(priority_pending_ops.front());
-            priority_pending_ops.pop();
+            wait_tick = priority_pending_ops.front().gpu_tick;
+            trace = priority_pending_ops.front().trace;
         }
 
-        master_semaphore.Wait(op.gpu_tick);
+        const u64 wait_start = Common::PerformanceTelemetry::Timestamp();
+        master_semaphore.Wait(wait_tick, Common::PerformanceTelemetry::HostWaitReason::FenceCpuVisibility, trace);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::PriorityOpsWaitNs,
+                                          Common::PerformanceTelemetry::Timestamp() - wait_start);
         if (stoken.stop_requested()) {
             break;
         }
 
-        op.callback();
+        const u64 completed_tick = master_semaphore.KnownGpuTick();
+        {
+            std::unique_lock lk(priority_pending_ops_mutex);
+            while (!priority_pending_ops.empty() &&
+                   priority_pending_ops.front().gpu_tick <= completed_tick) {
+                ready_ops.emplace_back(std::move(priority_pending_ops.front()));
+                priority_pending_ops.pop();
+            }
+        }
+
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::PriorityOpsDrainCount,
+                                          ready_ops.size());
+        const u64 exec_start = Common::PerformanceTelemetry::Timestamp();
+        for (auto& op : ready_ops) {
+            op.callback();
+        }
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::PriorityOpsExecuteNs,
+                                          Common::PerformanceTelemetry::Timestamp() - exec_start);
     }
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     if (dirty_bits == 0) [[likely]] {
-        Common::PerformanceTelemetry::Add(
-            Common::PerformanceTelemetry::Counter::DynamicStateEmptyCommits);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordDynamicCommitEnabled(0, 0);
+        }
         return;
     }
+    const u32 dirty_before = dirty_bits;
 
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
@@ -427,6 +494,19 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
                                                       ? vk::ImageAspectFlagBits::eColor
                                                       : vk::ImageAspectFlagBits::eNone);
+    }
+    if (telemetry_enabled) {
+        constexpr auto GroupMask = [](u32 bits) {
+            u32 groups{};
+            groups |= static_cast<u32>((bits & 0x00000003u) != 0) << 0;
+            groups |= static_cast<u32>((bits & 0x0003FFFCu) != 0) << 1;
+            groups |= static_cast<u32>((bits & 0x00040000u) != 0) << 2;
+            groups |= static_cast<u32>((bits & 0x01380000u) != 0) << 3;
+            groups |= static_cast<u32>((bits & 0x02C00000u) != 0) << 4;
+            return groups;
+        };
+        Common::PerformanceTelemetry::RecordDynamicCommitEnabled(
+            GroupMask(dirty_before), GroupMask(dirty_before & ~dirty_bits));
     }
 }
 

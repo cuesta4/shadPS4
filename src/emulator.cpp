@@ -48,6 +48,10 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
+#if defined(SHADPS4_ULTRA_PROFILE)
+#include <profile/instr_prof_interface.h>
+#endif
+
 #ifdef _WIN32
 #include <WinSock2.h>
 #endif
@@ -68,6 +72,13 @@ namespace Core {
 
 std::mutex exit_mutex{};
 
+#if defined(SHADPS4_ULTRA_PROFILE)
+void DumpLLVMProfileAtQuickExit() noexcept {
+    const int result = __llvm_profile_dump();
+    LOG_INFO(Common, "LLVM profile dump before quick_exit: {}", result == 0 ? "ok" : "failed");
+}
+#endif
+
 Emulator::Emulator() {
     // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
@@ -80,6 +91,9 @@ Emulator::Emulator() {
     WSAStartup(versionWanted, &wsaData);
 #endif
     std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
+#if defined(SHADPS4_ULTRA_PROFILE)
+    std::at_quick_exit(DumpLLVMProfileAtQuickExit);
+#endif
 }
 
 Emulator::~Emulator() {}

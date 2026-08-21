@@ -107,7 +107,8 @@ void MasterSemaphore::Refresh() {
     }
 }
 
-void MasterSemaphore::Wait(u64 tick) {
+void MasterSemaphore::Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason,
+                          const Common::PerformanceTelemetry::PendingOpTraceToken& trace) {
     // No need to wait if the GPU is ahead of the tick
     if (IsFree(tick)) {
         return;
@@ -117,6 +118,12 @@ void MasterSemaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
+
+    const u64 start_ns = Common::PerformanceTelemetry::Timestamp();
+    const u64 gpu_tick_before = KnownGpuTick();
+    const u64 cpu_tick_val = CurrentTick();
+    const u64 queue_depth = cpu_tick_val > gpu_tick_before ? cpu_tick_val - gpu_tick_before : 0;
+    const auto wait_seq = Common::PerformanceTelemetry::NextWaitSeq();
 
     // If none of the above is hit, fallback to a regular wait
     const vk::SemaphoreWaitInfo wait_info = {
@@ -132,6 +139,22 @@ void MasterSemaphore::Wait(u64 tick) {
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
     }
     Refresh();
+
+    const u64 duration_ns = Common::PerformanceTelemetry::Timestamp() - start_ns;
+    Common::PerformanceTelemetry::RecordHostWait(Common::PerformanceTelemetry::HostWaitSample{
+        .wait_seq = wait_seq,
+        .reason = reason,
+        .requested_tick = tick,
+        .current_gpu_tick_before = gpu_tick_before,
+        .cpu_tick = cpu_tick_val,
+        .queue_depth_estimate = queue_depth,
+        .start_ns = start_ns,
+        .duration_ns = duration_ns,
+        .fence_seq = trace.fence_seq,
+        .readback_seq = trace.readback_seq,
+        .submit_seq = trace.submit_seq,
+        .packet_seq = trace.packet_seq,
+    });
 }
 
 } // namespace Vulkan
