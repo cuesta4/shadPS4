@@ -1330,7 +1330,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
-      optimization{std::make_unique<OptimizationState>()} {
+      optimization{std::make_unique<OptimizationState>()},
+      async_shader_recompiling{EmulatorSettings.IsAsyncShaderRecompiling()} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
@@ -1515,10 +1516,16 @@ SHAD_NO_INLINE const GraphicsPipeline* PipelineCache::CreateGraphicsPipeline() {
     }
 
     const bool telemetry_enabled = optimization->telemetry_enabled;
+    const bool compile_async = async_shader_recompiling;
     std::packaged_task<std::unique_ptr<GraphicsPipeline>()> build_task{
-        [this, build = std::move(build), pipeline_hash, telemetry_enabled]() mutable {
-            LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} asynchronously",
-                     pipeline_hash);
+        [this, build = std::move(build), pipeline_hash, telemetry_enabled,
+         compile_async]() mutable {
+            if (compile_async) {
+                LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} asynchronously",
+                         pipeline_hash);
+            } else {
+                LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+            }
             auto compile_stages = build->BindCompileStages();
             GraphicsPipeline::SerializationSupport sdata{};
             Common::PerformanceTelemetry::ScopedDuration compile_duration{
@@ -1537,11 +1544,6 @@ SHAD_NO_INLINE const GraphicsPipeline* PipelineCache::CreateGraphicsPipeline() {
             return pipeline;
         }};
     auto future = build_task.get_future();
-    const bool is_new =
-        pending_graphics_pipelines.try_emplace(graphics_key, std::move(future)).second;
-    ASSERT(is_new);
-    QueueGraphicsPipelineTask(std::packaged_task<void()>{
-        [task = std::move(build_task)]() mutable { task(); }});
     ++num_new_pipelines;
 
     if (EmulatorSettings.IsShaderCollect()) {
@@ -1553,6 +1555,21 @@ SHAD_NO_INLINE const GraphicsPipeline* PipelineCache::CreateGraphicsPipeline() {
         }
     }
     fetch_shader = nullptr;
+
+    if (!compile_async) {
+        build_task();
+        auto pipeline = future.get();
+        const auto [it, is_new] =
+            graphics_pipelines.try_emplace(graphics_key, std::move(pipeline));
+        ASSERT(is_new);
+        return it.value().get();
+    }
+
+    const bool is_new =
+        pending_graphics_pipelines.try_emplace(graphics_key, std::move(future)).second;
+    ASSERT(is_new);
+    QueueGraphicsPipelineTask(std::packaged_task<void()>{
+        [task = std::move(build_task)]() mutable { task(); }});
     return nullptr;
 }
 
@@ -2148,7 +2165,7 @@ SHAD_NO_INLINE std::optional<PipelineCache::Result> PipelineCache::GetProgramSlo
 
     const auto it = std::ranges::find(program.modules, spec, &Program::Module::spec);
     if (it == program.modules.end()) [[unlikely]] {
-        if (stage != Stage::Compute) {
+        if (stage != Stage::Compute && async_shader_recompiling) {
             QueueProgramCompilation(program, stage, l_stage, params, runtime_info, binding,
                                     std::move(spec), perm_idx, perm_hash, false);
             return std::nullopt;
@@ -2177,7 +2194,7 @@ SHAD_NO_INLINE std::optional<PipelineCache::Result> PipelineCache::CreateProgram
     it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
     auto& program = *it_pgm.value();
     const auto perm_hash = HashCombine(params.hash, 0);
-    if (stage != Stage::Compute) {
+    if (stage != Stage::Compute && async_shader_recompiling) {
         QueueProgramCompilation(program, stage, l_stage, params, runtime_info, binding,
                                 std::nullopt, 0, perm_hash, true);
         return std::nullopt;

@@ -235,6 +235,7 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     std::unique_ptr<OptimizationState> optimization;
+    bool async_shader_recompiling{};
 
     static constexpr u32 NumGraphicsPipelineWorkers = 3;
     static constexpr u32 NumShaderModulePreferredWorkers = 2;
