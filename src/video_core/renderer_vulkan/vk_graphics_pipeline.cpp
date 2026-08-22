@@ -31,6 +31,7 @@ GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
+    std::span<const Shader::Info*, MaxShaderStages> runtime_stages,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
@@ -390,6 +391,7 @@ GraphicsPipeline::GraphicsPipeline(
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+    std::ranges::copy(runtime_stages, stages.begin());
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;

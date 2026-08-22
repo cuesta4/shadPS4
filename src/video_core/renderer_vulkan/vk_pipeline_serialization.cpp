@@ -8,13 +8,13 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 3u;
 static constexpr u32 ShaderMetaVersion = 3u;
-static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -165,6 +165,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
                                           compute_key, *infos[0], modules[0], sdata, true);
+    native_pipeline_cache_dirty.store(true, std::memory_order_release);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -238,8 +239,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     ASSERT(is_new);
 
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos, infos,
         runtime_infos, fetch_shader, modules, sdata, true);
+    native_pipeline_cache_dirty.store(true, std::memory_order_release);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -378,6 +380,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    SaveNativePipelineCache();
     Storage::DataBase::Instance().Close();
 }
 
