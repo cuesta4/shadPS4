@@ -57,6 +57,13 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+static SHAD_NO_INLINE void ValidateVertexInputPlanSize(size_t resolved_count,
+                                                       size_t plan_count) {
+    ASSERT_MSG(resolved_count == plan_count,
+               "Resolved vertex buffer count does not match vertex input plan: {} != {}",
+               resolved_count, plan_count);
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
@@ -443,9 +450,10 @@ void GraphicsPipeline::GetVertexInputs(
         return;
     }
     const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
-    ASSERT_MSG(vs_info.resolved_vertex_buffers.size() == vertex_input_plan.size(),
-               "Resolved vertex buffer count does not match vertex input plan: {} != {}",
-               vs_info.resolved_vertex_buffers.size(), vertex_input_plan.size());
+    if (vs_info.resolved_vertex_buffers.size() != vertex_input_plan.size()) [[unlikely]] {
+        ValidateVertexInputPlanSize(vs_info.resolved_vertex_buffers.size(),
+                                    vertex_input_plan.size());
+    }
     for (u32 attribute_index = 0; attribute_index < vertex_input_plan.size(); ++attribute_index) {
         const auto& attrib = vertex_input_plan[attribute_index];
         const auto step_rate = attrib.GetStepRate();

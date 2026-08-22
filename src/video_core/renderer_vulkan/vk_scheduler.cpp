@@ -118,6 +118,7 @@ void Scheduler::Wait(u64 tick) {
 }
 
 void Scheduler::PopPendingOperations() {
+    std::unique_lock lk(pending_ops_mutex);
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     if (pending_ops.empty()) [[likely]] {
         if (telemetry_enabled) {

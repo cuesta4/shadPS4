@@ -27,6 +27,7 @@ set(COMMON_TEST_SOURCES
     # Tests
     common/test_bit_array.cpp
     common/test_logging.cpp
+)
 
 set(SETTINGS_TEST_SOURCES
     # Under test

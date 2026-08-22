@@ -216,11 +216,9 @@ private:
     CachedImageView cached_depth_target_view{};
 
     struct DescriptorWriteState {
-        u32 binding{};
-        u32 array_element{};
-        u32 count{};
+        u64 key0{};
+        u64 key1{};
         u32 first_info{};
-        vk::DescriptorType type{};
         bool is_buffer{};
     };
 

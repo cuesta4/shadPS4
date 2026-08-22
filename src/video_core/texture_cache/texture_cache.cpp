@@ -1042,25 +1042,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     std::scoped_lock lock{mutex};
 
-    const ExactImageCacheKey exact_key{
-        .guest_address = info.guest_address,
-        .guest_size = info.guest_size,
-        .size = info.size,
-        .resources = info.resources,
-        .pixel_format = info.pixel_format,
-        .type = info.type,
-        .exact_format = exact_fmt,
-    };
-    const auto hash_key = [](const ExactImageCacheKey& key) {
-        u64 value = key.guest_address ^ (static_cast<u64>(key.guest_size) << 17);
-        value ^= static_cast<u64>(key.size.width) << 1;
-        value ^= static_cast<u64>(key.size.height) << 21;
-        value ^= static_cast<u64>(key.size.depth) << 41;
-        value ^= static_cast<u64>(key.resources.levels) << 9;
-        value ^= static_cast<u64>(key.resources.layers) << 29;
-        value ^= static_cast<u64>(key.pixel_format) << 45;
-        value ^= static_cast<u64>(key.type) * 0x9E3779B185EBCA87ULL;
-        value ^= static_cast<u64>(key.exact_format) << 63;
+    const ExactImageCacheKey exact_key{{
+        info.guest_address,
+        static_cast<u64>(info.guest_size) | (static_cast<u64>(info.size.width) << 32),
+        static_cast<u64>(info.size.height) | (static_cast<u64>(info.size.depth) << 32),
+        static_cast<u64>(info.resources.levels) |
+            (static_cast<u64>(info.resources.layers) << 32),
+        static_cast<u32>(info.pixel_format) | (static_cast<u64>(exact_fmt) << 32),
+        static_cast<u64>(info.type),
+    }};
+    const auto hash_key = [&] {
+        u64 value = info.guest_address ^ (static_cast<u64>(info.guest_size) << 17);
+        value ^= static_cast<u64>(info.size.width) << 1;
+        value ^= static_cast<u64>(info.size.height) << 21;
+        value ^= static_cast<u64>(info.size.depth) << 41;
+        value ^= static_cast<u64>(info.resources.levels) << 9;
+        value ^= static_cast<u64>(info.resources.layers) << 29;
+        value ^= static_cast<u64>(info.pixel_format) << 45;
+        value ^= static_cast<u64>(info.type) * 0x9E3779B185EBCA87ULL;
+        value ^= static_cast<u64>(exact_fmt) << 63;
         value ^= value >> 29;
         value *= 0x9E3779B185EBCA87ULL;
         value ^= value >> 32;
@@ -1075,9 +1075,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                !(cached_info.resources < info.resources);
     };
 
-    auto& exact_entry = exact_image_cache[hash_key(exact_key)];
+    auto& exact_entry = exact_image_cache[hash_key()];
     const u64 current_topology_epoch = topology_epoch.load(std::memory_order_relaxed);
-    if (exact_entry.valid && exact_entry.key == exact_key &&
+    if (exact_entry.valid &&
+        std::memcmp(exact_entry.key.words.data(), exact_key.words.data(),
+                    sizeof(ExactImageCacheKey)) == 0 &&
         exact_entry.topology_epoch == current_topology_epoch) {
         if (exact_entry.image_id && slot_images.is_allocated(exact_entry.image_id)) {
             auto& cached_image = slot_images[exact_entry.image_id];
@@ -1419,7 +1421,6 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
-
     AliasState* state{};
     bool inserted{};
     u32 aliases{};
@@ -1440,7 +1441,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
         image.flags |= ImageFlagBits::Aliased;
         state->members = inserted ? aliases + 1 : state->members + 1;
     }
-
+    image.lru_tick = gc_tick;
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
 }
@@ -1690,7 +1691,8 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
-void TextureCache::TouchImage(const Image& image) {
+void TextureCache::TouchImageSlow(Image& image) {
+    image.lru_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
 }
 

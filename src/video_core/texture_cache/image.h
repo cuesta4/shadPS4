@@ -189,6 +189,7 @@ public:
     std::shared_ptr<ImageReadbackToken> readback_token;
     u64 alias_generation{};
     u64 lru_id{};
+    u64 lru_tick{};
     u64 tick_accessed_last{};
     u64 hash{};
 
