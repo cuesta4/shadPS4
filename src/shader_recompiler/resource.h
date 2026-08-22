@@ -42,6 +42,10 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
+    bool IsStorage([[maybe_unused]] const AmdGpu::Buffer buffer) const noexcept {
+        return true;
+    }
+
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer{};
         if (inline_cbuf) {
@@ -97,11 +101,14 @@ struct ImageResource {
         return image;
     }
 
-    u32 NumBindings(const auto& info) const {
-        const AmdGpu::Image tsharp = GetSharp(info);
+    u32 NumBindings(const AmdGpu::Image& tsharp) const {
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        return NumBindings(GetSharp(info));
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;

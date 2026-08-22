@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <iostream>
+#include <memory>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <spdlog/details/fmt_helper.h>
@@ -25,6 +29,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 
 namespace Common::Log {
 extern bool g_should_append;
+extern std::atomic_bool g_is_enabled;
 extern std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS;
 
 void Setup(std::string_view shadps4_filename);
@@ -48,17 +53,31 @@ static constexpr std::array level_string_views{"Trace", "Debug",    "Info", "War
 [[nodiscard]] static constexpr std::string_view to_string_view(spdlog::level lvl) noexcept {
     return level_string_views.at(level_to_number(lvl));
 }
+
+[[nodiscard]] inline bool IsEnabled() noexcept {
+    return g_is_enabled.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline std::shared_ptr<spdlog::logger> GetLogger(
+    std::string_view log_class) noexcept {
+    const auto it = ALL_LOGGERS.find(log_class);
+    return it != ALL_LOGGERS.end() ? it->second : nullptr;
+}
 } // namespace Common::Log
 
 // Define the fmt lib macros
 #define LOG_GENERIC(log_class, log_level, format, ...)                                             \
     do {                                                                                           \
-        if (auto logger = Common::Log::ALL_LOGGERS[log_class]) {                                   \
-            logger->log(log_level, "[{}] <{}> ({}) {}:{} {}: " format, log_class,                  \
-                        Common::Log::to_string_view(log_level), Common::GetCurrentThreadName(),    \
-                        spdlog::source_loc::basename(__FILE__), __LINE__,                          \
-                        std::string_view(__func__) == "operator()" ? "lambda" : __func__,          \
-                        ##__VA_ARGS__);                                                            \
+        if (Common::Log::IsEnabled()) {                                                            \
+            if (const auto logger = Common::Log::GetLogger(log_class);                             \
+                logger != nullptr && logger->should_log(log_level)) {                              \
+                logger->log(log_level, "[{}] <{}> ({}) {}:{} {}: " format, log_class,              \
+                            Common::Log::to_string_view(log_level),                                \
+                            Common::GetCurrentThreadNameView(),                                    \
+                            spdlog::source_loc::basename(__FILE__), __LINE__,                      \
+                            std::string_view(__func__) == "operator()" ? "lambda" : __func__,      \
+                            ##__VA_ARGS__);                                                        \
+            }                                                                                      \
         }                                                                                          \
     } while (false)
 

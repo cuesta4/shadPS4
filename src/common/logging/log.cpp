@@ -27,6 +27,7 @@ enum class ShadPs4ReturnCode : u32 {
 
 namespace Common::Log {
 bool g_should_append = false;
+std::atomic_bool g_is_enabled{false};
 
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
@@ -177,6 +178,7 @@ static auto UpdateColorLevels(T sink) {
 }
 
 void Setup(std::string_view shadps4_filename) {
+    g_is_enabled.store(false, std::memory_order_relaxed);
     static std::once_flag already_registered;
 
     std::call_once(already_registered, []() {
@@ -213,6 +215,7 @@ void Setup(std::string_view shadps4_filename) {
     g_shad_file_sink->set_pattern("%^%v%$");
 
     UpdateSinks();
+    g_is_enabled.store(EmulatorSettings.IsLogEnable(), std::memory_order_relaxed);
 }
 
 void Switch(std::string_view game_filename) {
@@ -226,6 +229,7 @@ void Switch(std::string_view game_filename) {
 }
 
 void Shutdown() {
+    g_is_enabled.store(false, std::memory_order_relaxed);
     for (auto& logger : ALL_LOGGERS | std::views::values) {
         logger.reset();
     }
@@ -283,10 +287,15 @@ void UpdateSinks() {
 }
 
 void UpdateLogLevels(std::string_view log_filter) {
+    const bool log_enabled = EmulatorSettings.IsLogEnable();
     spdlog::level default_log_level = spdlog::level::info;
     std::unordered_map<std::string, spdlog::level> log_level_per_class;
 
-    if (EmulatorSettings.IsLogEnable()) {
+    if (!log_enabled) {
+        g_is_enabled.store(false, std::memory_order_relaxed);
+    }
+
+    if (log_enabled) {
         for (const auto class_level : std::views::split(log_filter, ' ')) {
             const auto class_level_pair =
                 std::views::split(class_level, ':') | std::ranges::to<std::vector<std::string>>();
@@ -308,7 +317,7 @@ void UpdateLogLevels(std::string_view log_filter) {
     }
 
     for (auto& [name, logger] : ALL_LOGGERS) {
-        if (EmulatorSettings.IsLogEnable()) {
+        if (log_enabled) {
             const auto level_it = log_level_per_class.find(std::string(name));
 
             logger->set_level(level_it != log_level_per_class.end() ? level_it->second
@@ -316,6 +325,10 @@ void UpdateLogLevels(std::string_view log_filter) {
         } else {
             logger->set_level(spdlog::level::off);
         }
+    }
+
+    if (log_enabled) {
+        g_is_enabled.store(true, std::memory_order_relaxed);
     }
 }
 

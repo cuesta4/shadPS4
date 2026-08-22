@@ -6,6 +6,8 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/hash.h"
+#include "common/performance_telemetry.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -60,23 +62,35 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
-void TextureCache::ProcessDownloadImages() {
+bool TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    bool scheduled = false;
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        scheduled |= DownloadImageMemory(image_id, true);
     }
     download_images.clear();
+    if (scheduled) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackBatches);
+    }
+    return scheduled;
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
+        return false;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    const u64 writeback_start = Common::PerformanceTelemetry::Enabled()
+                                    ? Common::PerformanceTelemetry::Timestamp()
+                                    : 0;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WritebackCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WritebackBytes,
+                                      download_size);
     const auto [download, offset] = download_buffer.Map(download_size);
     download_buffer.Commit();
     const vk::BufferImageCopy image_download = {
@@ -97,20 +111,50 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
+                                      download_size);
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
-    if (sync) {
-        scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
-    } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
-            });
+    auto readback_token = validate_identity ? image.readback_token : nullptr;
+    const u64 image_uid = image.image_uid;
+    scheduler.DeferPriorityOperation(
+        [device_addr = image.info.guest_address, download, download_size, writeback_start,
+         image_uid, readback_token = std::move(readback_token)] {
+            const auto record_completion = [=] {
+                if (writeback_start != 0) {
+                    Common::PerformanceTelemetry::RecordDurationEnabled(
+                        Common::PerformanceTelemetry::Counter::WritebackNs,
+                        Common::PerformanceTelemetry::EventType::Writeback, writeback_start,
+                        download_size);
+                }
+            };
+            const auto write_back = [&] {
+                Core::Memory::Instance()->TryWriteBacking(
+                    std::bit_cast<u8*>(device_addr), download, download_size,
+                    Core::MemoryWriteOrigin::GpuCompletion);
+            };
+            if (readback_token) {
+                std::scoped_lock identity_lock{readback_token->mutex};
+                if (readback_token->image_uid != image_uid) {
+                    Common::PerformanceTelemetry::Add(
+                        Common::PerformanceTelemetry::Counter::WritebackStaleSkips);
+                    record_completion();
+                    return;
+                }
+                write_back();
+            } else {
+                write_back();
+            }
+            record_completion();
+        });
+    if (writeback_start != 0) {
+        Common::PerformanceTelemetry::RecordDurationEnabled(
+            Common::PerformanceTelemetry::Counter::WritebackEnqueueNs,
+            Common::PerformanceTelemetry::EventType::None, writeback_start, download_size);
     }
+    return true;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -503,11 +547,81 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+bool TextureCache::TryReuseImage(ImageId image_id, u64 image_uid, u64 expected_topology_epoch) {
+    std::scoped_lock lock{mutex};
+    if (expected_topology_epoch != topology_epoch.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (!image_id || !slot_images.is_allocated(image_id)) {
+        return false;
+    }
+    auto& image = slot_images[image_id];
+    if (image.image_uid != image_uid || False(image.flags & ImageFlagBits::Registered)) {
+        return false;
+    }
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+    return true;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
     std::scoped_lock lock{mutex};
+
+    const ExactImageCacheKey exact_key{{
+        info.guest_address,
+        static_cast<u64>(info.guest_size) | (static_cast<u64>(info.size.width) << 32),
+        static_cast<u64>(info.size.height) | (static_cast<u64>(info.size.depth) << 32),
+        static_cast<u64>(info.resources.levels) |
+            (static_cast<u64>(info.resources.layers) << 32),
+        static_cast<u32>(info.pixel_format) | (static_cast<u64>(exact_fmt) << 32),
+        static_cast<u64>(info.type),
+    }};
+    const auto hash_key = [&] {
+        u64 value = info.guest_address ^ (static_cast<u64>(info.guest_size) << 17);
+        value ^= static_cast<u64>(info.size.width) << 1;
+        value ^= static_cast<u64>(info.size.height) << 21;
+        value ^= static_cast<u64>(info.size.depth) << 41;
+        value ^= static_cast<u64>(info.resources.levels) << 9;
+        value ^= static_cast<u64>(info.resources.layers) << 29;
+        value ^= static_cast<u64>(info.pixel_format) << 45;
+        value ^= static_cast<u64>(info.type) * 0x9E3779B185EBCA87ULL;
+        value ^= static_cast<u64>(exact_fmt) << 63;
+        value ^= value >> 29;
+        value *= 0x9E3779B185EBCA87ULL;
+        value ^= value >> 32;
+        return static_cast<size_t>(value) & (ExactImageCacheSize - 1);
+    };
+    const auto is_perfect_match = [&](const ImageInfo& cached_info) {
+        return cached_info.guest_address == info.guest_address &&
+               cached_info.guest_size == info.guest_size && cached_info.size == info.size &&
+               IsVulkanFormatCompatible(cached_info.pixel_format, info.pixel_format) &&
+               (cached_info.type == info.type || info.size == Extent3D{1, 1, 1}) &&
+               (!exact_fmt || cached_info.pixel_format == info.pixel_format) &&
+               !(cached_info.resources < info.resources);
+    };
+
+    auto& exact_entry = exact_image_cache[hash_key()];
+    const u64 current_topology_epoch = topology_epoch.load(std::memory_order_relaxed);
+    if (exact_entry.valid &&
+        std::memcmp(exact_entry.key.words.data(), exact_key.words.data(),
+                    sizeof(ExactImageCacheKey)) == 0 &&
+        exact_entry.topology_epoch == current_topology_epoch) {
+        if (exact_entry.image_id && slot_images.is_allocated(exact_entry.image_id)) {
+            auto& cached_image = slot_images[exact_entry.image_id];
+            if (cached_image.image_uid == exact_entry.image_uid &&
+                True(cached_image.flags & ImageFlagBits::Registered) &&
+                is_perfect_match(cached_image.info)) {
+                cached_image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(cached_image);
+                return exact_entry.image_id;
+            }
+        }
+        exact_entry.valid = false;
+    }
+
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -585,6 +699,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
+    if (view_mip < 0 && view_slice < 0 && is_perfect_match(image.info)) {
+        exact_entry = {
+            .key = exact_key,
+            .image_id = image_id,
+            .image_uid = image.image_uid,
+            .topology_epoch = topology_epoch.load(std::memory_order_relaxed),
+            .valid = true,
+        };
+    }
+
     return image_id;
 }
 
@@ -618,7 +742,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+void TextureCache::PrepareTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
@@ -629,10 +753,15 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    PrepareTexture(image_id, desc);
+    Image& image = slot_images[image_id];
     return image.FindView(desc.view_info);
 }
 
-ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+void TextureCache::PrepareRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
@@ -654,11 +783,15 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
                               MetaDataInfo{.type = MetaType::FMask});
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
+}
 
+ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    PrepareRenderTarget(image_id, desc);
+    Image& image = slot_images[image_id];
     return image.FindView(desc.view_info, false);
 }
 
-ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+void TextureCache::PrepareDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
@@ -694,7 +827,11 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         TouchImage(stencil_image);
         stencil_image.AssociateDepth(image_id, image.image_uid);
     }
+}
 
+ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    PrepareDepthTarget(image_id, desc);
+    Image& image = slot_images[image_id];
     return image.FindView(desc.view_info, false);
 }
 
@@ -795,7 +932,8 @@ void TextureCache::RefreshImage(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base) {
-    const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
+    const u64 hash =
+        HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), border_color_base.Address());
 
     std::scoped_lock lock{samplers_mutex};
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
@@ -809,17 +947,20 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
+    ++topology_epoch;
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    image.lru_tick = gc_tick;
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    ++topology_epoch;
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
@@ -1063,7 +1204,8 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
-void TextureCache::TouchImage(const Image& image) {
+void TextureCache::TouchImageSlow(Image& image) {
+    image.lru_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
 }
 
@@ -1071,6 +1213,11 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+
+    if (image.readback_token) {
+        std::scoped_lock lk{image.readback_token->mutex};
+        image.readback_token->image_uid = 0;
+    }
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;

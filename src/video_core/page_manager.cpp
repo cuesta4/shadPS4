@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+
 #include <boost/container/small_vector.hpp>
+#include <boost/icl/interval_set.hpp>
+#include <tsl/robin_map.h>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/performance_telemetry.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
@@ -82,6 +89,16 @@ struct PageManager::Impl {
                 }
             }
         }
+    };
+
+    struct WriteObserver {
+        u64 id;
+        MemoryWriteCallback callback;
+        void* user_data;
+    };
+
+    struct WatchedPage {
+        boost::container::small_vector<WriteObserver, 2> observers;
     };
 
     static constexpr size_t ADDRESS_BITS = 40;
@@ -355,6 +372,194 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    void GpuMap(VAddr address, size_t size) {
+        std::scoped_lock lock{mapping_mutex};
+        OnMap(address, size);
+        gpu_mappings += decltype(gpu_mappings)::interval_type::right_open(address, address + size);
+        NotifyWrite(address, size, MemoryWriteSource::Map);
+    }
+
+    void GpuUnmap(VAddr address, size_t size) {
+        std::scoped_lock lock{mapping_mutex};
+        NotifyWrite(address, size, MemoryWriteSource::Unmap);
+        OnUnmap(address, size);
+        gpu_mappings -= decltype(gpu_mappings)::interval_type::right_open(address, address + size);
+    }
+
+    [[nodiscard]] MemoryWriteWatch ArmWriteWatch(VAddr address, MemoryWriteCallback callback,
+                                                 void* user_data) {
+        const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+        if (callback == nullptr) [[unlikely]] {
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    Common::PerformanceTelemetry::Counter::MemoryWatchArmFailures, 1);
+            }
+            return {};
+        }
+
+        const VAddr page = PageManager::GetPageAddr(address);
+        std::scoped_lock mapping_lock{mapping_mutex};
+        const auto page_range =
+            decltype(gpu_mappings)::interval_type::right_open(page, page + PM_PAGE_SIZE);
+        if (!boost::icl::contains(gpu_mappings, page_range)) [[unlikely]] {
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    Common::PerformanceTelemetry::Counter::MemoryWatchArmFailures, 1);
+            }
+            return {};
+        }
+
+        std::scoped_lock lock{write_watch_mutex};
+        auto [it, inserted] = watched_pages.try_emplace(page);
+        if (inserted) {
+            UpdatePageWatchers<true, false>(page, PM_PAGE_SIZE);
+        }
+
+        u64 id = next_watch_id++;
+        if (id == 0) [[unlikely]] {
+            id = next_watch_id++;
+        }
+        it.value().observers.push_back(WriteObserver{
+            .id = id,
+            .callback = callback,
+            .user_data = user_data,
+        });
+        active_write_watches.fetch_add(1, std::memory_order_release);
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryWatchArms, 1);
+        }
+        return MemoryWriteWatch{
+            .page = page,
+            .id = id,
+            .epoch = memory_epoch.load(std::memory_order_acquire),
+        };
+    }
+
+    bool CancelWriteWatch(MemoryWriteWatch watch) {
+        if (!watch) {
+            return false;
+        }
+
+        std::scoped_lock lock{write_watch_mutex};
+        const auto page_it = watched_pages.find(watch.page);
+        if (page_it == watched_pages.end()) {
+            return false;
+        }
+        auto& observers = page_it.value().observers;
+        const auto observer_it = std::ranges::find(observers, watch.id, &WriteObserver::id);
+        if (observer_it == observers.end()) {
+            return false;
+        }
+
+        observers.erase(observer_it);
+        active_write_watches.fetch_sub(1, std::memory_order_release);
+        if (observers.empty()) {
+            UpdatePageWatchers<false, false>(watch.page, PM_PAGE_SIZE);
+            watched_pages.erase(page_it);
+        }
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::MemoryWatchCancels);
+        return true;
+    }
+
+    void NotifyWrite(VAddr address, u64 size, MemoryWriteSource source) {
+        if (size == 0 || size - 1 > std::numeric_limits<VAddr>::max() - address) [[unlikely]] {
+            return;
+        }
+
+        const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+        if (!telemetry_enabled &&
+            active_write_watches.load(std::memory_order_acquire) == 0) [[likely]] {
+            return;
+        }
+        NotifyWriteSlow(address, size, source);
+    }
+
+    SHAD_NO_INLINE void NotifyWriteSlow(VAddr address, u64 size, MemoryWriteSource source) {
+        const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+        Common::PerformanceTelemetry::ScopedDuration duration{
+            telemetry_enabled, Common::PerformanceTelemetry::Counter::MemoryNotifyNs};
+        const VAddr first_page = PageManager::GetPageAddr(address);
+        const VAddr last_page = PageManager::GetPageAddr(address + size - 1);
+        const u64 page_count = ((last_page - first_page) >> PM_PAGE_BITS) + 1;
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryNotifyCalls, 1);
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryNotifyPages, page_count);
+            Common::PerformanceTelemetry::AddEnabled(NotifyCounter(source), 1);
+        }
+
+        if (active_write_watches.load(std::memory_order_acquire) == 0) [[likely]] {
+            return;
+        }
+        const u64 epoch = memory_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+        std::scoped_lock lock{write_watch_mutex};
+        boost::container::small_vector<VAddr, 8> pages;
+        if (page_count <= pages.capacity()) {
+            for (VAddr page = first_page;; page += PM_PAGE_SIZE) {
+                if (watched_pages.contains(page)) {
+                    pages.push_back(page);
+                }
+                if (page == last_page) {
+                    break;
+                }
+            }
+        } else {
+            pages.reserve(watched_pages.size());
+            for (const auto& [page, watched] : watched_pages) {
+                if (page >= first_page && page <= last_page) {
+                    pages.push_back(page);
+                }
+            }
+        }
+
+        u64 callback_count{};
+        for (const VAddr page : pages) {
+            auto page_it = watched_pages.find(page);
+            if (page_it == watched_pages.end()) {
+                continue;
+            }
+            auto observers = std::move(page_it.value().observers);
+            watched_pages.erase(page_it);
+            active_write_watches.fetch_sub(observers.size(), std::memory_order_release);
+            UpdatePageWatchers<false, false>(page, PM_PAGE_SIZE);
+            callback_count += observers.size();
+            for (const auto& observer : observers) {
+                observer.callback(observer.user_data, page, epoch, source);
+            }
+        }
+
+        if (telemetry_enabled && !pages.empty()) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryNotifyTrackedPages, pages.size());
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryNotifyCallbacks, callback_count);
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::MemoryWatchWakeups, callback_count);
+        }
+    }
+
+    [[nodiscard]] static Common::PerformanceTelemetry::Counter NotifyCounter(
+        MemoryWriteSource source) {
+        using Counter = Common::PerformanceTelemetry::Counter;
+        switch (source) {
+        case MemoryWriteSource::Cpu:
+            return Counter::MemoryNotifyCpu;
+        case MemoryWriteSource::CommandProcessor:
+            return Counter::MemoryNotifyCommandProcessor;
+        case MemoryWriteSource::GpuCompletion:
+            return Counter::MemoryNotifyGpuCompletion;
+        case MemoryWriteSource::Map:
+            return Counter::MemoryNotifyMap;
+        case MemoryWriteSource::Unmap:
+            return Counter::MemoryNotifyUnmap;
+        }
+        UNREACHABLE();
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -362,6 +567,13 @@ struct PageManager::Impl {
     using LockType = Common::SpinLock;
 #endif
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
+    std::mutex mapping_mutex;
+    boost::icl::interval_set<VAddr> gpu_mappings;
+    std::mutex write_watch_mutex;
+    tsl::robin_map<VAddr, WatchedPage> watched_pages;
+    std::atomic<u64> active_write_watches{};
+    std::atomic<u64> memory_epoch{1};
+    u64 next_watch_id{1};
 };
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
@@ -370,11 +582,24 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
 PageManager::~PageManager() = default;
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
-    impl->OnMap(address, size);
+    impl->GpuMap(address, size);
 }
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
-    impl->OnUnmap(address, size);
+    impl->GpuUnmap(address, size);
+}
+
+MemoryWriteWatch PageManager::ArmWriteWatch(VAddr address, MemoryWriteCallback callback,
+                                            void* user_data) {
+    return impl->ArmWriteWatch(address, callback, user_data);
+}
+
+bool PageManager::CancelWriteWatch(MemoryWriteWatch watch) {
+    return impl->CancelWriteWatch(watch);
+}
+
+void PageManager::NotifyWrite(VAddr address, u64 size, MemoryWriteSource source) {
+    impl->NotifyWrite(address, size, source);
 }
 
 template <bool track>

@@ -11,6 +11,8 @@
 #include "video_core/texture_cache/image_view.h"
 
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -79,6 +81,13 @@ public:
 };
 
 class BlitHelper;
+
+struct ImageReadbackToken {
+    explicit ImageReadbackToken(u64 image_uid_) : image_uid{image_uid_} {}
+
+    std::mutex mutex;
+    u64 image_uid;
+};
 
 struct Image {
     Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
@@ -176,7 +185,9 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    std::shared_ptr<ImageReadbackToken> readback_token;
     u64 lru_id{};
+    u64 lru_tick{};
     u64 tick_accessed_last{};
     u64 hash{};
 

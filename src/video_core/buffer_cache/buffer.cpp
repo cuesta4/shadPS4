@@ -13,6 +13,8 @@
 
 namespace VideoCore {
 
+Common::IncrementalIdProvider<u64> Buffer::global_uid{};
+
 std::string_view BufferTypeName(MemoryUsage type) {
     switch (type) {
     case MemoryUsage::Upload:
@@ -102,8 +104,9 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
-    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
-      usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, uid{global_uid.Next()}, instance{&instance_},
+      scheduler{&scheduler_}, usage{usage_},
+      buffer{instance->GetDevice(), instance->GetAllocator()} {
     // Create buffer object.
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
@@ -193,6 +196,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
+        ++generation;
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);

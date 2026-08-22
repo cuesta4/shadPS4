@@ -127,6 +127,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         return;
     }
     image_uid = global_image_uid.Next();
+    readback_token = std::make_shared<ImageReadbackToken>(image_uid);
     mip_hashes.resize(info.resources.levels);
     // Here we force `eExtendedUsage` as don't know all image usage cases beforehand. In normal case
     // the texture cache should re-create the resource with the usage requested
@@ -218,21 +219,18 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                                   vk::PipelineStageFlags2 dst_stage,
-                                   std::optional<SubresourceRange> subres_range) {
-    auto& last_state = backing->state;
-    auto& subresource_states = backing->subresource_states;
-
-    const bool needs_partial_transition =
-        subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
+    Image& image, const vk::ImageLayout dst_layout, const vk::AccessFlags2 dst_mask,
+    const vk::PipelineStageFlags2 dst_stage,
+    const std::optional<SubresourceRange> subres_range, const bool needs_partial_transition) {
+    auto& last_state = image.backing->state;
+    auto& subresource_states = image.backing->subresource_states;
     const bool partially_transited = !subresource_states.empty();
 
-    Barriers barriers;
+    Image::Barriers barriers;
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
+            subresource_states.resize(image.info.resources.levels * image.info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
         }
 
@@ -243,18 +241,18 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             needs_partial_transition
                 ? std::ranges::views::iota(subres_range->base.level,
                                            subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
+                : std::views::iota(0u, image.info.resources.levels);
         const auto layers =
             needs_partial_transition
                 ? std::ranges::views::iota(subres_range->base.layer,
                                            subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
+                : std::views::iota(0u, image.info.resources.layers);
 
         for (u32 mip : mips) {
             for (u32 layer : layers) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
+                const auto subres_idx = mip * image.info.resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 
@@ -272,9 +270,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                         .newLayout = dst_layout,
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
+                        .image = image.GetImage(),
                         .subresourceRange{
-                            .aspectMask = aspect_mask,
+                            .aspectMask = image.aspect_mask,
                             .baseMipLevel = mip,
                             .levelCount = 1,
                             .baseArrayLayer = layer,
@@ -292,14 +290,6 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             subresource_states.clear();
         }
     } else { // Full resource transition
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
-            return {};
-        }
-
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
@@ -309,9 +299,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             .newLayout = dst_layout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
+            .image = image.GetImage(),
             .subresourceRange{
-                .aspectMask = aspect_mask,
+                .aspectMask = image.aspect_mask,
                 .baseMipLevel = 0,
                 .levelCount = VK_REMAINING_MIP_LEVELS,
                 .baseArrayLayer = 0,
@@ -325,6 +315,26 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     last_state.pl_stage = dst_stage;
 
     return barriers;
+}
+
+Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                                   vk::PipelineStageFlags2 dst_stage,
+                                   std::optional<SubresourceRange> subres_range) {
+    const bool needs_partial_transition =
+        subres_range &&
+        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+    const auto& last_state = backing->state;
+    if (!needs_partial_transition && backing->subresource_states.empty()) {
+        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                     vk::AccessFlagBits2::eShaderWrite |
+                                     vk::AccessFlagBits2::eMemoryWrite;
+        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+            return {};
+        }
+    }
+    return GetBarriersSlow(*this, dst_layout, dst_mask, dst_stage, subres_range,
+                           needs_partial_transition);
 }
 
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,

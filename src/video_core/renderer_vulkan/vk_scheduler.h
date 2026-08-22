@@ -3,11 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include "common/assert.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -47,7 +51,18 @@ struct RenderState {
     u16 num_color_attachments;
 
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
+        if (std::memcmp(&width, &other.width, sizeof(width) * 4) != 0 ||
+            std::memcmp(&depth_stencil_attachment, &other.depth_stencil_attachment,
+                        sizeof(RenderAttachment)) != 0) {
+            return false;
+        }
+        for (u32 index = 0; index < num_color_attachments; ++index) {
+            if (std::memcmp(&color_attachments[index], &other.color_attachments[index],
+                            sizeof(RenderAttachment)) != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
@@ -86,45 +101,54 @@ struct StencilOps {
     vk::CompareOp compare_op{};
 
     bool operator==(const StencilOps& other) const {
-        return fail_op == other.fail_op && pass_op == other.pass_op &&
-               depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
+        const u32 different =
+            (static_cast<u32>(fail_op) ^ static_cast<u32>(other.fail_op)) |
+            (static_cast<u32>(pass_op) ^ static_cast<u32>(other.pass_op)) |
+            (static_cast<u32>(depth_fail_op) ^ static_cast<u32>(other.depth_fail_op)) |
+            (static_cast<u32>(compare_op) ^ static_cast<u32>(other.compare_op));
+        return different == 0;
     }
 };
 struct DynamicState {
-    struct {
-        bool viewports : 1;
-        bool scissors : 1;
+    union {
+        struct {
+            u32 viewports : 1;
+            u32 scissors : 1;
 
-        bool depth_test_enabled : 1;
-        bool depth_write_enabled : 1;
-        bool depth_compare_op : 1;
+            u32 depth_test_enabled : 1;
+            u32 depth_write_enabled : 1;
+            u32 depth_compare_op : 1;
 
-        bool depth_bounds_test_enabled : 1;
-        bool depth_bounds : 1;
+            u32 depth_bounds_test_enabled : 1;
+            u32 depth_bounds : 1;
 
-        bool depth_bias_enabled : 1;
-        bool depth_bias : 1;
+            u32 depth_bias_enabled : 1;
+            u32 depth_bias : 1;
 
-        bool stencil_test_enabled : 1;
-        bool stencil_front_ops : 1;
-        bool stencil_front_reference : 1;
-        bool stencil_front_write_mask : 1;
-        bool stencil_front_compare_mask : 1;
-        bool stencil_back_ops : 1;
-        bool stencil_back_reference : 1;
-        bool stencil_back_write_mask : 1;
-        bool stencil_back_compare_mask : 1;
+            u32 stencil_test_enabled : 1;
+            u32 stencil_front_ops : 1;
+            u32 stencil_front_reference : 1;
+            u32 stencil_front_write_mask : 1;
+            u32 stencil_front_compare_mask : 1;
+            u32 stencil_back_ops : 1;
+            u32 stencil_back_reference : 1;
+            u32 stencil_back_write_mask : 1;
+            u32 stencil_back_compare_mask : 1;
 
-        bool primitive_restart_enable : 1;
-        bool rasterizer_discard_enable : 1;
-        bool cull_mode : 1;
-        bool front_face : 1;
+            u32 primitive_restart_enable : 1;
+            u32 rasterizer_discard_enable : 1;
+            u32 cull_mode : 1;
+            u32 front_face : 1;
 
-        bool blend_constants : 1;
-        bool color_write_masks : 1;
-        bool line_width : 1;
-        bool feedback_loop_enabled : 1;
-    } dirty_state{};
+            u32 blend_constants : 1;
+            u32 color_write_masks : 1;
+            u32 line_width : 1;
+            u32 feedback_loop_enabled : 1;
+        } dirty_state;
+        u32 dirty_bits{};
+    };
+
+    static constexpr u32 AllDirtyBits = (1U << 26) - 1;
 
     Viewports viewports{};
     Scissors scissors{};
@@ -167,7 +191,7 @@ struct DynamicState {
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
-        std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        dirty_bits = AllDirtyBits;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -180,6 +204,27 @@ struct DynamicState {
     void SetScissors(const Scissors& scissors_) {
         if (!std::ranges::equal(scissors, scissors_)) {
             scissors = scissors_;
+            dirty_state.scissors = true;
+        }
+    }
+
+    void SetSingleViewportScissor(const vk::Viewport& viewport, const vk::Rect2D& scissor) {
+        const bool viewport_different =
+            viewports.size() != 1 ||
+            ((viewports.front().x != viewport.x) | (viewports.front().y != viewport.y) |
+             (viewports.front().width != viewport.width) |
+             (viewports.front().height != viewport.height) |
+             (viewports.front().minDepth != viewport.minDepth) |
+             (viewports.front().maxDepth != viewport.maxDepth));
+        if (viewport_different) {
+            viewports.clear();
+            viewports.push_back(viewport);
+            dirty_state.viewports = true;
+        }
+        if (scissors.size() != 1 ||
+            std::memcmp(&scissors.front(), &scissor, sizeof(scissor)) != 0) {
+            scissors.clear();
+            scissors.push_back(scissor);
             dirty_state.scissors = true;
         }
     }
@@ -228,8 +273,8 @@ struct DynamicState {
     }
 
     void SetDepthBias(const float constant, const float clamp, const float slope) {
-        if (depth_bias_constant != constant || depth_bias_clamp != clamp ||
-            depth_bias_slope != slope) {
+        if ((depth_bias_constant != constant) | (depth_bias_clamp != clamp) |
+            (depth_bias_slope != slope)) {
             depth_bias_constant = constant;
             depth_bias_clamp = clamp;
             depth_bias_slope = slope;
@@ -310,7 +355,10 @@ struct DynamicState {
     }
 
     void SetBlendConstants(const std::array<float, 4> blend_constants_) {
-        if (blend_constants != blend_constants_) {
+        if ((blend_constants[0] != blend_constants_[0]) |
+            (blend_constants[1] != blend_constants_[1]) |
+            (blend_constants[2] != blend_constants_[2]) |
+            (blend_constants[3] != blend_constants_[3])) {
             blend_constants = blend_constants_;
             dirty_state.blend_constants = true;
         }
@@ -324,7 +372,8 @@ struct DynamicState {
     }
 
     void SetColorWriteMasks(const ColorWriteMasks& color_write_masks_) {
-        if (!std::ranges::equal(color_write_masks, color_write_masks_)) {
+        if (std::memcmp(color_write_masks.data(), color_write_masks_.data(),
+                        sizeof(color_write_masks)) != 0) {
             color_write_masks = color_write_masks_;
             dirty_state.color_write_masks = true;
         }
@@ -393,6 +442,53 @@ public:
         return master_semaphore.CurrentTick();
     }
 
+    /// Returns a monotonic epoch incremented whenever graphics push-descriptor state is disturbed
+    /// in the guest command buffer. Cached partial pushes use this to reject stale state.
+    [[nodiscard]] u64 GraphicsPushDescriptorEpoch() const noexcept {
+        return graphics_push_descriptor_epoch;
+    }
+
+    /// Records a graphics push-descriptor write in the guest command buffer.
+    void NotifyGraphicsPushDescriptorSet() noexcept {
+        ++graphics_push_descriptor_epoch;
+    }
+
+    /// Returns true when the supplied push-constant bytes differ from the state already emitted
+    /// for this bind point in the current command buffer.
+    [[nodiscard]] bool UpdatePushConstantCache(bool is_compute, vk::PipelineLayout layout,
+                                               const void* data, size_t size) noexcept {
+        ASSERT(size <= PushConstantCache::Capacity);
+        auto& cache = push_constant_caches[is_compute ? 1U : 0U];
+        const u64 tick = CurrentTick();
+        if (cache.valid && cache.command_buffer == current_cmdbuf && cache.layout == layout &&
+            cache.tick == tick && cache.size == size &&
+            std::memcmp(cache.bytes.data(), data, size) == 0) {
+            return false;
+        }
+        cache.valid = true;
+        cache.command_buffer = current_cmdbuf;
+        cache.layout = layout;
+        cache.tick = tick;
+        cache.size = size;
+        std::memcpy(cache.bytes.data(), data, size);
+        return true;
+    }
+
+    /// Binds a graphics pipeline only when it differs from the state already recorded in the
+    /// current guest command buffer.
+    void BindGraphicsPipeline(vk::Pipeline pipeline) {
+        const u64 tick = CurrentTick();
+        if (graphics_pipeline_valid && graphics_pipeline_command_buffer == current_cmdbuf &&
+            graphics_pipeline_tick == tick && graphics_pipeline == pipeline) {
+            return;
+        }
+        current_cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        graphics_pipeline_valid = true;
+        graphics_pipeline_command_buffer = current_cmdbuf;
+        graphics_pipeline_tick = tick;
+        graphics_pipeline = pipeline;
+    }
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         if (master_semaphore.IsFree(tick)) {
@@ -434,11 +530,27 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
+    struct PushConstantCache {
+        static constexpr size_t Capacity = 128;
+        std::array<std::byte, Capacity> bytes{};
+        vk::CommandBuffer command_buffer{};
+        vk::PipelineLayout layout{};
+        u64 tick{};
+        size_t size{};
+        bool valid{};
+    };
+
     const Instance& instance;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    u64 graphics_push_descriptor_epoch{};
+    std::array<PushConstantCache, 2> push_constant_caches{};
+    vk::CommandBuffer graphics_pipeline_command_buffer{};
+    vk::Pipeline graphics_pipeline{};
+    u64 graphics_pipeline_tick{};
+    bool graphics_pipeline_valid{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

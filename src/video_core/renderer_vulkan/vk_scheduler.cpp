@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -120,10 +121,43 @@ void Scheduler::Wait(u64 tick) {
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    master_semaphore.Refresh();
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (pending_ops.empty()) [[likely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpEmptyHits, 1);
+        }
+        return;
+    }
+
+    bool refreshed = false;
+    if (master_semaphore.IsFree(pending_ops.front().gpu_tick)) [[likely]] {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpKnownTickHits, 1);
+        }
+    } else {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
+        }
+        master_semaphore.Refresh();
+        refreshed = true;
+    }
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
+    }
+    if (!pending_ops.empty() && !refreshed) {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
+        }
+        master_semaphore.Refresh();
+        while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+            pending_ops.front().callback();
+            pending_ops.pop();
+        }
     }
 }
 
@@ -190,7 +224,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     };
 
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    master_semaphore.TelemetrySubmit(signal_value);
+    const auto submit_result = [&] {
+        Common::PerformanceTelemetry::ScopedDuration submit_duration{
+            Common::PerformanceTelemetry::Counter::DriverSubmitNs};
+        return instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    }();
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     master_semaphore.Refresh();
@@ -227,6 +266,12 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+    if (dirty_bits == 0) [[likely]] {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::DynamicStateEmptyCommits);
+        return;
+    }
+
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

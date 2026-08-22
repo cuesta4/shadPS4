@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <array>
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -41,6 +43,11 @@ enum class MemoryProt : u32 {
     GpuReadWrite = 48,
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryProt)
+
+enum class MemoryWriteOrigin : u8 {
+    CommandProcessor,
+    GpuCompletion,
+};
 
 enum class MemoryMapFlags : u32 {
     NoFlags = 0,
@@ -238,9 +245,18 @@ public:
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
-    void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    struct SparseCopyRequest {
+        VAddr source{};
+        u8* destination{};
+        u64 size{};
+    };
 
-    bool TryWriteBacking(void* address, const void* data, u64 size);
+    void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    /// Copies a request batch whose sizes sum to total_size.
+    void CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests, u64 total_size);
+
+    bool TryWriteBacking(void* address, const void* data, u64 size,
+                         MemoryWriteOrigin origin = MemoryWriteOrigin::CommandProcessor);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -354,6 +370,7 @@ private:
         }
     };
     std::array<PrtArea, 3> prt_areas{};
+    u64 mapping_generation{1};
 
     friend class ::Core::Devtools::Widget::MemoryMapViewer;
 };
