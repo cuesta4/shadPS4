@@ -73,6 +73,8 @@ public:
         return *rasterizer.get();
     }
 
+    void SyncPipelineCache();
+
     bool IsHDRSupported() const {
         return swapchain.HasHDR();
     }

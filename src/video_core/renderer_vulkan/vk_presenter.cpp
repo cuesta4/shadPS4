@@ -713,6 +713,10 @@ void Presenter::RecreateSwapchain() {
     ResetFifoTimingFeedback();
 }
 
+void Presenter::SyncPipelineCache() {
+    rasterizer->GetPipelineCache().Sync();
+}
+
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
 }

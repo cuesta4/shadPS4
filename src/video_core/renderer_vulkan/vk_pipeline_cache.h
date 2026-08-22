@@ -3,13 +3,20 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <variant>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
+#include "common/polyfill_thread.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -41,6 +48,7 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+struct ShaderCompileResult;
 
 struct ResolvedStageResources {
     boost::container::static_vector<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers;
@@ -70,6 +78,11 @@ struct Program {
     };
     static constexpr size_t MaxFetchShaderCacheEntries = 4;
 
+    struct PendingCompilation {
+        std::shared_ptr<ShaderCompileResult> result;
+        std::future<void> completion;
+    };
+
     Shader::Info info;
     ModuleList modules{};
     ResolvedStageResources resolved_resources{};
@@ -80,6 +93,7 @@ struct Program {
     u8 next_fetch_shader_slot{};
     bool specialization_plan_ready{};
     bool specialization_plan_cacheable{};
+    std::optional<PendingCompilation> pending_compilation;
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -123,8 +137,9 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
-    Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+    std::optional<Result> GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                     const Shader::ShaderParams& params,
+                                     Shader::Backend::Bindings& binding);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -141,15 +156,37 @@ private:
 
     const GraphicsPipeline* ResolveGraphicsPipelineSlow();
     const GraphicsPipeline* CreateGraphicsPipeline();
-    Result GetProgramSlow(Program& program, Shader::Stage stage, Shader::LogicalStage l_stage,
-                          const Shader::ShaderParams& params,
-                          const Shader::RuntimeInfo& runtime_info,
-                          Shader::Backend::Bindings& binding,
-                          const FetchShader* fetch_shader);
-    Result CreateProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                         const Shader::ShaderParams& params,
-                         const Shader::RuntimeInfo& runtime_info,
-                         Shader::Backend::Bindings& binding);
+    const GraphicsPipeline* PublishGraphicsPipeline(
+        tsl::robin_map<GraphicsPipelineKey,
+                       std::future<std::unique_ptr<GraphicsPipeline>>>::iterator pending_it);
+    void StartGraphicsPipelineCompiler();
+    void StopGraphicsPipelineCompiler();
+    void WaitForGraphicsPipelineCompiler();
+    void GraphicsPipelineCompilerThread(u32 worker_index);
+    void QueueGraphicsPipelineTask(std::packaged_task<void()>&& task);
+    void QueueShaderModuleTask(std::packaged_task<void()>&& task);
+    [[nodiscard]] std::vector<u8> LoadNativePipelineCache() const;
+    void SaveNativePipelineCache();
+    bool PublishProgramCompilation(Program& program);
+    void PublishPendingProgramCompilations();
+    void QueueProgramCompilation(Program& program, Shader::Stage stage,
+                                 Shader::LogicalStage l_stage,
+                                 const Shader::ShaderParams& params,
+                                 const Shader::RuntimeInfo& runtime_info,
+                                 Shader::Backend::Bindings binding,
+                                 std::optional<Shader::StageSpecialization> specialization,
+                                 size_t permutation_index, u64 permutation_hash,
+                                 bool initial_program);
+    std::optional<Result> GetProgramSlow(Program& program, Shader::Stage stage,
+                                         Shader::LogicalStage l_stage,
+                                         const Shader::ShaderParams& params,
+                                         const Shader::RuntimeInfo& runtime_info,
+                                         Shader::Backend::Bindings& binding,
+                                         const FetchShader* fetch_shader);
+    std::optional<Result> CreateProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                        const Shader::ShaderParams& params,
+                                        const Shader::RuntimeInfo& runtime_info,
+                                        Shader::Backend::Bindings& binding);
     vk::ShaderModule CompilePermutation(Program& program, Shader::Stage stage,
                                         Shader::LogicalStage l_stage,
                                         const Shader::ShaderParams& params,
@@ -169,7 +206,8 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding,
+                                   ShaderCompileResult* async_result = nullptr);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -184,10 +222,11 @@ private:
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
-    Shader::Pools pools;
     tsl::robin_map<u64, std::unique_ptr<Program>, ShaderProgramHash> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    tsl::robin_map<GraphicsPipelineKey, std::future<std::unique_ptr<GraphicsPipeline>>>
+        pending_graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -196,6 +235,22 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
     std::unique_ptr<OptimizationState> optimization;
+
+    static constexpr u32 NumGraphicsPipelineWorkers = 3;
+    static constexpr u32 NumShaderModulePreferredWorkers = 2;
+    static constexpr u32 NativePipelineCacheSaveBatch = 8;
+    static_assert(NumShaderModulePreferredWorkers < NumGraphicsPipelineWorkers);
+    std::array<std::jthread, NumGraphicsPipelineWorkers> graphics_pipeline_workers;
+    std::deque<std::packaged_task<void()>> shader_module_tasks;
+    std::deque<std::packaged_task<void()>> graphics_pipeline_tasks;
+    std::mutex graphics_pipeline_tasks_mutex;
+    std::condition_variable graphics_pipeline_tasks_cv;
+    size_t graphics_pipeline_tasks_in_flight{};
+    bool graphics_pipeline_compiler_stopping{};
+    std::mutex native_pipeline_cache_mutex;
+    std::atomic_bool native_pipeline_cache_dirty{};
+    std::atomic_bool native_pipeline_cache_save_requested{};
+    std::atomic<u32> native_pipeline_cache_updates{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

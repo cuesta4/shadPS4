@@ -48,6 +48,7 @@
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -60,6 +61,7 @@
 #include <core/file_format/npbind.h>
 
 Frontend::WindowSDL* g_window = nullptr;
+extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 namespace Core {
 
@@ -694,7 +696,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     UpdatePlayTime(id);
-    Storage::DataBase::Instance().Close();
+    if (presenter) {
+        presenter->SyncPipelineCache();
+    } else {
+        Storage::DataBase::Instance().Close();
+    }
 
     if (const auto telemetry_path = Common::PerformanceTelemetry::Dump(); !telemetry_path.empty()) {
         LOG_INFO(Common, "Performance telemetry written to {}", telemetry_path.string());
