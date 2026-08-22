@@ -155,6 +155,7 @@ public:
                                                         std::shared_ptr<GpuAuthorityShadow>* shadow);
     void PruneSupersededPendingDownloads(u64 image_uid, u64 superseded_version);
     void ScheduleComputeDownload(ImageId image_id);
+    void ScheduleRenderTargetDownload(ImageId image_id);
 
     [[nodiscard]] std::optional<PendingFastpathCandidate> TakePendingFastpathCandidate();
 
@@ -350,6 +351,7 @@ private:
 
     void PrepareImageAccess(ImageId image_id, AliasAccess access);
     void UpdateImageImpl(ImageId image_id);
+    void ScheduleImageDownload(ImageId image_id, bool fastpath_candidate);
 
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -464,8 +466,10 @@ private:
         // Backing contains the complete shared-memory view; writer is an uncommitted write.
         u64 backing_uid{};
         u64 writer_uid{};
+        u64 download_uid{};
         ImageId backing{};
         ImageId writer{};
+        ImageId download{};
         u32 members{};
 
         void ResetAuthority() {
@@ -475,6 +479,7 @@ private:
         }
     };
     tsl::robin_map<VAddr, AliasState> alias_states;
+    boost::container::small_vector<VAddr, 4> pending_alias_downloads;
     u64 alias_generation{};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;

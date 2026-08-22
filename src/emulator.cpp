@@ -48,6 +48,7 @@
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 
 #if defined(SHADPS4_ULTRA_PROFILE)
 #include <profile/instr_prof_interface.h>
@@ -64,6 +65,7 @@
 #include <core/file_format/npbind.h>
 
 Frontend::WindowSDL* g_window = nullptr;
+extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 namespace Libraries::Kernel {
 extern char const* g_environment[64];
@@ -529,6 +531,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}", EmulatorSettings.IsPipelineCacheEnabled());
     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
              EmulatorSettings.IsPipelineCacheArchived());
+    LOG_INFO(Config, "Vulkan AsyncShaderRecompiling: {}",
+             EmulatorSettings.IsAsyncShaderRecompiling());
 
     hwinfo::Memory ram;
     hwinfo::OS os;
@@ -724,7 +728,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     UpdatePlayTime(id);
-    Storage::DataBase::Instance().Close();
+    if (presenter) {
+        presenter->SyncPipelineCache();
+    } else {
+        Storage::DataBase::Instance().Close();
+    }
 
     if (const auto telemetry_path = Common::PerformanceTelemetry::Dump(); !telemetry_path.empty()) {
         LOG_INFO(Common, "Performance telemetry written to {}", telemetry_path.string());

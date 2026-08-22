@@ -19,6 +19,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/gpu_authority_tracker.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -431,7 +432,32 @@ void TextureCache::CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& ext
     };
     cmdbuf.copyImage(src.GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst.GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, region);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const u64 dst_previous_version = dst.content_epoch;
+#endif
     dst.MarkWrite(Common::PerformanceTelemetry::ImageWriter::Transfer);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const u64 copy_width =
+        src.info.props.is_block ? Common::DivCeil(extent.width, 4u) : extent.width;
+    const u64 copy_height =
+        src.info.props.is_block ? Common::DivCeil(extent.height, 4u) : extent.height;
+    Common::PerformanceTelemetry::RecordGpuAliasMaterialize({
+        .source_resource_id = src.image_uid,
+        .source_version = src.content_epoch,
+        .dest_resource_id = dst.image_uid,
+        .dest_previous_version = dst_previous_version,
+        .dest_new_version = dst.content_epoch,
+        .guest_addr = dst.info.guest_address,
+        .size = copy_width * copy_height * extent.depth *
+                std::min(src.info.resources.layers, dst.info.resources.layers) *
+                (src.info.num_bits / 8),
+        .copy_kind = src.info.pixel_format == dst.info.pixel_format
+                         ? Common::PerformanceTelemetry::AliasCopyKind::ImageToImage
+                         : Common::PerformanceTelemetry::AliasCopyKind::FormatReinterpret,
+        .submit_seq = Common::PerformanceTelemetry::LookupSubmitSeq(scheduler.CurrentTick()),
+        .packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+    });
+#endif
 }
 
 void TextureCache::PublishAliasWrite(ImageId image_id) {
@@ -465,10 +491,51 @@ void TextureCache::PublishAliasWrite(ImageId image_id) {
     } else if (!continuing_write) {
         SetAliasIdentity(state.backing, state.backing_uid, image_id, image.image_uid);
     }
+
+    const bool needs_download =
+        state.members > 1 && GetDownloadSize(image.info) <= TRACKER_BYTES_PER_PAGE;
+    if (needs_download && !state.download) {
+        pending_alias_downloads.push_back(image.info.guest_address);
+    }
+    SetAliasIdentity(state.download, state.download_uid, needs_download ? image_id : ImageId{},
+                     needs_download ? image.image_uid : 0);
 }
 
 bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* gpu_resident) {
-    std::unique_lock lk{download_images_mutex};
+    std::scoped_lock texture_lock{mutex};
+    std::unique_lock downloads_lock{download_images_mutex};
+    for (const VAddr address : pending_alias_downloads) {
+        const auto state_it = alias_states.find(address);
+        if (state_it == alias_states.end()) {
+            continue;
+        }
+        AliasState& state = state_it.value();
+        const ImageId download_id = state.download;
+        const u64 download_uid = state.download_uid;
+        SetAliasIdentity(state.download, state.download_uid, {}, 0);
+        if (!IsLiveImage(download_id, download_uid)) {
+            continue;
+        }
+        const Image& image = slot_images[download_id];
+        if (image.info.guest_address != address ||
+            False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const PendingImageDownload download{
+            .pending_seq = next_pending_download_seq++,
+            .image_id = download_id,
+            .image_uid = download_uid,
+            .resource_id = download_uid,
+            .resource_version = image.content_epoch,
+            .guest_begin = address,
+            .size = static_cast<u32>(GetDownloadSize(image.info)),
+            .policy = DownloadPolicy::LegacyEager,
+        };
+        std::erase_if(pending_downloads,
+                      [address](const auto& entry) { return entry.guest_begin == address; });
+        pending_downloads.push_back(download);
+    }
+    pending_alias_downloads.clear();
     if (pending_downloads.empty()) {
         if (gpu_resident != nullptr) {
             *gpu_resident = false;
@@ -636,7 +703,8 @@ bool TextureCache::PromotePendingDownloadAuthority(ImageId image_id, u64 image_u
         return false;
     }
     shadow->reset();
-    std::unique_lock lk{download_images_mutex};
+    std::scoped_lock texture_lock{mutex};
+    std::unique_lock downloads_lock{download_images_mutex};
     if (pending_downloads.size() != 1) {
         return false;
     }
@@ -648,6 +716,16 @@ bool TextureCache::PromotePendingDownloadAuthority(ImageId image_id, u64 image_u
                 return false;
             }
             auto& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::Aliased)) {
+                const auto state_it = alias_states.find(image.info.guest_address);
+                if (state_it != alias_states.end()) {
+                    const AliasState& state = state_it.value();
+                    if (state.download &&
+                        (state.download != image_id || state.download_uid != image_uid)) {
+                        return false;
+                    }
+                }
+            }
             const u32 download_size = static_cast<u32>(GetDownloadSize(image.info));
             auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
             if (image.image_uid != image_uid || image.content_epoch != resource_version ||
@@ -691,6 +769,20 @@ bool TextureCache::PromotePendingDownloadAuthority(ImageId image_id, u64 image_u
                                               download_size);
             *shadow = std::move(authority_shadow);
             pending_downloads.erase(it);
+            if (True(image.flags & ImageFlagBits::Aliased)) {
+                const auto state_it = alias_states.find(image.info.guest_address);
+                if (state_it != alias_states.end()) {
+                    AliasState& state = state_it.value();
+                    if (state.download == image_id && state.download_uid == image_uid) {
+                        SetAliasIdentity(state.download, state.download_uid, {}, 0);
+                        const auto address = image.info.guest_address;
+                        pending_alias_downloads.erase(
+                            std::remove(pending_alias_downloads.begin(),
+                                        pending_alias_downloads.end(), address),
+                            pending_alias_downloads.end());
+                    }
+                }
+            }
             return true;
         }
     }
@@ -1021,6 +1113,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
     readback_tracker->Invalidate(address, max_size);
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+        // Only consider images that match base address.
+        // TODO: Maybe also consider subresources
+        if (image.info.guest_address != address) {
+            return;
+        }
         // Ensure image is reuploaded when accessed again.
         InvalidateAlias(image);
         image.flags |= ImageFlagBits::GpuDirty;
@@ -1600,23 +1697,39 @@ void TextureCache::PrepareTexture(ImageId image_id, const ImageDesc& desc, bool 
 }
 
 void TextureCache::ScheduleComputeDownload(ImageId image_id) {
+    ScheduleImageDownload(image_id, true);
+}
+
+void TextureCache::ScheduleRenderTargetDownload(ImageId image_id) {
+    ScheduleImageDownload(image_id, false);
+}
+
+void TextureCache::ScheduleImageDownload(ImageId image_id, bool fastpath_candidate) {
     Image& image = slot_images[image_id];
     if (!readback_linear_images || (image.info.props.is_tiled && image.info.size.width > 8) ||
         image.info.guest_address == 0) {
         return;
     }
     const u32 download_size = static_cast<u32>(GetDownloadSize(image.info));
-    std::scoped_lock candidate_lock{fastpath_candidate_mutex};
-    pending_fastpath_candidate = PendingFastpathCandidate{
-        .image_id = image_id,
-        .image_uid = image.image_uid,
-        .resource_version = image.content_epoch,
-        .guest_addr = image.info.guest_address,
-        .download_size = download_size,
-        .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
-        .producer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
-    };
+    std::unique_lock candidate_lock{fastpath_candidate_mutex, std::defer_lock};
+    if (fastpath_candidate) {
+        candidate_lock.lock();
+        pending_fastpath_candidate = PendingFastpathCandidate{
+            .image_id = image_id,
+            .image_uid = image.image_uid,
+            .resource_version = image.content_epoch,
+            .guest_addr = image.info.guest_address,
+            .download_size = download_size,
+            .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
+            .producer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+        };
+    }
     std::unique_lock downloads_lock{download_images_mutex};
+    if (!fastpath_candidate) {
+        std::erase_if(pending_downloads, [image_id, image_uid = image.image_uid](const auto& entry) {
+            return entry.image_id == image_id && entry.image_uid == image_uid;
+        });
+    }
     pending_downloads.push_back(PendingImageDownload{
         .pending_seq = next_pending_download_seq++,
         .image_id = image_id,
@@ -2224,6 +2337,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
     if (alias_it != alias_states.end()) {
         AliasState& state = alias_it.value();
         bool state_valid = true;
+        if (state.download == image_id && state.download_uid == image.image_uid) {
+            SetAliasIdentity(state.download, state.download_uid, {}, 0);
+        }
         const bool owns_authority =
             (state.writer == image_id && state.writer_uid == image.image_uid) ||
             (state.backing == image_id && state.backing_uid == image.image_uid);

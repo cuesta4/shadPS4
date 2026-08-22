@@ -173,7 +173,7 @@ static constexpr u32 MaxColorBuffers = 8;
 struct PsColorBuffer {
     AmdGpu::DataFormat data_format : 6;
     AmdGpu::NumberFormat num_format : 4;
-    AmdGpu::NumberConversion num_conversion : 3;
+    AmdGpu::NumberConversion num_conversion : 4;
     AmdGpu::ShaderExportFormat export_format : 4;
     AmdGpu::CompMapping swizzle;
 

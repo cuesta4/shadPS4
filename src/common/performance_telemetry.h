@@ -715,6 +715,11 @@ enum class Counter : u16 {
     VirtualFenceForcedCompletions,
     VirtualWaitFallback,
     VirtualFenceRetired,
+    ShaderModuleCompileNs,
+    ShaderModuleCompileJobs,
+    ShaderModulePendingDraws,
+    ShaderModuleQueueWaitNs,
+    ShaderModuleQueueDepthMax,
     Count,
 };
 

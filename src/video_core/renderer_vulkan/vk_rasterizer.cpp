@@ -1052,6 +1052,9 @@ void Rasterizer::MarkImageWrites(Common::PerformanceTelemetry::ImageWriter write
 #endif
             if (image.binding.is_target) {
                 image.MarkWrite(writer);
+                if (!image.info.props.is_depth) {
+                    texture_cache.ScheduleRenderTargetDownload(image_id);
+                }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 if (record_telemetry) {
                     const auto write_kind =

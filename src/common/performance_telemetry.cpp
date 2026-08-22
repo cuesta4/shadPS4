@@ -594,6 +594,10 @@ constexpr std::array FrameCounters{
     Counter::DispatchCpuNs,
     Counter::PipelineHits,
     Counter::PipelineMisses,
+    Counter::ShaderModuleCompileNs,
+    Counter::ShaderModuleCompileJobs,
+    Counter::ShaderModulePendingDraws,
+    Counter::ShaderModuleQueueWaitNs,
     Counter::RenderTargetHits,
     Counter::RenderTargetMisses,
     Counter::ImageTokenHits,
@@ -967,6 +971,11 @@ constexpr std::array CounterNames{
     "virtual_fence_forced_completions",
     "virtual_wait_fallback",
     "virtual_fence_retired",
+    "shader_module_compile_ns",
+    "shader_module_compile_jobs",
+    "shader_module_pending_draws",
+    "shader_module_queue_wait_ns",
+    "shader_module_queue_depth_max",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 
@@ -1149,6 +1158,9 @@ constexpr std::array HistogramCounters{
     Counter::PresentMutexHoldNs,
     Counter::SubmitQueueDepthMax,
     Counter::FetchShaderWords,
+    Counter::ShaderModuleCompileNs,
+    Counter::ShaderModuleQueueWaitNs,
+    Counter::ShaderModuleQueueDepthMax,
 };
 
 constexpr std::array HistogramNames{
@@ -1167,6 +1179,9 @@ constexpr std::array HistogramNames{
     "present_mutex_hold_ns",
     "submit_queue_depth",
     "fetch_shader_words",
+    "shader_module_compile_ns",
+    "shader_module_queue_wait_ns",
+    "shader_module_queue_depth",
 };
 static_assert(HistogramCounters.size() == HistogramNames.size());
 
@@ -1998,7 +2013,8 @@ void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
 }
 
 [[nodiscard]] bool IsMaxCounter(Counter counter) noexcept {
-    return counter == Counter::IbDepthMax || counter == Counter::SubmitQueueDepthMax;
+    return counter == Counter::IbDepthMax || counter == Counter::SubmitQueueDepthMax ||
+           counter == Counter::ShaderModuleQueueDepthMax;
 }
 
 [[nodiscard]] std::string CsvSafe(std::string value) {
@@ -4914,7 +4930,7 @@ std::filesystem::path Dump() {
     file << "kind,thread,timestamp_ns,name,arg0,arg1,value\n";
     const auto profile = GetCaptureProfile();
     const auto* profile_str = profile == TraceCaptureProfile::SyncSemantic ? "sync_semantic" : "sync_perf";
-    file << "metadata,,0,schema_version,0,0,14\n";
+    file << "metadata,,0,schema_version,0,0,16\n";
     file << "metadata,,0,capture_profile,0,0," << profile_str << "\n";
     file << "metadata,,0,extra_read_faults_enabled,0,0," << (profile == TraceCaptureProfile::SyncSemantic ? "true" : "false") << "\n";
     file << "metadata,,0,session_duration_ns,0,0," << Timestamp() - g_session_start_ns << '\n';

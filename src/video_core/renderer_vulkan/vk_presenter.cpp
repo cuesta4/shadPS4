@@ -557,6 +557,10 @@ Presenter::~Presenter() {
     }
 }
 
+void Presenter::SyncPipelineCache() {
+    rasterizer->GetPipelineCache().Sync();
+}
+
 void Presenter::ReturnFrame(Frame* frame) {
     if (frame == nullptr) {
         return;
