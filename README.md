@@ -50,7 +50,7 @@ The releases contain the compiled binaries for easier access. Feel free to fork,
 - Configurable `app0`/HDD read bandwidth and fixed-time loading via **Disable Time Dilation**.
 - Compatibility fixes for shader interfaces and upstream clip-plane changes.
 
-## TUTZ-GOW-only features
+## TUTZ-GOW specific features
 
 - GPU-side virtual fencing for eligible GPU event signals.
 - Deferred GPU completion labels/writebacks, avoiding unnecessary CPU waits and fences.
