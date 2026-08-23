@@ -955,7 +955,7 @@ SHAD_NO_INLINE void Rasterizer::SynchronizeDmaBuffers() {
     fault_process_pending = true;
 }
 
-void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
+SHAD_NO_INLINE void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
     auto& state = descriptor_state;
     state.pipeline = pipeline;
     state.command_buffer = scheduler.CommandBuffer();
@@ -1282,7 +1282,7 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         }
         pipeline->BindResources(partial_set_writes, buffer_barriers, push_data);
     }
-    {
+    if (!can_reuse || !partial_set_writes.empty() || cached_write_index != cached.writes.size()) {
         Common::PerformanceTelemetry::SampledDuration<
             Common::PerformanceTelemetry::TimerSite::DescriptorCapture>
             capture_duration{telemetry_enabled};
@@ -1512,14 +1512,14 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
             }
             if (cache_hit) {
                 pending.buffer_id = cached.buffer_id;
-            } else {
-                pending.buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+                continue;
             }
 
+            pending.buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+            cached.topology_epoch = buffer_cache.TopologyEpoch();
             cached.sharp = vsharp;
             cached.buffer_id = pending.buffer_id;
             cached.buffer_uid = buffer_cache.GetBufferUid(pending.buffer_id);
-            cached.topology_epoch = buffer_cache.TopologyEpoch();
             cached.size = size;
             cached.valid = true;
             continue;
@@ -1721,8 +1721,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 cached.owner = &stage;
             }
 
-            const bool sharp_matches = std::memcmp(&cached.sharp, &tsharp, sizeof(tsharp)) == 0;
-            const bool cache_hit = cached.valid && sharp_matches &&
+            const bool cache_hit = cached.valid &&
+                                   std::memcmp(&cached.sharp, &tsharp, sizeof(tsharp)) == 0 &&
                                    cached.topology_epoch == texture_cache.TopologyEpoch() &&
                                    texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
                                                                cached.topology_epoch);
@@ -2369,6 +2369,11 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     }
 
     auto& dynamic_state = scheduler.GetDynamicState();
+    if (dynamic_state.dirty_bits == 0) {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::DynamicStateEmptyCommits);
+        return;
+    }
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 

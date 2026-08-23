@@ -597,7 +597,9 @@ std::shared_ptr<File> HandleTable::GetFileShared(int d) {
 }
 
 File* HandleTable::GetFile(int d) {
-    return GetFileShared(d).get();
+    std::scoped_lock lock{m_mutex};
+    const auto index = static_cast<size_t>(d);
+    return index < m_files.size() ? m_files[index].get() : nullptr;
 }
 
 File* HandleTable::GetSocket(int d) {
