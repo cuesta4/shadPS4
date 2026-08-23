@@ -243,8 +243,8 @@ private:
     std::unique_ptr<OptimizationState> optimization;
     bool async_shader_recompiling{};
 
-    static constexpr u32 NumGraphicsPipelineWorkers = 3;
-    static constexpr u32 NumShaderModulePreferredWorkers = 2;
+    static constexpr u32 NumGraphicsPipelineWorkers = 6;
+    static constexpr u32 NumShaderModulePreferredWorkers = 3;
     static constexpr u32 NativePipelineCacheSaveBatch = 8;
     static_assert(NumShaderModulePreferredWorkers < NumGraphicsPipelineWorkers);
     std::array<std::jthread, NumGraphicsPipelineWorkers> graphics_pipeline_workers;
