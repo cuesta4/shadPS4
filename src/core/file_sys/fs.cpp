@@ -560,10 +560,8 @@ void HandleTable::DeleteHandle(int d) {
 
 File* HandleTable::GetFile(int d) {
     std::scoped_lock lock{m_mutex};
-    if (d < 0 || d >= m_files.size()) {
-        return nullptr;
-    }
-    return m_files.at(d);
+    const auto index = static_cast<size_t>(d);
+    return index < m_files.size() ? m_files[index] : nullptr;
 }
 
 File* HandleTable::GetSocket(int d) {

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstring>
 #include <immintrin.h>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -119,6 +120,16 @@ consteval auto BuildGraphicsPipelineRegisterMask() {
 
 constexpr auto GraphicsPipelineRegisterMask = BuildGraphicsPipelineRegisterMask();
 constexpr auto MemoryWaitFallbackInterval = std::chrono::microseconds{250};
+
+template <typename Condvar, typename Lock, typename Rep, typename Period, typename Pred>
+#if defined(__clang__) || defined(__GNUC__)
+[[gnu::cold]]
+#endif
+SHAD_NO_INLINE bool WaitMemoryFallback(
+    Condvar& cv, std::unique_lock<Lock>& lk, std::stop_token stoken,
+    const std::chrono::duration<Rep, Period>& timeout, Pred&& pred) {
+    return cv.wait_for(lk, stoken, timeout, std::forward<Pred>(pred));
+}
 
 template <u32 WordCount>
 [[nodiscard]] inline u32 PipelineRegisterBits(u32 first_register) {
@@ -455,8 +466,8 @@ void Liverpool::Process(std::stop_token stoken) {
             };
             if (num_submits.load(std::memory_order_acquire) != 0 &&
                 ready_queue_mask.load(std::memory_order_acquire) == 0) {
-                memory_wait_fallback =
-                    !submit_cv.wait_for(lk, stoken, MemoryWaitFallbackInterval, has_ready_work);
+                memory_wait_fallback = !WaitMemoryFallback(
+                    submit_cv, lk, stoken, MemoryWaitFallbackInterval, has_ready_work);
             } else {
                 Common::CondvarWait(submit_cv, lk, stoken, has_ready_work);
             }
@@ -995,12 +1006,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         {
             const u32 count = ((header_raw >> 16) + 1) & 0x3fff;
+            u32 packet_words = count + 1;
             const auto opcode = static_cast<PM4ItOpcode>((header_raw >> 8) & 0xff);
             if (telemetry_enabled) {
                 Common::PerformanceTelemetry::CountPm4PacketEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                     static_cast<u32>(opcode), ib_depth, reinterpret_cast<uintptr_t>(header),
-                    count + 1, header_raw);
+                    packet_words, header_raw);
             }
             const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
             switch (opcode) {
@@ -1754,15 +1766,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
-                    dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());
-                    continue;
+                    packet_words += cond_exec->exec_count.Value();
                 }
                 break;
             }
             default:
                 UnknownType3Opcode(opcode, count);
             }
-            dcb = NextPacket(dcb, count + 1);
+            dcb = NextPacket(dcb, packet_words);
         }
     }
 
@@ -1814,7 +1825,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
                 *queue.read_addr += acb.size();
-                *queue.read_addr %= queue.ring_size_dw;
+                *queue.read_addr &= queue.ring_size_dw - 1;
             }
             break;
         }
@@ -1829,7 +1840,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
                 *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                *queue.read_addr &= queue.ring_size_dw - 1;
             }
             continue;
         }
@@ -2168,7 +2179,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 
         if constexpr (!is_indirect) {
             *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            *queue.read_addr &= queue.ring_size_dw - 1;
         }
     }
 
