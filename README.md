@@ -34,8 +34,7 @@ These builds are experimental and are not intended to replace upstream shadPS4.
   the custom launcher executable. This release contains the executable only; use it
   with the official QtLauncher package.
 
-The emulator releases intentionally contain only their respective emulator executable.
-No launcher ZIP is redistributed here.
+The releases contain the compiled binaries for easier access. Feel free to fork, build and hack around at will.
 
 ## Features common to both builds
 
