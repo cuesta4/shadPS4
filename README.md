@@ -97,7 +97,6 @@ game-specific visual or stability problems. Disable it if it bother you too much
 ## Scope and limitations
 
 - These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO. Feel free to clone the code and build yourself.
-- First-run shader compilation can still stutter while the cache is populated.
 - TUTZ-GOW is a build targeting maximum performance for God of War III. You may try it with other games, but they might break.
 - Neither build is a promise of perfect performance, accuracy, or visual correctness.
 
