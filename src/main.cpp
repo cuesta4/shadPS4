@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -23,6 +24,10 @@
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
 
+#ifdef __LLVM_INSTR_PROFILE_GENERATE
+extern "C" int __llvm_profile_dump();
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #elif defined(__APPLE__)
@@ -30,6 +35,13 @@
 #endif
 
 int main(int argc, char* argv[]) {
+#ifdef __LLVM_INSTR_PROFILE_GENERATE
+    (void)std::at_quick_exit([] { (void)__llvm_profile_dump(); });
+    if (std::getenv("SHADPS4_PGO_QUICK_EXIT_SMOKE") != nullptr) {
+        std::quick_exit(0);
+    }
+#endif
+
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
