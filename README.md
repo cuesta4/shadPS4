@@ -10,6 +10,7 @@ focused on making **God of War III** and **Dead Nation** more playable while the
 upstream project continues to evolve.
 
 These builds are experimental and are not intended to replace upstream shadPS4.
+Massive thanks to the amazing shadps4 devs.
 
 > [!CAUTION]
 > ## Unofficial builds — please read
@@ -43,7 +44,7 @@ The releases contain the compiled binaries for easier access. Feel free to fork,
 - Semantically inactive depth/stencil attachments omitted from graphics pipelines.
 - Asynchronous graphics shader and pipeline compilation, configurable per game,
   using six compiler workers.
-- More persistent shader-cache storage and background cache I/O.
+- Shader-cache storage and background cache I/O fixes.
 - Linear-readback, buffer-cache, PM4, draw, and rasterizer hot-path optimizations.
 - Reduced redundant synchronization, logging, lookups, and allocations in frequently
   executed CPU/GPU paths; the resulting code is also easier for Clang to optimize.
@@ -80,11 +81,12 @@ God of War 3 Remastered settings:
 1. Right-click the game in the launcher.
 2. Open **Game-specific Settings... → Configure Game-specific Settings**.
 3. Open the **Experimental** tab.
-4. Under **HDD Read Speed**, set the bandwidth to **at least 75 MiB/s**.
+4. Under **HDD Read Speed**, set the bandwidth to **75 MiB/s**.
 5. Enable **Async Shader Recompiling** under 
-   **Shader Cache**. Restart the game after changing it.
+   **Shader Cache**.
 6. Keep **Readbacks Mode** disabled and enable
-   **Readback Linear Images**. 
+   **Readback Linear Images**.
+7. Enjoy!
 
 Other info:
 The HDD speed might help other games, but at cost of loading speeds. 
@@ -98,6 +100,7 @@ game-specific visual or stability problems. Disable it if it bother you too much
 - These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO. Feel free to clone the code and build yourself.
 - TUTZ-GOW is a build targeting maximum performance for God of War III. You may try it with other games, but they might break.
 - Neither build is a promise of perfect performance, accuracy, or visual correctness.
+- Feel free to report bugs, open PRs and suggest changes to either version or launcher. Life's been busy, so I can't promise anything, tho.
 
 ## Showcase
 
