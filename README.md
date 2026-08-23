@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# Tutz shadPS4 builds
+# SHADPS4 - TUTZ-GOW/TUTZ-EMU BUILDS
 
 Unofficial Windows builds of [shadPS4](https://github.com/shadps4-emu/shadPS4),
 focused on making **God of War III** and **Dead Nation** more playable while the
@@ -76,34 +76,34 @@ versions/
     └── tutz-gow.exe
 ```
 
-For a game-specific profile:
+God of War 3 Remastered settings:
 
 1. Right-click the game in the launcher.
 2. Open **Game-specific Settings... → Configure Game-specific Settings**.
 3. Open the **Experimental** tab.
 4. Under **HDD Read Speed**, set the bandwidth to **at least 75 MiB/s**.
-5. For God of War III, select the TUTZ-GOW executable and enable **Async Shader
-   Recompiling** under **Shader Cache**. Restart the game after changing it.
-6. For the tested GOW3 readback profile, keep **Readbacks Mode** disabled and enable
-   **Readback Linear Images**. Use TUTZ-EMU if another game requires a different
-   readback configuration.
+5. Enable **Async Shader Recompiling** under 
+   **Shader Cache**. Restart the game after changing it.
+6. Keep **Readbacks Mode** disabled and enable
+   **Readback Linear Images**. 
 
-`Disable Time Dilation` is available in the same HDD Read Speed card. Enable it when
-you want fixed HDD timing instead of timing scaled by the emulated frame rate.
+Other info:
+The HDD speed might help other games, but at cost of loading speeds. 
+The `Disable Time Dilation` mitigates that, but it might regress games.
 
 Async shader compilation can reduce shader-compilation stutter, but it may expose
-game-specific visual or stability problems. Disable it for a game that regresses.
+game-specific visual or stability problems. Disable it if it bother you too much.
 
 ## Scope and limitations
 
-- These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO.
+- These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO. Feel free to clone the code and build yourself.
 - First-run shader compilation can still stutter while the cache is populated.
-- TUTZ-GOW is a targeted God of War III build, not a compatibility claim for other games.
+- TUTZ-GOW is a build targeting maximum performance for God of War III. You may try it with other games, but they might break.
 - Neither build is a promise of perfect performance, accuracy, or visual correctness.
 
-## Media
+## Showcase
 
-Screenshots and a YouTube showcase will be added here.
+https://www.youtube.com/watch?v=tWWtB59fE7o
 
 ## Source and license
 
