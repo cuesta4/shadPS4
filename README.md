@@ -3,208 +3,103 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-<h1 align="center">
-  <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
-  <br>
-  <b>shadPS4</b>
-  <br>
-</h1>
+# Tutz shadPS4 builds
 
-<h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
-</h1>
+Unofficial Windows builds of [shadPS4](https://github.com/shadps4-emu/shadPS4),
+focused on making **God of War III** and **Dead Nation** more playable while the
+upstream project continues to evolve.
 
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
+These builds are experimental and are not intended to replace upstream shadPS4.
 
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
+> [!CAUTION]
+> ## Unofficial builds — please read
+>
+> These binaries are **not official shadPS4 releases** and are not endorsed by the
+> upstream developers.
+>
+> - Do **not** contact upstream developers about these builds.
+> - Do **not** report bugs caused by these builds in the official shadPS4 repository.
+> - Do **not** assume that a problem seen here exists in upstream shadPS4.
+> - Reproduce issues with an official upstream build before opening an upstream report.
+> - Build-specific feedback belongs in this fork, together with the exact build and game.
 
-# General information
+## Downloads
 
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+- [**Tuts-Emu**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-emu-2026-08-23) —
+  the general-purpose build. Use it for Dead Nation and most other games.
+- [**Tuts-GOW**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-gow-2026-08-23) —
+  the God of War III build. It contains a game-focused GPU synchronization path and
+  has **not** been tested as a general-purpose build.
 
-> [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+Both releases include the latest compatible Qt launcher package.
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+## Features common to both builds
 
-# Status
+- Coherent aliased-resource tracking across the buffer and texture caches.
+- Guest VBlank timing decoupled from Vulkan presentation timing.
+- Semantically inactive depth/stencil attachments omitted from graphics pipelines.
+- Asynchronous graphics shader and pipeline compilation, configurable per game,
+  using six compiler workers.
+- More persistent shader-cache storage and background cache I/O.
+- Linear-readback, buffer-cache, PM4, draw, and rasterizer hot-path optimizations.
+- Reduced redundant synchronization, logging, lookups, and allocations in frequently
+  executed CPU/GPU paths; the resulting code is also easier for Clang to optimize.
+- Configurable `app0`/HDD read bandwidth and fixed-time loading via **Disable Time Dilation**.
+- Compatibility fixes for shader interfaces and upstream clip-plane changes.
 
-> [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+## Tuts-GOW-only features
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+- GPU-side virtual fencing for eligible GPU event signals.
+- Deferred GPU completion labels/writebacks, avoiding unnecessary CPU waits and fences.
+- GPU authority tracking and lazy materialization optimized for linear readbacks.
+- Additional God of War III–focused synchronization and readback fast paths.
 
-# Why
+The Tuts-GOW path is deliberately isolated from Tuts-Emu because it changes the
+GPU/CPU synchronization contract and has only been validated with God of War III.
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+## Recommended launcher setup
 
-# Building
+The launcher is included in each release. Keep the emulator executables in the
+launcher version directory, for example:
 
-## Docker
-
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
-
-## Windows
-
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
-
-## Linux
-
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
-
-## macOS
-
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
-
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
-
-# Usage examples
-
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
-
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
-
-Below is a list of commonly used command patterns:
-```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
+```text
+versions/
+├── tutz-emu/
+│   └── tutz-emu.exe
+└── tutz-gow/
+    └── tutz-gow.exe
 ```
 
-# Debugging and reporting issues
+For a game-specific profile:
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+1. Right-click the game in the launcher.
+2. Open **Game-specific Settings... → Configure Game-specific Settings**.
+3. Open the **Experimental** tab.
+4. Under **HDD Read Speed**, set the bandwidth to **at least 75 MiB/s**.
+5. For God of War III, select the Tuts-GOW executable and enable **Async Shader
+   Recompiling** under **Shader Cache**. Restart the game after changing it.
+6. For the tested GOW3 readback profile, keep **Readbacks Mode** disabled and enable
+   **Readback Linear Images**. Use Tuts-Emu if another game requires a different
+   readback configuration.
 
-# Keyboard and Mouse Mappings
+`Disable Time Dilation` is available in the same HDD Read Speed card. Enable it when
+you want fixed HDD timing instead of timing scaled by the emulated frame rate.
 
-> [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+Async shader compilation can reduce shader-compilation stutter, but it may expose
+game-specific visual or stability problems. Disable it for a game that regresses.
 
-| Button | Function |
-|-------------|-------------|
-F10 | FPS Counter
-Ctrl+F10 | Video Debug Info
-F11 | Fullscreen
-F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
-Alt+F12 | Capture screenshot including HUD/dialog overlays
+## Scope and limitations
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
+- These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO.
+- First-run shader compilation can still stutter while the cache is populated.
+- Tuts-GOW is a targeted God of War III build, not a compatibility claim for other games.
+- Neither build is a promise of perfect performance, accuracy, or visual correctness.
 
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
+## Media
 
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
+Screenshots and a YouTube showcase will be added here.
 
+## Source and license
 
-# Firmware files
-
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
-
-<div align="center">
-
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 |
-</div>
-
-> [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
-
-
-
-# Main team
-
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
-
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
-
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
-</a>
-
-# Contributing
-
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
-
-
-# Special Thanks
-
-A few noteworthy teams/projects who've helped us along the way are:
-
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
-
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
-
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
-
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
-
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
-
-# License
-
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+This fork is based on the open-source [shadPS4 project](https://github.com/shadps4-emu/shadPS4)
+and remains available under the [GPL-2.0-or-later license](LICENSE).
