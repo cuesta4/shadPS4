@@ -25,13 +25,17 @@ These builds are experimental and are not intended to replace upstream shadPS4.
 
 ## Downloads
 
-- [**Tuts-Emu**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-emu-2026-08-23) —
+- [**TUTZ-EMU**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-emu-2026-08-23) —
   the general-purpose build. Use it for Dead Nation and most other games.
-- [**Tuts-GOW**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-gow-2026-08-23) —
+- [**TUTZ-GOW**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-gow-2026-08-23) —
   the God of War III build. It contains a game-focused GPU synchronization path and
   has **not** been tested as a general-purpose build.
+- [**TUTZ-UI**](https://github.com/cuesta4/shadPS4/releases/tag/tutz-ui-2026-08-23) —
+  the custom launcher executable. This release contains the executable only; use it
+  with the official QtLauncher package.
 
-Both releases include the latest compatible Qt launcher package.
+The emulator releases intentionally contain only their respective emulator executable.
+No launcher ZIP is redistributed here.
 
 ## Features common to both builds
 
@@ -59,10 +63,10 @@ GPU/CPU synchronization contract and has only been validated with God of War III
 
 ## Recommended launcher setup
 
-The launcher is included in each release. Extract `tutz-launcher-*-win64.zip` and
-run `bin/shadPS4QtLauncher.exe`, or use the standalone launcher executable together
-with its Qt runtime files. Keep the emulator executables in the launcher version
-directory, for example:
+Download the [official QtLauncher package](https://github.com/shadps4-emu/shadPS4-qtlauncher/releases/latest),
+replace its `shadPS4QtLauncher.exe` with the executable from the
+[TUTZ-UI release](https://github.com/cuesta4/shadPS4/releases/tag/tutz-ui-2026-08-23),
+and keep the emulator executables in the launcher version directory, for example:
 
 ```text
 versions/
