@@ -68,7 +68,7 @@ static constexpr std::array level_string_views{"Trace", "Debug",    "Info", "War
 // Define the fmt lib macros
 #define LOG_GENERIC(log_class, log_level, format, ...)                                             \
     do {                                                                                           \
-        if (Common::Log::IsEnabled()) {                                                            \
+        if (Common::Log::IsEnabled()) [[unlikely]] {                                               \
             if (const auto logger = Common::Log::GetLogger(log_class);                             \
                 logger != nullptr && logger->should_log(log_level)) {                              \
                 logger->log(log_level, "[{}] <{}> ({}) {}:{} {}: " format, log_class,              \

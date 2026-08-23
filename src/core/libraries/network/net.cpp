@@ -829,9 +829,10 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
 
     int sockets_waited_on = (epoll->events.size() - epoll->async_resolutions.size()) > 0;
 
-    std::vector<epoll_event> native_events{static_cast<size_t>(maxevents)};
+    std::vector<epoll_event> native_events;
     int result = ORBIS_OK;
     if (sockets_waited_on) {
+        native_events.resize(static_cast<size_t>(maxevents));
 #ifdef __linux__
         const timespec epoll_timeout{.tv_sec = timeout / 1000000,
                                      .tv_nsec = (timeout % 1000000) * 1000};
