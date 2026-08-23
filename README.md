@@ -51,14 +51,14 @@ No launcher ZIP is redistributed here.
 - Configurable `app0`/HDD read bandwidth and fixed-time loading via **Disable Time Dilation**.
 - Compatibility fixes for shader interfaces and upstream clip-plane changes.
 
-## Tuts-GOW-only features
+## TUTZ-GOW-only features
 
 - GPU-side virtual fencing for eligible GPU event signals.
 - Deferred GPU completion labels/writebacks, avoiding unnecessary CPU waits and fences.
 - GPU authority tracking and lazy materialization optimized for linear readbacks.
 - Additional God of War III–focused synchronization and readback fast paths.
 
-The Tuts-GOW path is deliberately isolated from Tuts-Emu because it changes the
+The TUTZ-GOW path is deliberately isolated from TUTZ-EMU because it changes the
 GPU/CPU synchronization contract and has only been validated with God of War III.
 
 ## Recommended launcher setup
@@ -82,10 +82,10 @@ For a game-specific profile:
 2. Open **Game-specific Settings... → Configure Game-specific Settings**.
 3. Open the **Experimental** tab.
 4. Under **HDD Read Speed**, set the bandwidth to **at least 75 MiB/s**.
-5. For God of War III, select the Tuts-GOW executable and enable **Async Shader
+5. For God of War III, select the TUTZ-GOW executable and enable **Async Shader
    Recompiling** under **Shader Cache**. Restart the game after changing it.
 6. For the tested GOW3 readback profile, keep **Readbacks Mode** disabled and enable
-   **Readback Linear Images**. Use Tuts-Emu if another game requires a different
+   **Readback Linear Images**. Use TUTZ-EMU if another game requires a different
    readback configuration.
 
 `Disable Time Dilation` is available in the same HDD Read Speed card. Enable it when
@@ -98,7 +98,7 @@ game-specific visual or stability problems. Disable it for a game that regresses
 
 - These are Windows x64 builds compiled with Clang, Release optimizations, and ThinLTO.
 - First-run shader compilation can still stutter while the cache is populated.
-- Tuts-GOW is a targeted God of War III build, not a compatibility claim for other games.
+- TUTZ-GOW is a targeted God of War III build, not a compatibility claim for other games.
 - Neither build is a promise of perfect performance, accuracy, or visual correctness.
 
 ## Media
