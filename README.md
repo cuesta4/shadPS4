@@ -104,7 +104,19 @@ game-specific visual or stability problems. Disable it if it bother you too much
 
 ## Showcase
 
-https://www.youtube.com/watch?v=tWWtB59fE7o
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=tWWtB59fE7o">
+    <img
+      src="https://img.youtube.com/vi/tWWtB59fE7o/maxresdefault.jpg"
+      width="720"
+      alt="Watch demonstration video on YouTube"
+    >
+  </a>
+  <br>
+  <a href="https://www.youtube.com/watch?v=tWWtB59fE7o">
+    ▶️ <strong>Watch on YouTube</strong>
+  </a>
+</p>
 
 ## Source and license
 
