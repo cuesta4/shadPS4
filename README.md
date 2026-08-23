@@ -59,8 +59,10 @@ GPU/CPU synchronization contract and has only been validated with God of War III
 
 ## Recommended launcher setup
 
-The launcher is included in each release. Keep the emulator executables in the
-launcher version directory, for example:
+The launcher is included in each release. Extract `tutz-launcher-*-win64.zip` and
+run `bin/shadPS4QtLauncher.exe`, or use the standalone launcher executable together
+with its Qt runtime files. Keep the emulator executables in the launcher version
+directory, for example:
 
 ```text
 versions/
