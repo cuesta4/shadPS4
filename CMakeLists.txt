@@ -1293,6 +1293,8 @@ target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config
 if (ENABLE_DETAILED_TELEMETRY)
     target_compile_definitions(shadps4 PRIVATE SHADPS4_ENABLE_DETAILED_TELEMETRY)
     set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "shadps4-instrumentado")
+else()
+    set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "shadps4")
 endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
@@ -58,12 +60,29 @@ struct GpuAuthorityShadow final : StreamBufferPin {
         Release();
     }
 
+    void ExtendLifetime(u64 required_tick) noexcept {
+        u64 current_tick = tick.load(std::memory_order_relaxed);
+        while (current_tick < required_tick &&
+               !tick.compare_exchange_weak(current_tick, required_tick,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {
+        }
+    }
+
+    [[nodiscard]] u64 Tick() const noexcept {
+        return tick.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] u64 RequiredTick(u64 allocation_tick) const noexcept override {
+        return std::max(allocation_tick, Tick());
+    }
+
     std::mutex data_mutex;
     u8* data{};
     VAddr guest_addr{};
     u64 buffer_offset{};
     u32 size{};
-    u64 tick{};
+    std::atomic<u64> tick{};
     std::unique_ptr<u8[]> owned_data;
 };
 
@@ -135,6 +154,8 @@ public:
     [[nodiscard]] std::shared_ptr<GpuAuthorityEntry> GetAuthorityForImage(u64 image_uid, u64 version) const;
     [[nodiscard]] std::shared_ptr<GpuAuthorityEntry> GetAuthorityForRange(VAddr addr,
                                                                          size_t size) const;
+    [[nodiscard]] std::shared_ptr<GpuAuthorityShadow> AcquireGpuShadowForImage(
+        VAddr addr, size_t size);
 
     [[nodiscard]] std::shared_ptr<VirtualGpuFence> MatchVirtualWait(
         VAddr label_addr, u32 ref, u32 mask, u32 function,

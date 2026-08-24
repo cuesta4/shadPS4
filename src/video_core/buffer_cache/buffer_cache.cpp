@@ -1579,6 +1579,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    if (const auto shadow =
+            GpuAuthorityTracker::Instance().AcquireGpuShadowForImage(gpu_addr, size)) {
+        ASSERT(shadow->buffer_offset <= std::numeric_limits<u32>::max());
+        return {&download_buffer, static_cast<u32>(shadow->buffer_offset)};
+    }
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {

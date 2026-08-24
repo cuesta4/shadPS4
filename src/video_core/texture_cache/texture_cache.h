@@ -123,6 +123,7 @@ public:
         u32 download_size{0};
         u64 producer_seq{0};
         Common::PerformanceTelemetry::PacketSeq producer_packet_seq{0};
+        Common::PerformanceTelemetry::ImageWriter producer_kind{};
     };
 
 public:
@@ -351,7 +352,8 @@ private:
 
     void PrepareImageAccess(ImageId image_id, AliasAccess access);
     void UpdateImageImpl(ImageId image_id);
-    void ScheduleImageDownload(ImageId image_id, bool fastpath_candidate);
+    void ScheduleImageDownload(ImageId image_id, bool fastpath_candidate, bool replace_existing,
+                               Common::PerformanceTelemetry::ImageWriter producer_kind);
 
     /// Iterate over all page indices in a range
     template <typename Func>

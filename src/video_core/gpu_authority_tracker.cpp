@@ -205,6 +205,54 @@ std::shared_ptr<GpuAuthorityEntry> GpuAuthorityTracker::GetAuthorityForRange(
     return nullptr;
 }
 
+std::shared_ptr<GpuAuthorityShadow> GpuAuthorityTracker::AcquireGpuShadowForImage(
+    VAddr addr, size_t size) {
+    if (!IsGow3FastpathActive() || size != 512) {
+        return nullptr;
+    }
+
+    std::scoped_lock lock{tracker_mutex};
+    for (auto it = authorities.rbegin(); it != authorities.rend(); ++it) {
+        const auto& entry = *it;
+        std::scoped_lock entry_lock{*entry->entry_mutex};
+        if (entry->state != GpuAuthorityState::GpuAuthoritative || entry->guest_begin != addr ||
+            entry->download_size != size || !entry->shadow) {
+            continue;
+        }
+        std::scoped_lock shadow_lock{entry->shadow->data_mutex};
+        if (entry->shadow->IsReleased() || entry->shadow->owned_data) {
+            continue;
+        }
+        entry->shadow->ExtendLifetime(rasterizer ? rasterizer->CurrentTick()
+                                                 : entry->shadow->Tick());
+        if (!entry->gpu_consumed) {
+            entry->gpu_consumed = true;
+            Common::PerformanceTelemetry::RecordAuthorityGpuConsume(
+                Common::PerformanceTelemetry::AuthorityGpuConsumeSample{
+                    .authority_seq = entry->authority_seq,
+                    .resource_id = entry->resource_id,
+                    .resource_version = entry->resource_version,
+                    .image_id = entry->image_id,
+                    .image_uid = entry->image_uid,
+                    .consumer_seq = Common::PerformanceTelemetry::NextConsumerSeq(),
+                    .consumer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+                    .consumer_kind = static_cast<u32>(
+                        Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy),
+                    .requested_access = static_cast<u32>(vk::AccessFlagBits2::eTransferRead),
+                    .requested_layout = 0,
+                    .producer_tick = entry->producer_tick,
+                    .consumer_cmd_buffer_seq =
+                        Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                    .consumer_submit_seq = 0,
+                });
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::AuthorityGpuFirstConsumer);
+        }
+        return entry->shadow;
+    }
+    return nullptr;
+}
+
 void GpuAuthorityTracker::RefreshAuthorityReadWatches(VAddr addr, size_t size) {
     const auto [watch_addr, watch_size] = GetReadWatchRange(addr, size);
     boost::container::small_vector<std::pair<VAddr, size_t>, 4> ranges_to_disarm;

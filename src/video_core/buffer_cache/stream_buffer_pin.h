@@ -6,6 +6,8 @@
 #include <atomic>
 #include <memory>
 
+#include "common/types.h"
+
 namespace VideoCore {
 
 class StreamBufferPin {
@@ -13,6 +15,10 @@ public:
     virtual ~StreamBufferPin() = default;
 
     virtual void Reclaim() noexcept = 0;
+
+    [[nodiscard]] virtual u64 RequiredTick(u64 allocation_tick) const noexcept {
+        return allocation_tick;
+    }
 
     [[nodiscard]] bool IsReleased() const noexcept {
         return released.load(std::memory_order_acquire);

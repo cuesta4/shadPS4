@@ -277,12 +277,13 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         auto& watch = previous_watches[wait_cursor];
         auto pin = previous_watch_pins.empty() ? StreamBufferPinHandle{}
                                                : previous_watch_pins[wait_cursor];
-        if ((!scheduler->IsFree(watch.tick) ||
-             (pin && !pin->IsReleased())) &&
+        const u64 required_tick = pin ? pin->RequiredTick(watch.tick) : watch.tick;
+        if ((!scheduler->IsFree(required_tick) ||
+              (pin && !pin->IsReleased())) &&
             !allow_wait) {
             return false;
         }
-        scheduler->Wait(watch.tick,
+        scheduler->Wait(required_tick,
                         Common::PerformanceTelemetry::HostWaitReason::StreamBufferReuse);
         if (pin) {
             pin->Reclaim();

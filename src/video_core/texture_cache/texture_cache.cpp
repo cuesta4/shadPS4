@@ -606,8 +606,10 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
                     });
                 Common::PerformanceTelemetry::Add(
                     Common::PerformanceTelemetry::Counter::ConservativeDownloadSuppressed);
-                Common::PerformanceTelemetry::Add(
-                    Common::PerformanceTelemetry::Counter::Eager3kDownloads);
+                if (entry.size == 3072) {
+                    Common::PerformanceTelemetry::Add(
+                        Common::PerformanceTelemetry::Counter::Eager3kDownloads);
+                }
                 remaining_downloads.push_back(entry);
                 continue;
             }
@@ -1697,14 +1699,26 @@ void TextureCache::PrepareTexture(ImageId image_id, const ImageDesc& desc, bool 
 }
 
 void TextureCache::ScheduleComputeDownload(ImageId image_id) {
-    ScheduleImageDownload(image_id, true);
+    ScheduleImageDownload(image_id, true, false,
+                          Common::PerformanceTelemetry::ImageWriter::ComputeDispatch);
 }
 
 void TextureCache::ScheduleRenderTargetDownload(ImageId image_id) {
-    ScheduleImageDownload(image_id, false);
+    const Image& image = slot_images[image_id];
+    const auto& info = image.info;
+    const bool fastpath_candidate =
+        GpuAuthorityTracker::Instance().IsGow3FastpathActive() && !info.props.is_tiled &&
+        !image.usage.storage && info.pixel_format == vk::Format::eR16G16Sfloat &&
+        info.size.width == 1 && info.size.height == 1 && info.size.depth == 1 &&
+        info.pitch == 128 && info.resources.levels == 1 && info.resources.layers == 1 &&
+        GetDownloadSize(info) == 512;
+    ScheduleImageDownload(image_id, fastpath_candidate, true,
+                          Common::PerformanceTelemetry::ImageWriter::GraphicsDraw);
 }
 
-void TextureCache::ScheduleImageDownload(ImageId image_id, bool fastpath_candidate) {
+void TextureCache::ScheduleImageDownload(
+    ImageId image_id, bool fastpath_candidate, bool replace_existing,
+    Common::PerformanceTelemetry::ImageWriter producer_kind) {
     Image& image = slot_images[image_id];
     if (!readback_linear_images || (image.info.props.is_tiled && image.info.size.width > 8) ||
         image.info.guest_address == 0) {
@@ -1722,10 +1736,11 @@ void TextureCache::ScheduleImageDownload(ImageId image_id, bool fastpath_candida
             .download_size = download_size,
             .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
             .producer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+            .producer_kind = producer_kind,
         };
     }
     std::unique_lock downloads_lock{download_images_mutex};
-    if (!fastpath_candidate) {
+    if (replace_existing) {
         std::erase_if(pending_downloads, [image_id, image_uid = image.image_uid](const auto& entry) {
             return entry.image_id == image_id && entry.image_uid == image_uid;
         });
@@ -1770,11 +1785,12 @@ void TextureCache::WaitGpuAuthorityShadow(
         return;
     }
     auto* master_semaphore = scheduler.GetMasterSemaphore();
-    if (!master_semaphore->IsFree(shadow->tick) && liverpool->IsGpuThread() &&
-        shadow->tick >= scheduler.CurrentTick()) {
+    const u64 tick = shadow->Tick();
+    if (!master_semaphore->IsFree(tick) && liverpool->IsGpuThread() &&
+        tick >= scheduler.CurrentTick()) {
         scheduler.Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
     }
-    master_semaphore->Wait(shadow->tick,
+    master_semaphore->Wait(tick,
                            Common::PerformanceTelemetry::HostWaitReason::FenceCpuVisibility);
 }
 
@@ -1785,7 +1801,7 @@ bool TextureCache::MaterializeGpuAuthority(
         *out_validation_bytes_equal = -1;
     }
     if (!shadow || shadow->guest_addr != required_addr || shadow->size != required_size ||
-        !scheduler.GetMasterSemaphore()->IsFree(shadow->tick)) {
+        !scheduler.GetMasterSemaphore()->IsFree(shadow->Tick())) {
         return false;
     }
     std::scoped_lock shadow_lock{shadow->data_mutex};
