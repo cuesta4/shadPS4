@@ -857,7 +857,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         .subresourceRange{frame_subresources},
     };
 
-    draw_scheduler.EndRendering();
+    draw_scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::Present,
+                                Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = draw_scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Present, image_id.index,
+        static_cast<u64>(attribute.attrib.width) * attribute.attrib.height * 4);
     const auto cmdbuf = draw_scheduler.CommandBuffer();
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -916,6 +920,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
+    draw_scheduler.EndGpuInterval(gpu_interval);
     SubmitInfo info{};
     draw_scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild);
     return frame;
@@ -926,7 +931,11 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     Frame* frame = GetRenderFrame();
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::Present,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Present, frame->id,
+        static_cast<u64>(frame->width) * frame->height * 4);
 
     const auto cmdbuf = scheduler.CommandBuffer();
 
@@ -989,6 +998,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Flush frame creation commands.
     frame->ready_semaphore = scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = scheduler.CurrentTick();
+    scheduler.EndGpuInterval(gpu_interval);
     SubmitInfo info{};
     scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild);
     return frame;
@@ -1043,6 +1053,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Present, frame->id,
+        static_cast<u64>(swapchain.GetExtent().width) * swapchain.GetExtent().height * 4);
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::vector<ScreenshotReadback> pending_screenshots;
     if (capture_with_overlays_count > 0) {
@@ -1245,6 +1258,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
                  vk::PipelineStageFlagBits::eFragmentShader);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    scheduler.EndGpuInterval(gpu_interval);
     scheduler.Flush(info, Common::PerformanceTelemetry::SubmitReason::PresentSubmit);
     // Present to swapchain.
     const bool present_succeeded = swapchain.Present(frame->id);

@@ -133,7 +133,8 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 }
 
 void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
-    scheduler->EndRendering();
+    scheduler->EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                            Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer size must be a multiple of 4 bytes");
     const auto cmdbuf = scheduler->CommandBuffer();

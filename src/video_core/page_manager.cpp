@@ -674,6 +674,7 @@ struct PageManager::Impl {
     bool HasReadWatcher(VAddr address) const {
         const size_t page = address >> PM_PAGE_BITS;
         if (page >= cached_pages.size()) return false;
+        std::scoped_lock lock{read_watch_mutex};
         return cached_pages[page].num_read_watchers > 0;
     }
 
@@ -696,7 +697,7 @@ struct PageManager::Impl {
     std::array<LockType, NUM_ADDRESS_LOCKS> locks{};
     std::mutex mapping_mutex;
     boost::icl::interval_set<VAddr> gpu_mappings;
-    std::mutex read_watch_mutex;
+    mutable std::mutex read_watch_mutex;
     tsl::robin_map<size_t, u16> read_watch_refcounts;
     std::mutex write_watch_mutex;
     tsl::robin_map<VAddr, WatchedPage> watched_pages;

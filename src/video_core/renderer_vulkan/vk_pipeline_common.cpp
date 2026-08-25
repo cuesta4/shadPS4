@@ -58,7 +58,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             .bufferMemoryBarrierCount = u32(buffer_barriers.size()),
             .pBufferMemoryBarriers = buffer_barriers.data(),
         };
-        scheduler.EndRendering();
+        scheduler.EndRendering(
+            Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
+            Common::PerformanceTelemetry::Avoidability::ProvenRequired);
         cmdbuf.pipelineBarrier2(dependencies);
     }
 

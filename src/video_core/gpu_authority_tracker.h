@@ -89,6 +89,9 @@ struct GpuAuthorityShadow final : StreamBufferPin {
 struct GpuAuthorityEntry {
     u64 authority_seq{0};
     u64 candidate_seq{0};
+    Common::PerformanceTelemetry::ScopeSeq scope_seq{0};
+    Common::PerformanceTelemetry::CauseSeq cause_seq{0};
+    Common::PerformanceTelemetry::SignalSeq signal_seq{0};
     u32 image_id{0};
     u64 image_uid{0};
     u64 resource_id{0};
@@ -116,6 +119,10 @@ struct GpuAuthorityEntry {
 struct VirtualGpuFence {
     u64 virtual_fence_seq{0};
     u64 authority_seq{0};
+    u64 candidate_seq{0};
+    Common::PerformanceTelemetry::ScopeSeq scope_seq{0};
+    Common::PerformanceTelemetry::CauseSeq cause_seq{0};
+    Common::PerformanceTelemetry::SignalSeq signal_seq{0};
     Common::PerformanceTelemetry::FenceSeq fence_seq{0};
     VAddr label_addr{0};
     u64 label_generation{0};

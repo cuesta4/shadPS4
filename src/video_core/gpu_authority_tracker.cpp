@@ -90,6 +90,18 @@ void GpuAuthorityTracker::RegisterAuthority(const GpuAuthorityEntry& entry) {
             });
             Common::PerformanceTelemetry::Add(
                 Common::PerformanceTelemetry::Counter::AuthoritySupersededWithoutHostUse);
+            Common::PerformanceTelemetry::RecordCandidateTerminal(
+                Common::PerformanceTelemetry::CandidateTerminalSample{
+                    .candidate_id = old_entry->candidate_seq,
+                    .resource_uid = old_entry->resource_id,
+                    .resource_epoch = old_entry->resource_version,
+                    .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                    .bytes_preserved = old_entry->download_size,
+                    .reason =
+                        Common::PerformanceTelemetry::CandidateTerminalReason::Superseded,
+                    .had_cpu_consumer = static_cast<u8>(old_entry->host_current),
+                    .had_gpu_consumer = static_cast<u8>(old_entry->gpu_consumed),
+                });
         }
     }
     std::erase_if(authorities, [](const auto& old_entry) {
@@ -227,6 +239,7 @@ std::shared_ptr<GpuAuthorityShadow> GpuAuthorityTracker::AcquireGpuShadowForImag
                                                  : entry->shadow->Tick());
         if (!entry->gpu_consumed) {
             entry->gpu_consumed = true;
+            const auto consumer_seq = Common::PerformanceTelemetry::NextConsumerSeq();
             Common::PerformanceTelemetry::RecordAuthorityGpuConsume(
                 Common::PerformanceTelemetry::AuthorityGpuConsumeSample{
                     .authority_seq = entry->authority_seq,
@@ -234,7 +247,7 @@ std::shared_ptr<GpuAuthorityShadow> GpuAuthorityTracker::AcquireGpuShadowForImag
                     .resource_version = entry->resource_version,
                     .image_id = entry->image_id,
                     .image_uid = entry->image_uid,
-                    .consumer_seq = Common::PerformanceTelemetry::NextConsumerSeq(),
+                    .consumer_seq = consumer_seq,
                     .consumer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
                     .consumer_kind = static_cast<u32>(
                         Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy),
@@ -244,6 +257,23 @@ std::shared_ptr<GpuAuthorityShadow> GpuAuthorityTracker::AcquireGpuShadowForImag
                     .consumer_cmd_buffer_seq =
                         Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
                     .consumer_submit_seq = 0,
+                });
+            Common::PerformanceTelemetry::RecordCandidateConsumer(
+                Common::PerformanceTelemetry::CandidateConsumerSample{
+                    .candidate_id = entry->candidate_seq,
+                    .consumer_id = consumer_seq,
+                    .resource_uid = entry->resource_id,
+                    .resource_epoch = entry->resource_version,
+                    .guest_begin = entry->guest_begin,
+                    .guest_end = entry->guest_end,
+                    .packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+                    .command_buffer_seq =
+                        Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                    .stage_bits = static_cast<u64>(vk::PipelineStageFlagBits2::eTransfer),
+                    .access_bits = static_cast<u64>(vk::AccessFlagBits2::eTransferRead),
+                    .kind = Common::PerformanceTelemetry::CandidateConsumerKind::GpuBuffer,
+                    .same_version = 1,
+                    .confidence = 255,
                 });
             Common::PerformanceTelemetry::Add(
                 Common::PerformanceTelemetry::Counter::AuthorityGpuFirstConsumer);
@@ -306,6 +336,24 @@ std::shared_ptr<VirtualGpuFence> GpuAuthorityTracker::MatchVirtualWait(
     }
     fence->wait_consumed = true;
     fence->wait_packet_seq = wait_pkt;
+    Common::PerformanceTelemetry::RecordLogicalSignal(
+        Common::PerformanceTelemetry::LogicalSignalSample{
+            .signal_id = fence->signal_seq,
+            .candidate_id = fence->candidate_seq,
+            .scope_id = fence->scope_seq,
+            .cause_id = fence->cause_seq,
+            .wait_seq = wait_seq,
+            .packet_seq = wait_pkt,
+            .label_addr = fence->label_addr,
+            .label_generation = fence->label_generation,
+            .value = fence->expected_value,
+            .producer_tick = fence->producer_tick,
+            .phase = Common::PerformanceTelemetry::LogicalSignalPhase::WaitMatched,
+            .action = Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+            .producer_submitted = static_cast<u8>(
+                rasterizer && rasterizer->CurrentTick() > fence->producer_tick),
+            .producer_completed = static_cast<u8>(fence->gpu_complete),
+        });
     RetireVirtualFenceLocked(fence);
     return fence;
 }
@@ -338,6 +386,22 @@ void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_t
     }
 
     const u64 completed_tick = rasterizer ? rasterizer->KnownGpuTick() : 0;
+    Common::PerformanceTelemetry::RecordLogicalSignal(
+        Common::PerformanceTelemetry::LogicalSignalSample{
+            .signal_id = fence->signal_seq,
+            .candidate_id = fence->candidate_seq,
+            .scope_id = fence->scope_seq,
+            .cause_id = fence->cause_seq,
+            .packet_seq = fence->producer_packet_seq,
+            .label_addr = fence->label_addr,
+            .label_generation = fence->label_generation,
+            .value = fence->expected_value,
+            .producer_tick = fence->producer_tick,
+            .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Published,
+            .action = Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+            .producer_submitted = 1,
+            .producer_completed = 1,
+        });
     if (action == Common::PerformanceTelemetry::AsyncLabelAction::Wrote) {
         if (rasterizer) {
             rasterizer->NotifyMemoryWrite(fence->label_addr, sizeof(u32),
@@ -529,6 +593,24 @@ bool GpuAuthorityTracker::ResolveForRamRead(
             .destination_resource_id = dest_res_id,
             .authority_state_before = state_before,
         });
+        Common::PerformanceTelemetry::RecordCandidateConsumer(
+            Common::PerformanceTelemetry::CandidateConsumerSample{
+                .candidate_id = entry->candidate_seq,
+                .consumer_id = consumer_seq,
+                .resource_uid = entry->resource_id,
+                .resource_epoch = entry->resource_version,
+                .guest_begin = overlap_begin,
+                .guest_end = overlap_end,
+                .destination_uid = dest_res_id,
+                .packet_seq = cur_pkt_seq,
+                .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .kind = dest_kind == Common::PerformanceTelemetry::ResourceType::Image
+                            ? Common::PerformanceTelemetry::CandidateConsumerKind::GpuImage
+                            : Common::PerformanceTelemetry::CandidateConsumerKind::GpuBuffer,
+                .same_version = 1,
+                .required_materialization = 1,
+                .confidence = 255,
+            });
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::RamDemandEvents);
 
         if (entry->state == GpuAuthorityState::HostCurrent) {
@@ -674,6 +756,31 @@ bool GpuAuthorityTracker::ResolveForRamRead(
                     .producer_tick_complete = 1,
                     .materialize_success = 1,
                 });
+                Common::PerformanceTelemetry::RecordCandidateRepresentation(
+                    Common::PerformanceTelemetry::CandidateRepresentationSample{
+                        .candidate_id = entry->candidate_seq,
+                        .representation_id =
+                            Common::PerformanceTelemetry::NextRepresentationSeq(),
+                        .resource_uid = res_id,
+                        .resource_epoch = res_ver,
+                        .authority_id = auth_seq,
+                        .copy_bytes = dl_size,
+                        .timeline_tick = completed_tick,
+                        .representation =
+                            Common::PerformanceTelemetry::RepresentationKind::GuestRam,
+                    });
+                Common::PerformanceTelemetry::RecordCandidateTerminal(
+                    Common::PerformanceTelemetry::CandidateTerminalSample{
+                        .candidate_id = entry->candidate_seq,
+                        .resource_uid = res_id,
+                        .resource_epoch = res_ver,
+                        .first_consumer_id = consumer_seq,
+                        .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                        .bytes_preserved = dl_size,
+                        .reason =
+                            Common::PerformanceTelemetry::CandidateTerminalReason::Materialized,
+                        .had_gpu_consumer = static_cast<u8>(entry->gpu_consumed),
+                    });
             } else {
                 Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::MaterializeFailure);
                 all_succeeded = false;
@@ -705,6 +812,12 @@ bool GpuAuthorityTracker::HandleCpuRead(VAddr fault_addr, size_t size) {
             }
             return true;
         }
+        u8 requires_materialization{};
+        {
+            std::scoped_lock entry_lock{*entry->entry_mutex};
+            requires_materialization =
+                static_cast<u8>(entry->state != GpuAuthorityState::HostCurrent);
+        }
         Common::PerformanceTelemetry::RecordAuthorityCpuRead(Common::PerformanceTelemetry::AuthorityCpuReadSample{
             .authority_seq = entry->authority_seq,
             .fault_addr = fault_addr,
@@ -714,6 +827,19 @@ bool GpuAuthorityTracker::HandleCpuRead(VAddr fault_addr, size_t size) {
             .materialize_seq = 0,
             .resumed_after_materialize = 1,
         });
+        Common::PerformanceTelemetry::RecordCandidateConsumer(
+            Common::PerformanceTelemetry::CandidateConsumerSample{
+                .candidate_id = entry->candidate_seq,
+                .consumer_id = Common::PerformanceTelemetry::NextConsumerSeq(),
+                .resource_uid = entry->resource_id,
+                .resource_epoch = entry->resource_version,
+                .guest_begin = fault_addr,
+                .guest_end = fault_addr + (size > 0 ? size : 4),
+                .kind = Common::PerformanceTelemetry::CandidateConsumerKind::CpuData,
+                .same_version = 1,
+                .required_materialization = requires_materialization,
+                .confidence = 255,
+            });
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AuthorityCpuRead);
     }
     const bool ok = ResolveForRamRead(watch_addr, watch_size,
@@ -767,6 +893,17 @@ void GpuAuthorityTracker::HandleUnmap(VAddr addr, size_t size) {
         entry->cv->notify_all();
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::AuthorityDestroyedWithoutHostUse);
+        Common::PerformanceTelemetry::RecordCandidateTerminal(
+            Common::PerformanceTelemetry::CandidateTerminalSample{
+                .candidate_id = entry->candidate_seq,
+                .resource_uid = entry->resource_id,
+                .resource_epoch = entry->resource_version,
+                .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                .bytes_preserved = entry->download_size,
+                .reason = Common::PerformanceTelemetry::CandidateTerminalReason::Unmapped,
+                .had_cpu_consumer = static_cast<u8>(entry->host_current),
+                .had_gpu_consumer = static_cast<u8>(entry->gpu_consumed),
+            });
     }
     for (const auto& entry : overlaps) {
         RefreshAuthorityReadWatches(entry->guest_begin, entry->download_size);
@@ -812,6 +949,60 @@ void GpuAuthorityTracker::ValidateGpuConsumerBarrier(
             .subresource_range = subresource_range,
             .valid_write_dependency = valid_dep,
         });
+    const auto hazard_id = Common::PerformanceTelemetry::NextHazardSeq();
+    const auto barrier_id = Common::PerformanceTelemetry::NextBarrierSeq();
+    Common::PerformanceTelemetry::RecordHazardResolution(
+        Common::PerformanceTelemetry::HazardResolutionSample{
+            .hazard_id = hazard_id,
+            .barrier_id = barrier_id,
+            .cause_id = entry->cause_seq,
+            .candidate_id = entry->candidate_seq,
+            .resource_uid = entry->resource_id,
+            .resource_epoch = entry->resource_version,
+            .guest_begin = entry->guest_begin,
+            .guest_end = entry->guest_end,
+            .src_stage = src_stage,
+            .src_access = src_access,
+            .dst_stage = dst_stage,
+            .dst_access = dst_access,
+            .sync_requirement_bits =
+                static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+                static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility) |
+                (old_layout != new_layout
+                     ? static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                            ImageLayoutTransition)
+                     : 0),
+            .old_layout = old_layout,
+            .new_layout = new_layout,
+            .image_barrier_count = 1,
+            .resolution = valid_dep
+                              ? (old_layout != new_layout
+                                     ? Common::PerformanceTelemetry::HazardResolutionKind::
+                                           LayoutTransition
+                                     : Common::PerformanceTelemetry::HazardResolutionKind::
+                                           BarrierEmitted)
+                              : Common::PerformanceTelemetry::HazardResolutionKind::TraceGap,
+            .avoidability = valid_dep
+                                ? Common::PerformanceTelemetry::Avoidability::ProvenRequired
+                                : Common::PerformanceTelemetry::Avoidability::UnknownDueToTraceGap,
+            .confidence = static_cast<u8>(valid_dep ? 255 : 96),
+        });
+    Common::PerformanceTelemetry::RecordCausalEffect(
+        Common::PerformanceTelemetry::CausalEffectSample{
+            .effect_id = Common::PerformanceTelemetry::NextEffectSeq(),
+            .cause_id = entry->cause_seq,
+            .candidate_id = entry->candidate_seq,
+            .scope_id = entry->scope_seq,
+            .hazard_id = hazard_id,
+            .object_id = barrier_id,
+            .command_buffer_seq = cur_cmdbuf,
+            .kind = Common::PerformanceTelemetry::CausalEffectKind::Barrier,
+            .attribution = Common::PerformanceTelemetry::EffectAttribution::Shared,
+            .avoidability = valid_dep
+                                ? Common::PerformanceTelemetry::Avoidability::ProvenRequired
+                                : Common::PerformanceTelemetry::Avoidability::UnknownDueToTraceGap,
+            .confidence = static_cast<u8>(valid_dep ? 255 : 96),
+        });
 
     if (valid_dep) {
         Common::PerformanceTelemetry::Add(
@@ -839,6 +1030,23 @@ void GpuAuthorityTracker::ValidateGpuConsumerBarrier(
                 .producer_tick = prod_tick,
                 .consumer_cmd_buffer_seq = cur_cmdbuf,
                 .consumer_submit_seq = 0,
+            });
+        Common::PerformanceTelemetry::RecordCandidateConsumer(
+            Common::PerformanceTelemetry::CandidateConsumerSample{
+                .candidate_id = entry->candidate_seq,
+                .consumer_id = consumer_seq,
+                .resource_uid = entry->resource_id,
+                .resource_epoch = entry->resource_version,
+                .guest_begin = entry->guest_begin,
+                .guest_end = entry->guest_end,
+                .packet_seq = cur_pkt,
+                .command_buffer_seq = cur_cmdbuf,
+                .stage_bits = dst_stage,
+                .access_bits = dst_access,
+                .layout = new_layout,
+                .kind = Common::PerformanceTelemetry::CandidateConsumerKind::GpuImage,
+                .same_version = 1,
+                .confidence = static_cast<u8>(valid_dep ? 255 : 128),
             });
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::AuthorityGpuFirstConsumer);

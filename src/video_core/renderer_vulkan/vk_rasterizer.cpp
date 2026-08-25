@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/hash.h"
 #include "common/performance_telemetry.h"
 #include "common/signal_context.h"
 #include "core/debug_state.h"
@@ -33,6 +34,57 @@
 #endif
 
 namespace Vulkan {
+
+static u64 RecordBarrierCausality(vk::PipelineStageFlags2 src_stage,
+                                  vk::AccessFlags2 src_access,
+                                  vk::PipelineStageFlags2 dst_stage,
+                                  vk::AccessFlags2 dst_access, u16 memory_barriers,
+                                  u16 buffer_barriers, u16 image_barriers,
+                                  Common::PerformanceTelemetry::Avoidability avoidability) {
+    if (!Common::PerformanceTelemetry::Enabled()) {
+        return 0;
+    }
+    const auto context = Common::PerformanceTelemetry::CurrentCausalContext();
+    const auto hazard_id = context.hazard_id != 0
+                               ? context.hazard_id
+                               : Common::PerformanceTelemetry::NextHazardSeq();
+    const auto barrier_id = Common::PerformanceTelemetry::NextBarrierSeq();
+    Common::PerformanceTelemetry::RecordHazardResolution(
+        Common::PerformanceTelemetry::HazardResolutionSample{
+            .hazard_id = hazard_id,
+            .barrier_id = barrier_id,
+            .cause_id = context.cause_id,
+            .candidate_id = context.candidate_id,
+            .src_stage = static_cast<u64>(src_stage),
+            .src_access = static_cast<u64>(src_access),
+            .dst_stage = static_cast<u64>(dst_stage),
+            .dst_access = static_cast<u64>(dst_access),
+            .sync_requirement_bits =
+                static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+                static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility),
+            .memory_barrier_count = memory_barriers,
+            .buffer_barrier_count = buffer_barriers,
+            .image_barrier_count = image_barriers,
+            .resolution = Common::PerformanceTelemetry::HazardResolutionKind::BarrierEmitted,
+            .avoidability = avoidability,
+            .confidence = 255,
+        });
+    Common::PerformanceTelemetry::RecordCausalEffect(
+        Common::PerformanceTelemetry::CausalEffectSample{
+            .effect_id = Common::PerformanceTelemetry::NextEffectSeq(),
+            .cause_id = context.cause_id,
+            .candidate_id = context.candidate_id,
+            .scope_id = context.scope_id,
+            .hazard_id = hazard_id,
+            .object_id = barrier_id,
+            .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+            .kind = Common::PerformanceTelemetry::CausalEffectKind::Barrier,
+            .attribution = Common::PerformanceTelemetry::EffectAttribution::Shared,
+            .avoidability = avoidability,
+            .confidence = 255,
+        });
+    return barrier_id;
+}
 
 static SHAD_NO_INLINE void ValidateResolvedSharp(size_t index, size_t descriptor_count,
                                                  size_t resolved_count) {
@@ -277,16 +329,26 @@ Rasterizer::~Rasterizer() {
 }
 
 void Rasterizer::CpSync() {
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     auto cmdbuf = scheduler.CommandBuffer();
 
     const vk::MemoryBarrier ib_barrier{
         .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
         .dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead,
     };
+    const u64 barrier_id = RecordBarrierCausality(
+        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+        vk::PipelineStageFlagBits2::eDrawIndirect,
+        vk::AccessFlagBits2::eIndirectCommandRead, 1, 0, 0,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
                            vk::PipelineStageFlagBits::eDrawIndirect,
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
+    scheduler.EndGpuInterval(interval);
 }
 
 void Rasterizer::AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size) {
@@ -350,18 +412,26 @@ void Rasterizer::AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size) 
                      vk::AccessFlagBits2::eMemoryRead;
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = src_stages,
         .srcAccessMask = src_access,
         .dstStageMask = dst_stages,
         .dstAccessMask = dst_access,
     };
+    const u64 barrier_id = RecordBarrierCausality(
+        src_stages, src_access, dst_stages, dst_access, 1, 0, 0,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
     auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
+    scheduler.EndGpuInterval(interval);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AcquireMemBarriers);
     Common::PerformanceTelemetry::RecordEnabled(
@@ -417,7 +487,9 @@ void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
         return;
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = src_stages,
         .srcAccessMask = src_access,
@@ -430,11 +502,17 @@ void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
                          vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
                          vk::AccessFlagBits2::eMemoryRead,
     };
+    const u64 barrier_id = RecordBarrierCausality(
+        src_stages, src_access, barrier.dstStageMask, barrier.dstAccessMask, 1, 0, 0,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
     auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
+    scheduler.EndGpuInterval(interval);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     Common::PerformanceTelemetry::Add(
         Common::PerformanceTelemetry::Counter::EventWriteFlushBarriers);
@@ -444,7 +522,9 @@ void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
 }
 
 void Rasterizer::FullGpuBarrier() {
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead |
@@ -460,10 +540,17 @@ void Rasterizer::FullGpuBarrier() {
                          vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
                          vk::AccessFlagBits2::eTransferWrite,
     };
+    const u64 barrier_id = RecordBarrierCausality(
+        barrier.srcStageMask, barrier.srcAccessMask, barrier.dstStageMask,
+        barrier.dstAccessMask, 1, 0, 0,
+        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
+    scheduler.EndGpuInterval(interval);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BruteForceBarriers);
 }
@@ -670,6 +757,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindGraphicsPipeline(pipeline->Handle());
+    scheduler.ProfileGraphicsDraw(std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -744,6 +832,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindGraphicsPipeline(pipeline->Handle());
+    scheduler.ProfileGraphicsDraw(std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -798,11 +887,14 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     BindPipelineResources(pipeline);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.ProfileComputeDispatch(std::hash<ComputePipelineKey>{}(pipeline->GetComputeKey()));
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
@@ -839,11 +931,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         buffer_barriers.emplace_back(*barrier);
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     BindPipelineResources(pipeline);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.ProfileComputeDispatch(std::hash<ComputePipelineKey>{}(pipeline->GetComputeKey()));
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
@@ -2095,8 +2190,12 @@ void Rasterizer::Resolve() {
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->regs.color_buffers[0].Address(),
                                  liverpool->regs.color_buffers[1].Address()));
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Resolve, mrt1_image.image_uid,
+        mrt1_image.info.guest_size);
     mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range,
                        Common::PerformanceTelemetry::ImageWriter::GraphicsDraw);
+    scheduler.EndGpuInterval(interval);
     ScopeMarkerEnd();
 }
 
@@ -2121,6 +2220,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
+
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, write_image.image_uid,
+        write_image.info.guest_size);
 
     read_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
                        sub_range);
@@ -2158,16 +2261,24 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
                                         write_image.GetImage(),
                                         vk::ImageLayout::eTransferDstOptimal, region);
     write_image.MarkWrite(Common::PerformanceTelemetry::ImageWriter::Transfer);
+    scheduler.EndGpuInterval(interval);
 
     ScopeMarkerEnd();
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Clear, address, num_bytes);
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
+    scheduler.EndGpuInterval(interval);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    const u64 interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy,
+        HashCombine(dst, src), num_bytes);
     buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
+    scheduler.EndGpuInterval(interval);
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {

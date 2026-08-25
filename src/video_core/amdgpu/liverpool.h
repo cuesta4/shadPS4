@@ -266,6 +266,11 @@ private:
         Common::PerformanceTelemetry::FenceSeq fence_seq{};
         Common::PerformanceTelemetry::FenceGen generation{};
         Common::PerformanceTelemetry::PacketSeq packet_seq{};
+        Common::PerformanceTelemetry::CandidateSeq candidate_id{};
+        Common::PerformanceTelemetry::ScopeSeq scope_id{};
+        Common::PerformanceTelemetry::CauseSeq cause_id{};
+        Common::PerformanceTelemetry::SignalSeq signal_id{};
+        Common::PerformanceTelemetry::HazardSeq hazard_id{};
         VAddr label_addr{};
         u64 label_value{};
     };

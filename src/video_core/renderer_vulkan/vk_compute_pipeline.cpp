@@ -5,6 +5,7 @@
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -105,7 +106,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
+    const bool capture_executable = PipelineExecutableCaptureEnabled() &&
+                                    instance.SupportsPipelineExecutableProperties();
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = capture_executable
+                     ? vk::PipelineCreateFlags{
+                           vk::PipelineCreateFlagBits::eCaptureStatisticsKHR}
+                     : vk::PipelineCreateFlags{},
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
@@ -114,6 +121,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
+    RecordPipelineExecutableStatistics(instance, *pipeline, compute_key.value, true);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }
 

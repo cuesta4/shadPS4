@@ -98,6 +98,10 @@ public:
     };
 
     struct DownloadContext {
+        Common::PerformanceTelemetry::ScopeSeq scope_id{0};
+        Common::PerformanceTelemetry::CauseSeq cause_id{0};
+        Common::PerformanceTelemetry::SignalSeq signal_id{0};
+        Common::PerformanceTelemetry::HazardSeq hazard_id{0};
         DownloadTrigger trigger{DownloadTrigger::Other};
         u64 fence_seq{0};
         u32 trigger_control{0};
@@ -105,20 +109,29 @@ public:
     };
 
     struct PendingImageDownload {
+        Common::PerformanceTelemetry::CandidateSeq candidate_id{0};
         u64 pending_seq{0};
         ImageId image_id{0};
         u64 image_uid{0};
         u64 resource_id{0};
         u64 resource_version{0};
+        u64 alias_epoch{0};
+        u64 created_timestamp_ns{0};
+        u64 descriptor_hash{0};
+        u64 producer_seq{0};
+        Common::PerformanceTelemetry::PacketSeq producer_packet_seq{0};
         VAddr guest_begin{0};
         u32 size{0};
         DownloadPolicy policy{DownloadPolicy::LegacyEager};
     };
 
     struct PendingFastpathCandidate {
+        Common::PerformanceTelemetry::CandidateSeq candidate_id{0};
         ImageId image_id{0};
         u64 image_uid{0};
         u64 resource_version{0};
+        u64 alias_epoch{0};
+        u64 created_timestamp_ns{0};
         VAddr guest_addr{0};
         u32 download_size{0};
         u64 producer_seq{0};
@@ -373,7 +386,9 @@ private:
 
     /// Copies image memory back to CPU.
     bool DownloadImageMemory(ImageId image_id, bool validate_identity = false,
-                             bool track_gpu_source = false, bool* gpu_resident = nullptr);
+                             bool track_gpu_source = false, bool* gpu_resident = nullptr,
+                             u64 candidate_created_timestamp_ns = 0,
+                             u64 candidate_alias_epoch = 0);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);

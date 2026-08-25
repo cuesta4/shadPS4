@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,6 +34,105 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+namespace {
+
+using namespace Common::PerformanceTelemetry;
+
+u64 CandidateDescriptorHash(const Image& image) {
+    return XXH3_64bits(&image.info, sizeof(image.info));
+}
+
+u32 CandidateCapabilities(const Image& image) {
+    u32 bits = static_cast<u32>(CandidateCapability::CpuMaterialization);
+    bits |= static_cast<u32>(image.info.props.is_tiled ? CandidateCapability::Tiled
+                                                       : CandidateCapability::Linear);
+    if (image.SafeToDownload()) {
+        bits |= static_cast<u32>(CandidateCapability::SafeDownload) |
+                static_cast<u32>(CandidateCapability::GpuShadow) |
+                static_cast<u32>(CandidateCapability::DurablePin);
+        if (!image.info.props.is_tiled) {
+            bits |= static_cast<u32>(CandidateCapability::DirectAuthority);
+        }
+    }
+    return bits;
+}
+
+std::pair<u16, u16> CandidateProducerLocation(ImageWriter writer) noexcept {
+    switch (writer) {
+    case ImageWriter::GraphicsDraw:
+        return {static_cast<u16>(Pm4Engine::Graphics),
+                static_cast<u16>(FenceStageScope::Ps)};
+    case ImageWriter::ComputeDispatch:
+    case ImageWriter::ComputeHle:
+        return {static_cast<u16>(Pm4Engine::Compute), static_cast<u16>(FenceStageScope::Cs)};
+    case ImageWriter::Transfer:
+        return {static_cast<u16>(Pm4Engine::Graphics),
+                static_cast<u16>(FenceStageScope::Pipe)};
+    default:
+        return {std::numeric_limits<u16>::max(), std::numeric_limits<u16>::max()};
+    }
+}
+
+void RecordCandidateScheduleForImage(CandidateSeq candidate_id, ImageId image_id,
+                                     const Image& image, u64 alias_epoch, u32 download_size,
+                                     ImageWriter producer_kind, u64 reason_mask) {
+    const auto producer_seq = CurrentProducerSeq();
+    const auto [producer_engine, producer_stage] = CandidateProducerLocation(producer_kind);
+    if (producer_seq == 0) {
+        reason_mask |= static_cast<u64>(CandidateRejectReason::ProducerUnknown);
+    }
+    RecordCandidateSchedule(CandidateScheduleSample{
+        .candidate_id = candidate_id,
+        .frame_seq = CurrentFrameSeq(),
+        .command_buffer_seq = CurrentCmdBufferSeq(),
+        .producer_seq = producer_seq,
+        .producer_packet_seq = CurrentPacketSeq(),
+        .resource_uid = image.image_uid,
+        .resource_epoch = image.content_epoch,
+        .alias_epoch = alias_epoch,
+        .guest_begin = image.info.guest_address,
+        .guest_end = image.info.guest_address + download_size,
+        .descriptor_hash = CandidateDescriptorHash(image),
+        .image_id = image_id.index,
+        .pixel_format = static_cast<u32>(image.info.pixel_format),
+        .width = image.info.size.width,
+        .height = image.info.size.height,
+        .depth = image.info.size.depth,
+        .pitch = image.info.pitch,
+        .levels = static_cast<u16>(image.info.resources.levels),
+        .layers = static_cast<u16>(image.info.resources.layers),
+        .producer_engine = producer_engine,
+        .producer_stage = producer_stage,
+        .writer_kind = static_cast<u16>(producer_kind),
+        .aspect = static_cast<u16>(image.info.props.is_depth ? 1 : 0),
+        .capability_bits = CandidateCapabilities(image),
+        .initial_reason_mask = reason_mask,
+    });
+}
+
+void RecordCandidateTerminalState(const TextureCache::PendingImageDownload& entry,
+                                  CandidateTerminalReason reason, u64 reason_mask = 0,
+                                  bool cpu_consumer = false, bool gpu_consumer = false) {
+    if (entry.candidate_id == 0) {
+        return;
+    }
+    RecordCandidateTerminal(CandidateTerminalSample{
+        .candidate_id = entry.candidate_id,
+        .resource_uid = entry.resource_id,
+        .resource_epoch = entry.resource_version,
+        .alias_epoch = entry.alias_epoch,
+        .created_timestamp_ns = entry.created_timestamp_ns,
+        .terminal_timestamp_ns = Timestamp(),
+        .bytes_preserved = entry.size,
+        .reason_mask = reason_mask,
+        .reason = reason,
+        .had_cpu_consumer = static_cast<u8>(cpu_consumer),
+        .had_gpu_consumer = static_cast<u8>(gpu_consumer),
+    });
+}
+
+} // namespace
 
 struct PendingImageReadback {
     struct Page {
@@ -395,7 +495,8 @@ bool TextureCache::CommitAliasWriter(AliasState& state) {
 void TextureCache::CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent) {
     Image& src = slot_images[src_id];
     Image& dst = slot_images[dst_id];
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     auto barriers =
         src.GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
                         vk::PipelineStageFlagBits2::eCopy, {});
@@ -504,6 +605,7 @@ void TextureCache::PublishAliasWrite(ImageId image_id) {
 bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* gpu_resident) {
     std::scoped_lock texture_lock{mutex};
     std::unique_lock downloads_lock{download_images_mutex};
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     for (const VAddr address : pending_alias_downloads) {
         const auto state_it = alias_states.find(address);
         if (state_it == alias_states.end()) {
@@ -521,18 +623,40 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
             False(image.flags & ImageFlagBits::GpuModified)) {
             continue;
         }
+        const auto candidate_id =
+            telemetry_enabled ? Common::PerformanceTelemetry::NextCandidateSeq() : 0;
+        const u64 created_timestamp_ns =
+            telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        const u32 download_size = static_cast<u32>(GetDownloadSize(image.info));
+        if (telemetry_enabled) {
+            RecordCandidateScheduleForImage(
+                candidate_id, download_id, image, image.alias_generation, download_size,
+                image.TelemetryWritebackState().writer, 0);
+        }
         const PendingImageDownload download{
+            .candidate_id = candidate_id,
             .pending_seq = next_pending_download_seq++,
             .image_id = download_id,
             .image_uid = download_uid,
             .resource_id = download_uid,
             .resource_version = image.content_epoch,
+            .alias_epoch = image.alias_generation,
+            .created_timestamp_ns = created_timestamp_ns,
+            .descriptor_hash = CandidateDescriptorHash(image),
+            .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
+            .producer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
             .guest_begin = address,
-            .size = static_cast<u32>(GetDownloadSize(image.info)),
+            .size = download_size,
             .policy = DownloadPolicy::LegacyEager,
         };
-        std::erase_if(pending_downloads,
-                      [address](const auto& entry) { return entry.guest_begin == address; });
+        std::erase_if(pending_downloads, [address](const auto& entry) {
+            const bool replace = entry.guest_begin == address;
+            if (replace) {
+                RecordCandidateTerminalState(
+                    entry, Common::PerformanceTelemetry::CandidateTerminalReason::Superseded);
+            }
+            return replace;
+        });
         pending_downloads.push_back(download);
     }
     pending_alias_downloads.clear();
@@ -542,22 +666,51 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
         }
         return false;
     }
-    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     const u32 candidates = static_cast<u32>(pending_downloads.size());
     u32 scheduled_count{};
     bool all_gpu_resident = (context.trigger == DownloadTrigger::EventWriteEos);
-    scheduler.EndRendering();
+    const Common::PerformanceTelemetry::CausalTraceToken process_trace{
+        .scope_id = context.scope_id,
+        .cause_id = context.cause_id,
+        .signal_id = context.signal_id,
+        .hazard_id = context.hazard_id,
+    };
+    Common::PerformanceTelemetry::ScopedCausalContext process_context{process_trace};
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::UnknownFallback,
+                           Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
 
     std::vector<PendingImageDownload> remaining_downloads;
     remaining_downloads.reserve(pending_downloads.size());
 
     for (const auto& entry : pending_downloads) {
+        const Common::PerformanceTelemetry::CausalTraceToken candidate_trace{
+            .candidate_id = entry.candidate_id,
+            .scope_id = context.scope_id,
+            .cause_id = context.cause_id,
+            .signal_id = context.signal_id,
+            .hazard_id = context.hazard_id,
+        };
+        Common::PerformanceTelemetry::ScopedCausalContext candidate_context{candidate_trace};
         if (!slot_images.is_allocated(entry.image_id) ||
             slot_images[entry.image_id].image_uid != entry.image_uid) {
             // Stale or freed image
+            RecordCandidateTerminalState(
+                entry, Common::PerformanceTelemetry::CandidateTerminalReason::Destroyed,
+                static_cast<u64>(
+                    Common::PerformanceTelemetry::CandidateRejectReason::ImageFreedOrReused));
             continue;
         }
         auto& image = slot_images[entry.image_id];
+        const u64 base_evidence =
+            (entry.producer_seq != 0
+                 ? static_cast<u64>(
+                       Common::PerformanceTelemetry::CandidateEvidence::ProducerIdentified)
+                 : 0) |
+            static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::ResourceIdentity) |
+            static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::ResourceEpoch) |
+            static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::AliasEpoch) |
+            static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::RangeCovered) |
+            static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::TraceComplete);
         auto auth = VideoCore::GpuAuthorityTracker::Instance().GetAuthorityForImage(
             entry.image_uid, entry.resource_version);
 
@@ -606,6 +759,59 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
                     });
                 Common::PerformanceTelemetry::Add(
                     Common::PerformanceTelemetry::Counter::ConservativeDownloadSuppressed);
+                Common::PerformanceTelemetry::RecordCandidateDecision(
+                    Common::PerformanceTelemetry::CandidateDecisionSample{
+                        .candidate_id = entry.candidate_id,
+                        .scope_id = context.scope_id,
+                        .cause_id = context.cause_id,
+                        .signal_id = context.signal_id,
+                        .authority_id = auth_seq,
+                        .producer_ticket = auth ? auth->producer_tick : 0,
+                        .sync_requirement_bits =
+                            static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                 ExecutionOrder) |
+                            static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                 SnapshotPreservation),
+                        .evidence_bits = base_evidence |
+                                         static_cast<u64>(Common::PerformanceTelemetry::
+                                                              CandidateEvidence::SnapshotRepresentable) |
+                                         static_cast<u64>(Common::PerformanceTelemetry::
+                                                              CandidateEvidence::PinLifetime),
+                        .reason_mask = 0,
+                        .proposed_data_action =
+                            Common::PerformanceTelemetry::DataAction::GpuShadow,
+                        .proposed_signal_action =
+                            Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                        .executed_data_action =
+                            Common::PerformanceTelemetry::DataAction::GpuShadow,
+                        .executed_signal_action =
+                            Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                        .avoidability =
+                            Common::PerformanceTelemetry::Avoidability::ProvenEliminable,
+                        .correlation_status =
+                            Common::PerformanceTelemetry::CorrelationStatus::Complete,
+                    });
+                Common::PerformanceTelemetry::RecordCandidateRepresentation(
+                    Common::PerformanceTelemetry::CandidateRepresentationSample{
+                        .candidate_id = entry.candidate_id,
+                        .representation_id =
+                            Common::PerformanceTelemetry::NextRepresentationSeq(),
+                        .resource_uid = entry.resource_id,
+                        .resource_epoch = entry.resource_version,
+                        .alias_epoch = entry.alias_epoch,
+                        .authority_id = auth_seq,
+                        .copy_bytes = entry.size,
+                        .timeline_tick = auth ? auth->producer_tick : 0,
+                        .command_buffer_seq =
+                            Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                        .submit_seq = auth ? Common::PerformanceTelemetry::LookupSubmitSeq(
+                                                auth->producer_tick)
+                                           : 0,
+                        .representation =
+                            Common::PerformanceTelemetry::RepresentationKind::GpuShadow,
+                        .pinned = 1,
+                        .immutable_snapshot = 1,
+                    });
                 if (entry.size == 3072) {
                     Common::PerformanceTelemetry::Add(
                         Common::PerformanceTelemetry::Counter::Eager3kDownloads);
@@ -616,6 +822,61 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
         }
 
         // Legacy eager download
+        u64 reason_mask = static_cast<u64>(
+            Common::PerformanceTelemetry::CandidateRejectReason::
+                UnknownConsumerWithoutDurableSnapshot);
+        if (context.scope_id == 0) {
+            reason_mask |= static_cast<u64>(
+                Common::PerformanceTelemetry::CandidateRejectReason::NoCompletionScope);
+        }
+        if (entry.producer_seq == 0) {
+            reason_mask |= static_cast<u64>(
+                Common::PerformanceTelemetry::CandidateRejectReason::ProducerUnknown);
+        }
+        if (image.content_epoch != entry.resource_version) {
+            reason_mask |= static_cast<u64>(
+                Common::PerformanceTelemetry::CandidateRejectReason::ResourceEpochChanged);
+        }
+        if (image.alias_generation != entry.alias_epoch) {
+            reason_mask |= static_cast<u64>(
+                Common::PerformanceTelemetry::CandidateRejectReason::AliasEpochChanged);
+        }
+        const bool shadow_representable = image.SafeToDownload();
+        Common::PerformanceTelemetry::RecordCandidateDecision(
+            Common::PerformanceTelemetry::CandidateDecisionSample{
+                .candidate_id = entry.candidate_id,
+                .scope_id = context.scope_id,
+                .cause_id = context.cause_id,
+                .signal_id = context.signal_id,
+                .sync_requirement_bits =
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility) |
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                         CpuDataMaterialization),
+                .evidence_bits = base_evidence |
+                                 (shadow_representable
+                                      ? static_cast<u64>(Common::PerformanceTelemetry::
+                                                             CandidateEvidence::SnapshotRepresentable)
+                                      : 0),
+                .reason_mask = reason_mask,
+                .blocked_action_bits = static_cast<u64>(
+                    Common::PerformanceTelemetry::SyncRequirement::CpuDataMaterialization),
+                .proposed_data_action = shadow_representable
+                                            ? Common::PerformanceTelemetry::DataAction::GpuShadow
+                                            : Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                .proposed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                .executed_data_action =
+                    Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                .executed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::ForceHostCompletion,
+                .avoidability =
+                    Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+                .correlation_status = context.scope_id != 0
+                                          ? Common::PerformanceTelemetry::CorrelationStatus::Complete
+                                          : Common::PerformanceTelemetry::CorrelationStatus::
+                                                MissingContext,
+            });
         ImageTelemetryWritebackState telemetry_state{};
         u64 backing_image{};
         if (telemetry_enabled) {
@@ -623,7 +884,12 @@ bool TextureCache::ProcessDownloadImages(const DownloadContext& context, bool* g
             backing_image = std::bit_cast<u64>(static_cast<VkImage>(image.GetImage()));
         }
         bool image_gpu_resident{};
-        if (!DownloadImageMemory(entry.image_id, true, all_gpu_resident, &image_gpu_resident)) {
+        if (!DownloadImageMemory(entry.image_id, true, all_gpu_resident, &image_gpu_resident,
+                                 entry.created_timestamp_ns, entry.alias_epoch)) {
+            RecordCandidateTerminalState(
+                entry, Common::PerformanceTelemetry::CandidateTerminalReason::Overwritten,
+                static_cast<u64>(Common::PerformanceTelemetry::CandidateRejectReason::
+                                     ResourceNotGpuModified));
             continue;
         }
         ++scheduled_count;
@@ -760,15 +1026,55 @@ bool TextureCache::PromotePendingDownloadAuthority(ImageId image_id, u64 image_u
                 .imageExtent = {image.info.size.width, image.info.size.height,
                                 image.info.size.depth},
             };
+            auto candidate_trace = Common::PerformanceTelemetry::CurrentCausalContext();
+            candidate_trace.candidate_id = entry.candidate_id;
+            Common::PerformanceTelemetry::ScopedCausalContext candidate_context{candidate_trace};
+            const u64 gpu_copy_interval = scheduler.BeginGpuInterval(
+                Common::PerformanceTelemetry::GpuIntervalKind::Copy, image.image_uid,
+                download_size);
             image.Transit(vk::ImageLayout::eTransferSrcOptimal,
                           vk::AccessFlagBits2::eTransferRead, {});
             scheduler.CommandBuffer().copyImageToBuffer(
                 image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                 download_buffer.Handle(), image_download);
+            scheduler.EndGpuInterval(gpu_copy_interval);
             image.flags &= ~ImageFlagBits::GpuModified;
             Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
             Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
                                               download_size);
+            Common::PerformanceTelemetry::RecordCandidateRepresentation(
+                Common::PerformanceTelemetry::CandidateRepresentationSample{
+                    .candidate_id = entry.candidate_id,
+                    .representation_id = Common::PerformanceTelemetry::NextRepresentationSeq(),
+                    .resource_uid = entry.resource_id,
+                    .resource_epoch = entry.resource_version,
+                    .alias_epoch = entry.alias_epoch,
+                    .allocation_id = offset,
+                    .copy_bytes = download_size,
+                    .timeline_tick = scheduler.CurrentTick(),
+                    .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                    .representation =
+                        Common::PerformanceTelemetry::RepresentationKind::GpuShadow,
+                    .pinned = 1,
+                    .immutable_snapshot = 1,
+                });
+            const auto causal_context = Common::PerformanceTelemetry::CurrentCausalContext();
+            Common::PerformanceTelemetry::RecordCausalEffect(
+                Common::PerformanceTelemetry::CausalEffectSample{
+                    .effect_id = Common::PerformanceTelemetry::NextEffectSeq(),
+                    .cause_id = causal_context.cause_id,
+                    .candidate_id = entry.candidate_id,
+                    .scope_id = causal_context.scope_id,
+                    .object_id = gpu_copy_interval,
+                    .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                    .timeline_tick = scheduler.CurrentTick(),
+                    .bytes = download_size,
+                    .kind = Common::PerformanceTelemetry::CausalEffectKind::Copy,
+                    .attribution = Common::PerformanceTelemetry::EffectAttribution::Exclusive,
+                    .avoidability =
+                        Common::PerformanceTelemetry::Avoidability::ProvenEliminable,
+                    .confidence = 255,
+                });
             *shadow = std::move(authority_shadow);
             pending_downloads.erase(it);
             if (True(image.flags & ImageFlagBits::Aliased)) {
@@ -794,12 +1100,20 @@ bool TextureCache::PromotePendingDownloadAuthority(ImageId image_id, u64 image_u
 void TextureCache::PruneSupersededPendingDownloads(u64 image_uid, u64 superseded_version) {
     std::unique_lock lk{download_images_mutex};
     std::erase_if(pending_downloads, [image_uid, superseded_version](const PendingImageDownload& d) {
-        return d.image_uid == image_uid && d.resource_version <= superseded_version;
+        const bool superseded =
+            d.image_uid == image_uid && d.resource_version <= superseded_version;
+        if (superseded) {
+            RecordCandidateTerminalState(
+                d, Common::PerformanceTelemetry::CandidateTerminalReason::Superseded);
+        }
+        return superseded;
     });
 }
 
 bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
-                                       bool track_gpu_source, bool* gpu_resident) {
+                                       bool track_gpu_source, bool* gpu_resident,
+                                       u64 candidate_created_timestamp_ns,
+                                       u64 candidate_alias_epoch) {
     if (gpu_resident != nullptr) {
         *gpu_resident = false;
     }
@@ -834,12 +1148,15 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     const auto cmdbuf = scheduler.CommandBuffer();
+    const u64 gpu_copy_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, image.image_uid, download_size);
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
                                       download_size);
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
+    scheduler.EndGpuInterval(gpu_copy_interval);
     image.flags &= ~ImageFlagBits::GpuModified;
 
     if (track_gpu_source && gpu_resident != nullptr) {
@@ -848,6 +1165,39 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
 
     auto readback_token = validate_identity ? image.readback_token : nullptr;
     const u64 image_uid = image.image_uid;
+    const auto causal_trace = Common::PerformanceTelemetry::CurrentCausalContext();
+    if (causal_trace.candidate_id != 0) {
+        Common::PerformanceTelemetry::RecordCandidateRepresentation(
+            Common::PerformanceTelemetry::CandidateRepresentationSample{
+                .candidate_id = causal_trace.candidate_id,
+                .representation_id = Common::PerformanceTelemetry::NextRepresentationSeq(),
+                .resource_uid = image.image_uid,
+                .resource_epoch = image.content_epoch,
+                .alias_epoch = candidate_alias_epoch,
+                .allocation_id = offset,
+                .copy_bytes = download_size,
+                .timeline_tick = scheduler.CurrentTick(),
+                .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .representation = Common::PerformanceTelemetry::RepresentationKind::GpuShadow,
+                .pinned = 1,
+                .immutable_snapshot = 1,
+            });
+        Common::PerformanceTelemetry::RecordCausalEffect(
+            Common::PerformanceTelemetry::CausalEffectSample{
+                .effect_id = Common::PerformanceTelemetry::NextEffectSeq(),
+                .cause_id = causal_trace.cause_id,
+                .candidate_id = causal_trace.candidate_id,
+                .scope_id = causal_trace.scope_id,
+                .object_id = gpu_copy_interval,
+                .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .timeline_tick = scheduler.CurrentTick(),
+                .bytes = download_size,
+                .kind = Common::PerformanceTelemetry::CausalEffectKind::Copy,
+                .attribution = Common::PerformanceTelemetry::EffectAttribution::Exclusive,
+                .avoidability = Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+                .confidence = 255,
+            });
+    }
     PendingImageReadback pending{
         .address = image.info.guest_address,
         .data = download,
@@ -888,12 +1238,14 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
         });
         Common::PerformanceTelemetry::ArmReadbackSourceWatch(Common::PerformanceTelemetry::ReadbackSourceWatch{
             .watch_seq = Common::PerformanceTelemetry::NextWatchSeq(),
+            .candidate_id = causal_trace.candidate_id,
             .fence_seq = active_fence_cause.fence_seq,
             .wait_seq = 0,
             .readback_seq = readback_seq,
             .producer_seq = 0,
             .resource_id = image.image_uid,
             .resource_version = image_content_epoch,
+            .alias_epoch = candidate_alias_epoch,
             .guest_addr = image.info.guest_address,
             .size = download_size,
             .producer_packet = 0,
@@ -917,7 +1269,8 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
 
     scheduler.DeferPriorityOperation(
         [device_addr = image.info.guest_address, download_size, writeback_start,
-         image_uid, image_content_epoch, readback_seq, pending_trace,
+         image_uid, image_content_epoch, readback_seq, pending_trace, causal_trace,
+         candidate_created_timestamp_ns, candidate_alias_epoch,
          readback_token = std::move(readback_token), pending = std::move(pending),
          readback_tracker = readback_tracker, &page_manager = tracker] {
             const auto record_completion = [=] {
@@ -953,6 +1306,22 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
                     Common::PerformanceTelemetry::Add(
                         Common::PerformanceTelemetry::Counter::WritebackStaleSkips);
                     record_completion();
+                    if (causal_trace.candidate_id != 0) {
+                        Common::PerformanceTelemetry::RecordCandidateTerminal(
+                            Common::PerformanceTelemetry::CandidateTerminalSample{
+                                .candidate_id = causal_trace.candidate_id,
+                                .resource_uid = image_uid,
+                                .resource_epoch = image_content_epoch,
+                                .alias_epoch = candidate_alias_epoch,
+                                .created_timestamp_ns = candidate_created_timestamp_ns,
+                                .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                                .reason_mask = static_cast<u64>(
+                                    Common::PerformanceTelemetry::CandidateRejectReason::
+                                        ImageFreedOrReused),
+                                .reason = Common::PerformanceTelemetry::CandidateTerminalReason::
+                                    Destroyed,
+                            });
+                    }
                     return;
                 }
                 const u64 commit_start = Common::PerformanceTelemetry::Timestamp();
@@ -961,6 +1330,32 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
                 if (committed_bytes != download_size) {
                     Common::PerformanceTelemetry::Add(
                         Common::PerformanceTelemetry::Counter::WritebackStaleSkips);
+                }
+                if (causal_trace.candidate_id != 0) {
+                    Common::PerformanceTelemetry::RecordCandidateRepresentation(
+                        Common::PerformanceTelemetry::CandidateRepresentationSample{
+                            .candidate_id = causal_trace.candidate_id,
+                            .representation_id =
+                                Common::PerformanceTelemetry::NextRepresentationSeq(),
+                            .resource_uid = image_uid,
+                            .resource_epoch = image_content_epoch,
+                            .alias_epoch = candidate_alias_epoch,
+                            .copy_bytes = committed_bytes,
+                            .representation =
+                                Common::PerformanceTelemetry::RepresentationKind::GuestRam,
+                        });
+                    Common::PerformanceTelemetry::RecordCandidateTerminal(
+                        Common::PerformanceTelemetry::CandidateTerminalSample{
+                            .candidate_id = causal_trace.candidate_id,
+                            .resource_uid = image_uid,
+                            .resource_epoch = image_content_epoch,
+                            .alias_epoch = candidate_alias_epoch,
+                            .created_timestamp_ns = candidate_created_timestamp_ns,
+                            .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                            .bytes_preserved = committed_bytes,
+                            .reason =
+                                Common::PerformanceTelemetry::CandidateTerminalReason::Materialized,
+                        });
                 }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 if (writeback_start != 0) {
@@ -1006,6 +1401,32 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
                 if (committed_bytes != download_size) {
                     Common::PerformanceTelemetry::Add(
                         Common::PerformanceTelemetry::Counter::WritebackStaleSkips);
+                }
+                if (causal_trace.candidate_id != 0) {
+                    Common::PerformanceTelemetry::RecordCandidateRepresentation(
+                        Common::PerformanceTelemetry::CandidateRepresentationSample{
+                            .candidate_id = causal_trace.candidate_id,
+                            .representation_id =
+                                Common::PerformanceTelemetry::NextRepresentationSeq(),
+                            .resource_uid = image_uid,
+                            .resource_epoch = image_content_epoch,
+                            .alias_epoch = candidate_alias_epoch,
+                            .copy_bytes = committed_bytes,
+                            .representation =
+                                Common::PerformanceTelemetry::RepresentationKind::GuestRam,
+                        });
+                    Common::PerformanceTelemetry::RecordCandidateTerminal(
+                        Common::PerformanceTelemetry::CandidateTerminalSample{
+                            .candidate_id = causal_trace.candidate_id,
+                            .resource_uid = image_uid,
+                            .resource_epoch = image_content_epoch,
+                            .alias_epoch = candidate_alias_epoch,
+                            .created_timestamp_ns = candidate_created_timestamp_ns,
+                            .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                            .bytes_preserved = committed_bytes,
+                            .reason =
+                                Common::PerformanceTelemetry::CandidateTerminalReason::Materialized,
+                        });
                 }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 if (writeback_start != 0) {
@@ -1720,18 +2141,94 @@ void TextureCache::ScheduleImageDownload(
     ImageId image_id, bool fastpath_candidate, bool replace_existing,
     Common::PerformanceTelemetry::ImageWriter producer_kind) {
     Image& image = slot_images[image_id];
-    if (!readback_linear_images || (image.info.props.is_tiled && image.info.size.width > 8) ||
-        image.info.guest_address == 0) {
-        return;
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    const auto candidate_id = telemetry_enabled ? Common::PerformanceTelemetry::NextCandidateSeq() : 0;
+    const u64 created_timestamp_ns =
+        telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+    u64 reason_mask{};
+    if (!readback_linear_images) {
+        reason_mask |= static_cast<u64>(Common::PerformanceTelemetry::CandidateRejectReason::
+                                            ReadbackDisabledByConfiguration);
+    }
+    if (image.info.props.is_tiled && image.info.size.width > 8) {
+        reason_mask |= static_cast<u64>(
+            Common::PerformanceTelemetry::CandidateRejectReason::UnsupportedTiling);
+    }
+    if (image.info.guest_address == 0) {
+        reason_mask |= static_cast<u64>(
+            Common::PerformanceTelemetry::CandidateRejectReason::GuestAddressUnavailable);
+    }
+    if (!image.SafeToDownload()) {
+        reason_mask |= static_cast<u64>(
+            Common::PerformanceTelemetry::CandidateRejectReason::ImageNotSafeToDownload);
     }
     const u32 download_size = static_cast<u32>(GetDownloadSize(image.info));
+    if (telemetry_enabled) {
+        RecordCandidateScheduleForImage(candidate_id, image_id, image, image.alias_generation,
+                                        download_size, producer_kind, reason_mask);
+    }
+    if (reason_mask != 0) {
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordCandidateDecision(
+                Common::PerformanceTelemetry::CandidateDecisionSample{
+                    .candidate_id = candidate_id,
+                    .sync_requirement_bits = static_cast<u64>(
+                        Common::PerformanceTelemetry::SyncRequirement::CpuDataMaterialization),
+                    .evidence_bits = static_cast<u64>(
+                        Common::PerformanceTelemetry::CandidateEvidence::ResourceIdentity),
+                    .reason_mask = reason_mask,
+                    .proposed_data_action =
+                        Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                    .executed_data_action =
+                        Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                    .avoidability =
+                        Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+                    .correlation_status =
+                        Common::PerformanceTelemetry::CorrelationStatus::Complete,
+                });
+            const PendingImageDownload rejected{
+                .candidate_id = candidate_id,
+                .image_id = image_id,
+                .image_uid = image.image_uid,
+                .resource_id = image.image_uid,
+                .resource_version = image.content_epoch,
+                .alias_epoch = image.alias_generation,
+                .created_timestamp_ns = created_timestamp_ns,
+                .guest_begin = image.info.guest_address,
+                .size = download_size,
+            };
+            RecordCandidateTerminalState(
+                rejected, Common::PerformanceTelemetry::CandidateTerminalReason::RejectedAtSchedule,
+                reason_mask);
+        }
+        return;
+    }
     std::unique_lock candidate_lock{fastpath_candidate_mutex, std::defer_lock};
     if (fastpath_candidate) {
         candidate_lock.lock();
+        if (pending_fastpath_candidate && telemetry_enabled) {
+            const auto& old = *pending_fastpath_candidate;
+            const PendingImageDownload superseded{
+                .candidate_id = old.candidate_id,
+                .image_id = old.image_id,
+                .image_uid = old.image_uid,
+                .resource_id = old.image_uid,
+                .resource_version = old.resource_version,
+                .alias_epoch = old.alias_epoch,
+                .created_timestamp_ns = old.created_timestamp_ns,
+                .guest_begin = old.guest_addr,
+                .size = old.download_size,
+            };
+            RecordCandidateTerminalState(
+                superseded, Common::PerformanceTelemetry::CandidateTerminalReason::Superseded);
+        }
         pending_fastpath_candidate = PendingFastpathCandidate{
+            .candidate_id = candidate_id,
             .image_id = image_id,
             .image_uid = image.image_uid,
             .resource_version = image.content_epoch,
+            .alias_epoch = image.alias_generation,
+            .created_timestamp_ns = created_timestamp_ns,
             .guest_addr = image.info.guest_address,
             .download_size = download_size,
             .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
@@ -1741,16 +2238,29 @@ void TextureCache::ScheduleImageDownload(
     }
     std::unique_lock downloads_lock{download_images_mutex};
     if (replace_existing) {
-        std::erase_if(pending_downloads, [image_id, image_uid = image.image_uid](const auto& entry) {
-            return entry.image_id == image_id && entry.image_uid == image_uid;
-        });
+        std::erase_if(pending_downloads,
+                      [image_id, image_uid = image.image_uid](const auto& entry) {
+                          const bool replace =
+                              entry.image_id == image_id && entry.image_uid == image_uid;
+                          if (replace) {
+                              RecordCandidateTerminalState(
+                                  entry, Common::PerformanceTelemetry::CandidateTerminalReason::Superseded);
+                          }
+                          return replace;
+                      });
     }
     pending_downloads.push_back(PendingImageDownload{
+        .candidate_id = candidate_id,
         .pending_seq = next_pending_download_seq++,
         .image_id = image_id,
         .image_uid = image.image_uid,
         .resource_id = image.image_uid,
         .resource_version = image.content_epoch,
+        .alias_epoch = image.alias_generation,
+        .created_timestamp_ns = created_timestamp_ns,
+        .descriptor_hash = CandidateDescriptorHash(image),
+        .producer_seq = Common::PerformanceTelemetry::CurrentProducerSeq(),
+        .producer_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
         .guest_begin = image.info.guest_address,
         .size = download_size,
         .policy = DownloadPolicy::LegacyEager,
@@ -1987,7 +2497,11 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        image.info.props.is_tiled
+            ? Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand
+            : Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);

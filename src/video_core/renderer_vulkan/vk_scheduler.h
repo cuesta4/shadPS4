@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -26,6 +27,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class GpuProfiler;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -427,7 +429,17 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    void EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason reason =
+            Common::PerformanceTelemetry::ScopeBreakReason::UnknownFallback,
+        Common::PerformanceTelemetry::Avoidability avoidability =
+            Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
+
+    void ProfileGraphicsDraw(u64 pipeline_hash, u32 command_count = 1);
+    void ProfileComputeDispatch(u64 pipeline_hash, u32 command_count = 1);
+    [[nodiscard]] u64 BeginGpuInterval(Common::PerformanceTelemetry::GpuIntervalKind kind,
+                                       u64 object_hash = 0, u64 bytes = 0);
+    void EndGpuInterval(u64 token);
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
@@ -554,9 +566,16 @@ private:
 
     const Instance& instance;
     MasterSemaphore master_semaphore;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    std::unique_ptr<GpuProfiler> gpu_profiler;
+#endif
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    Common::PerformanceTelemetry::CmdBufferSeq current_command_buffer_seq{};
+    u64 rendering_scope_id{};
+    u64 attachment_hash{};
+    u64 current_pipeline_hash{};
     u64 graphics_push_descriptor_epoch{};
     std::array<PushConstantCache, 2> push_constant_caches{};
     vk::CommandBuffer graphics_pipeline_command_buffer{};

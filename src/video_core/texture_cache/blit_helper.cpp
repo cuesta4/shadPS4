@@ -141,9 +141,13 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     };
     cmdbuf.setScissorWithCount(scissor);
 
+    const u64 pipeline_hash = 0x626c69745f646570ULL ^ static_cast<u64>(num_samples) ^
+                              (static_cast<u64>(dst_pixel_format) << 32);
+    scheduler.ProfileGraphicsDraw(pipeline_hash);
     cmdbuf.draw(3, 1, 0, 0);
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::AttachmentSetChange,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     scheduler.GetDynamicState().Invalidate();
 }
 
@@ -243,9 +247,14 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     };
     cmdbuf.setScissorWithCount(scissor);
 
+    const u64 pipeline_hash = 0x626c69745f6d7361ULL ^ static_cast<u64>(num_samples) ^
+                              (static_cast<u64>(pixel_format) << 32) ^
+                              (static_cast<u64>(src_msaa) << 63);
+    scheduler.ProfileGraphicsDraw(pipeline_hash);
     cmdbuf.draw(3, 1, 0, 0);
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::AttachmentSetChange,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     scheduler.GetDynamicState().Invalidate();
 }
 

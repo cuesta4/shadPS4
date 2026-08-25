@@ -94,6 +94,30 @@ public:
         return profiler_context;
     }
 
+    [[nodiscard]] double TimestampPeriodNs() const noexcept {
+        return properties.limits.timestampPeriod;
+    }
+
+    [[nodiscard]] u32 TimestampValidBits() const noexcept {
+        return timestamp_valid_bits;
+    }
+
+    [[nodiscard]] bool SupportsPipelineStatistics() const noexcept {
+        return features.pipelineStatisticsQuery;
+    }
+
+    [[nodiscard]] bool SupportsCalibratedTimestamps() const noexcept {
+        return calibrated_timestamps;
+    }
+
+    [[nodiscard]] vk::TimeDomainEXT CalibratedHostTimeDomain() const noexcept {
+        return calibrated_host_time_domain;
+    }
+
+    [[nodiscard]] bool SupportsPipelineExecutableProperties() const noexcept {
+        return pipeline_executable_properties;
+    }
+
     /// Returns true if anisotropic filtering is supported
     bool IsAnisotropicFilteringSupported() const {
         return features.samplerAnisotropy;
@@ -507,6 +531,8 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 timestamp_valid_bits{};
+    vk::TimeDomainEXT calibrated_host_time_domain{vk::TimeDomainEXT::eDevice};
     bool swapchain_maintenance1{};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
@@ -533,6 +559,8 @@ private:
     bool image_view_min_lod{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool calibrated_timestamps{};
+    bool pipeline_executable_properties{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

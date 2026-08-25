@@ -14,6 +14,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/hash.h"
 #include "common/performance_telemetry.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -272,6 +273,122 @@ static SHAD_NO_INLINE void BeginHostMarker(Vulkan::Rasterizer& rasterizer,
         }
     }
     return PM4CmdWaitRegMem::TestValue(value, function, mask, reference);
+}
+
+void RecordPendingCompletionHazard(Common::PerformanceTelemetry::CausalTraceToken& trace,
+                                   u64 completed_stages, u64 completed_writes,
+                                   u64 requirement_bits, u8 confidence) {
+    if (!Common::PerformanceTelemetry::Enabled()) {
+        return;
+    }
+    if (trace.hazard_id == 0) {
+        trace.hazard_id = Common::PerformanceTelemetry::NextHazardSeq();
+    }
+    Common::PerformanceTelemetry::RecordHazardResolution(
+        Common::PerformanceTelemetry::HazardResolutionSample{
+            .hazard_id = trace.hazard_id,
+            .cause_id = trace.cause_id,
+            .candidate_id = trace.candidate_id,
+            .src_stage = completed_stages,
+            .src_access = completed_writes,
+            .sync_requirement_bits = requirement_bits,
+            .resolution = Common::PerformanceTelemetry::HazardResolutionKind::Pending,
+            .avoidability = Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+            .confidence = confidence,
+        });
+}
+
+Common::PerformanceTelemetry::CausalTraceToken RecordWaitScope(
+    Common::PerformanceTelemetry::Pm4Engine engine, u32 queue_id, VAddr wait_address,
+    u64 reference, Common::PerformanceTelemetry::WaitSeq wait_seq,
+    const Common::PerformanceTelemetry::CausalTraceToken& producer_trace,
+    bool producer_correlated) {
+    using namespace Common::PerformanceTelemetry;
+    if (!Enabled()) {
+        return {};
+    }
+    CausalTraceToken trace{
+        .candidate_id = producer_trace.candidate_id,
+        .scope_id = NextScopeSeq(),
+        .cause_id = producer_trace.cause_id ? producer_trace.cause_id : NextCauseSeq(),
+        .signal_id = producer_trace.signal_id,
+        .hazard_id = producer_trace.hazard_id,
+    };
+    const auto packet_seq = CurrentPacketSeq();
+    RecordCompletionScope(CompletionScopeSample{
+        .scope_id = trace.scope_id,
+        .cause_id = trace.cause_id,
+        .signal_id = trace.signal_id,
+        .frame_seq = CurrentFrameSeq(),
+        .command_buffer_seq = CurrentCmdBufferSeq(),
+        .first_packet_seq = packet_seq,
+        .last_packet_seq = packet_seq,
+        .completed_stage_bits = static_cast<u64>(FenceStageScope::All),
+        .visible_access_bits = reference,
+        .label_addr = wait_address,
+        .label_value = reference,
+        .pm4_digest = HashCombine(wait_address, reference),
+        .queue_id = queue_id,
+        .engine = static_cast<u16>(engine),
+        .kind = CompletionScopeKind::WaitRegMem,
+        .confidence = static_cast<u8>(producer_correlated ? 255 : 96),
+    });
+    if (trace.signal_id != 0) {
+        RecordLogicalSignal(LogicalSignalSample{
+            .signal_id = trace.signal_id,
+            .candidate_id = trace.candidate_id,
+            .scope_id = trace.scope_id,
+            .cause_id = trace.cause_id,
+            .wait_seq = wait_seq,
+            .packet_seq = packet_seq,
+            .label_addr = wait_address,
+            .value = reference,
+            .phase = LogicalSignalPhase::WaitMatched,
+            .action = SignalAction::VirtualGpuWait,
+        });
+    }
+    RecordPendingCompletionHazard(
+        trace, static_cast<u64>(FenceStageScope::All), 0,
+        static_cast<u64>(SyncRequirement::ExecutionOrder) |
+            static_cast<u64>(SyncRequirement::MemoryVisibility),
+        static_cast<u8>(producer_correlated ? 255 : 96));
+    return trace;
+}
+
+void RecordWaitEffect(const Common::PerformanceTelemetry::CausalTraceToken& trace,
+                      Common::PerformanceTelemetry::WaitSeq wait_seq, u64 duration_ns,
+                      bool virtualized, bool producer_correlated) {
+    using namespace Common::PerformanceTelemetry;
+    if (!Enabled() || trace.scope_id == 0) {
+        return;
+    }
+    RecordHazardResolution(HazardResolutionSample{
+        .hazard_id = trace.hazard_id,
+        .cause_id = trace.cause_id,
+        .candidate_id = trace.candidate_id,
+        .sync_requirement_bits = static_cast<u64>(SyncRequirement::ExecutionOrder) |
+                                 static_cast<u64>(SyncRequirement::MemoryVisibility),
+        .resolution = virtualized ? HazardResolutionKind::ImplicitDependency
+                                  : HazardResolutionKind::LegacyFallback,
+        .avoidability = virtualized ? Avoidability::ProvenEliminable
+                                    : Avoidability::ConservativeFallback,
+        .confidence = static_cast<u8>(producer_correlated ? 255 : 96),
+    });
+    RecordCausalEffect(CausalEffectSample{
+        .effect_id = NextEffectSeq(),
+        .cause_id = trace.cause_id,
+        .candidate_id = trace.candidate_id,
+        .scope_id = trace.scope_id,
+        .hazard_id = trace.hazard_id,
+        .object_id = wait_seq,
+        .command_buffer_seq = CurrentCmdBufferSeq(),
+        .duration_ns = duration_ns,
+        .kind = CausalEffectKind::HostWait,
+        .attribution = EffectAttribution::Exclusive,
+        .avoidability = virtualized ? Avoidability::ProvenEliminable
+                                    : Avoidability::ConservativeFallback,
+        .confidence = static_cast<u8>(producer_correlated ? 255 : 96),
+    });
 }
 
 } // namespace
@@ -912,7 +1029,8 @@ SHAD_NO_INLINE void WriteFenceMemory(Vulkan::Rasterizer* rasterizer, void* addre
 
 SHAD_NO_INLINE void SignalEventWriteEos(const PM4CmdEventWriteEos& packet,
                                         Vulkan::Rasterizer* rasterizer,
-                                        const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {}) {
+                                        const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {},
+                                        const Common::PerformanceTelemetry::CausalTraceToken& causal = {}) {
     {
         Common::PerformanceTelemetry::ScopedMemoryWriteOrigin origin{
             Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
@@ -936,13 +1054,33 @@ SHAD_NO_INLINE void SignalEventWriteEos(const PM4CmdEventWriteEos& packet,
             .irq = 0,
             .signal_origin = Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
         });
+        if (causal.signal_id != 0) {
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+            Common::PerformanceTelemetry::LogicalSignalSample{
+                .signal_id = causal.signal_id,
+                .candidate_id = causal.candidate_id,
+                .scope_id = causal.scope_id,
+                .cause_id = causal.cause_id,
+                .packet_seq = fence_token.packet_seq,
+                .label_addr = fence_token.label_addr,
+                .label_generation = fence_token.generation,
+                .value = fence_token.label_val,
+                .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Published,
+                .action =
+                    Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                .producer_submitted = 1,
+                .producer_completed = 1,
+            });
+        }
     }
 #endif
 }
 
 SHAD_NO_INLINE void SignalEventWriteEop(const PM4CmdEventWriteEop& packet,
                                         Vulkan::Rasterizer* rasterizer,
-                                        const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {}) {
+                                        const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {},
+                                        const Common::PerformanceTelemetry::CausalTraceToken& causal = {}) {
     {
         Common::PerformanceTelemetry::ScopedMemoryWriteOrigin origin{
             Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
@@ -968,13 +1106,34 @@ SHAD_NO_INLINE void SignalEventWriteEop(const PM4CmdEventWriteEop& packet,
             .irq = 1,
             .signal_origin = Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
         });
+        if (causal.signal_id != 0) {
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+            Common::PerformanceTelemetry::LogicalSignalSample{
+                .signal_id = causal.signal_id,
+                .candidate_id = causal.candidate_id,
+                .scope_id = causal.scope_id,
+                .cause_id = causal.cause_id,
+                .packet_seq = fence_token.packet_seq,
+                .label_addr = fence_token.label_addr,
+                .label_generation = fence_token.generation,
+                .value = fence_token.label_val,
+                .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Published,
+                .action =
+                    Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                .irq = static_cast<u8>(packet.int_sel.Value() != InterruptSelect::None),
+                .producer_submitted = 1,
+                .producer_completed = 1,
+            });
+        }
     }
 #endif
 }
 
 SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& packet,
                                      Vulkan::Rasterizer* rasterizer, u32 pipe_id,
-                                     const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {}) {
+                                     const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {},
+                                     const Common::PerformanceTelemetry::CausalTraceToken& causal = {}) {
     {
         Common::PerformanceTelemetry::ScopedMemoryWriteOrigin origin{
             Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
@@ -1008,6 +1167,26 @@ SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& packet,
             .irq = 1,
             .signal_origin = Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
         });
+        if (causal.signal_id != 0) {
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+            Common::PerformanceTelemetry::LogicalSignalSample{
+                .signal_id = causal.signal_id,
+                .candidate_id = causal.candidate_id,
+                .scope_id = causal.scope_id,
+                .cause_id = causal.cause_id,
+                .packet_seq = fence_token.packet_seq,
+                .label_addr = fence_token.label_addr,
+                .label_generation = fence_token.generation,
+                .value = fence_token.label_val,
+                .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Published,
+                .action =
+                    Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                .irq = static_cast<u8>(packet.int_sel.Value() != InterruptSelect::None),
+                .producer_submitted = 1,
+                .producer_completed = 1,
+            });
+        }
     }
 #endif
 }
@@ -1133,6 +1312,61 @@ void Liverpool::FlushPendingGpuCompletionsForWait() {
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& packet) {
+    Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
+    if (Common::PerformanceTelemetry::Enabled()) {
+        completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
+        completion_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
+        if (packet.Address<VAddr>() != 0) {
+            completion_trace.signal_id = Common::PerformanceTelemetry::NextSignalSeq();
+        }
+        const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+        Common::PerformanceTelemetry::RecordCompletionScope(
+            Common::PerformanceTelemetry::CompletionScopeSample{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .first_packet_seq = packet_seq,
+                .last_packet_seq = packet_seq,
+                .completed_stage_bits = packet.event_control,
+                .completed_write_bits = packet.cmd_info,
+                .visible_access_bits = packet.event_type.Value(),
+                .cache_action_bits = packet.event_control,
+                .label_addr = packet.Address<VAddr>(),
+                .label_value = packet.DataDWord(),
+                .pm4_digest = HashCombine(packet.event_control, packet.cmd_info),
+                .queue_id = static_cast<u32>(GfxQueueId),
+                .engine = static_cast<u16>(Common::PerformanceTelemetry::Pm4Engine::Graphics),
+                .kind = Common::PerformanceTelemetry::CompletionScopeKind::EventWriteEos,
+                .confidence = 255,
+            });
+        if (completion_trace.signal_id != 0) {
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+                Common::PerformanceTelemetry::LogicalSignalSample{
+                    .signal_id = completion_trace.signal_id,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .packet_seq = packet_seq,
+                    .label_addr = packet.Address<VAddr>(),
+                    .value = packet.DataDWord(),
+                    .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                    .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Created,
+                    .action =
+                        Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                });
+        }
+    }
+    RecordPendingCompletionHazard(
+        completion_trace, packet.event_control, packet.cmd_info,
+        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+            static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility) |
+            (completion_trace.signal_id
+                 ? static_cast<u64>(
+                       Common::PerformanceTelemetry::SyncRequirement::HostSignalVisibility)
+                 : 0),
+        255);
+    Common::PerformanceTelemetry::ScopedCausalContext completion_context{completion_trace};
     const bool is_gow3 = (Common::ElfInfo::Instance().GameSerial() == "CUSA01715");
     if (is_gow3 && rasterizer) {
         auto& texture_cache = rasterizer->GetTextureCache();
@@ -1141,15 +1375,20 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
         const bool is_val_1 = (packet.DataDWord() == 1);
         const VAddr label_addr = packet.Address<VAddr>();
         std::shared_ptr<VideoCore::GpuAuthorityShadow> authority_shadow;
-        const bool promoted = cand_opt && is_sig_fence && is_val_1 && label_addr != 0 &&
-                               texture_cache.PromotePendingDownloadAuthority(
-                                   cand_opt->image_id, cand_opt->image_uid,
-                                   cand_opt->resource_version, &authority_shadow);
+        bool promoted{};
+        if (cand_opt && is_sig_fence && is_val_1 && label_addr != 0) {
+            auto candidate_trace = completion_trace;
+            candidate_trace.candidate_id = cand_opt->candidate_id;
+            Common::PerformanceTelemetry::ScopedCausalContext candidate_context{candidate_trace};
+            promoted = texture_cache.PromotePendingDownloadAuthority(
+                cand_opt->image_id, cand_opt->image_uid, cand_opt->resource_version,
+                &authority_shadow);
+        }
 
         if (promoted) {
             auto candidate = *cand_opt;
 
-            const u64 candidate_seq = Common::PerformanceTelemetry::NextCandidateSeq();
+            const u64 candidate_seq = candidate.candidate_id;
             auto& authority_tracker = VideoCore::GpuAuthorityTracker::Instance();
             const auto [authority_seq, virtual_fence_seq, label_generation] =
                 authority_tracker.AllocateIds(label_addr);
@@ -1162,6 +1401,9 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             VideoCore::GpuAuthorityEntry auth_entry{
                 .authority_seq = authority_seq,
                 .candidate_seq = candidate_seq,
+                .scope_seq = completion_trace.scope_id,
+                .cause_seq = completion_trace.cause_id,
+                .signal_seq = completion_trace.signal_id,
                 .image_id = candidate.image_id.index,
                 .image_uid = candidate.image_uid,
                 .resource_id = candidate.image_uid,
@@ -1184,6 +1426,10 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             VideoCore::VirtualGpuFence virt_fence{
                 .virtual_fence_seq = virtual_fence_seq,
                 .authority_seq = authority_seq,
+                .candidate_seq = candidate_seq,
+                .scope_seq = completion_trace.scope_id,
+                .cause_seq = completion_trace.cause_id,
+                .signal_seq = completion_trace.signal_id,
                 .fence_seq = fence_seq,
                 .label_addr = label_addr,
                 .label_generation = label_generation,
@@ -1200,6 +1446,71 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
 
             authority_tracker.RegisterAuthority(auth_entry);
             authority_tracker.RegisterVirtualFence(virt_fence);
+
+            Common::PerformanceTelemetry::RecordCandidateDecision(
+                Common::PerformanceTelemetry::CandidateDecisionSample{
+                    .candidate_id = candidate_seq,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .signal_id = completion_trace.signal_id,
+                    .authority_id = authority_seq,
+                    .producer_ticket = producer_tick,
+                    .sync_requirement_bits =
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             ExecutionOrder) |
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             SnapshotPreservation) |
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             HostSignalVisibility),
+                    .evidence_bits =
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             ProducerIdentified) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             ResourceIdentity) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             ResourceEpoch) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::AliasEpoch) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             RangeCovered) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             ScopeIdentified) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             ScopeAfterProducer) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             SameQueueOrder) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             SnapshotRepresentable) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::PinLifetime) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                             LabelGeneration) |
+                        static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::TraceComplete),
+                    .proposed_data_action =
+                        Common::PerformanceTelemetry::DataAction::GpuShadow,
+                    .proposed_signal_action =
+                        Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                    .executed_data_action =
+                        Common::PerformanceTelemetry::DataAction::GpuShadow,
+                    .executed_signal_action =
+                        Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                    .avoidability =
+                        Common::PerformanceTelemetry::Avoidability::ProvenEliminable,
+                    .correlation_status =
+                        Common::PerformanceTelemetry::CorrelationStatus::Complete,
+                });
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+                Common::PerformanceTelemetry::LogicalSignalSample{
+                    .signal_id = completion_trace.signal_id,
+                    .candidate_id = candidate_seq,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .packet_seq = pkt_seq,
+                    .label_addr = label_addr,
+                    .label_generation = label_generation,
+                    .value = packet.DataDWord(),
+                    .producer_tick = producer_tick,
+                    .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Created,
+                    .action = Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                });
 
             texture_cache.PruneSupersededPendingDownloads(candidate.image_uid,
                                                           candidate.resource_version - 1);
@@ -1285,7 +1596,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             else rej = Common::PerformanceTelemetry::FastpathRejectReason::LifetimeInvalid;
 
             Common::PerformanceTelemetry::RecordFastpathCandidate(Common::PerformanceTelemetry::FastpathCandidateSample{
-                .candidate_seq = Common::PerformanceTelemetry::NextCandidateSeq(),
+                .candidate_seq = cand_opt->candidate_id,
                 .timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
                 .title_id_hash = 0x01715u,
                 .producer_seq = cand_opt->producer_seq,
@@ -1313,6 +1624,50 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             });
             Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathCandidates);
             Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathRejectedSignature);
+            const u64 reason_mask = !is_sig_fence
+                                        ? static_cast<u64>(Common::PerformanceTelemetry::
+                                                               CandidateRejectReason::
+                                                                   AmbiguousEventSemantics)
+                                        : !is_val_1
+                                              ? static_cast<u64>(Common::PerformanceTelemetry::
+                                                                     CandidateRejectReason::
+                                                                         MultipleSignalConsumers)
+                                              : static_cast<u64>(Common::PerformanceTelemetry::
+                                                                     CandidateRejectReason::
+                                                                         PinOrLifetimeUnavailable);
+            Common::PerformanceTelemetry::RecordCandidateDecision(
+                Common::PerformanceTelemetry::CandidateDecisionSample{
+                    .candidate_id = cand_opt->candidate_id,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .signal_id = completion_trace.signal_id,
+                    .reason_mask = reason_mask,
+                    .proposed_data_action =
+                        Common::PerformanceTelemetry::DataAction::GpuShadow,
+                    .proposed_signal_action =
+                        Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                    .executed_data_action =
+                        Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                    .executed_signal_action =
+                        Common::PerformanceTelemetry::SignalAction::ForceHostCompletion,
+                    .avoidability =
+                        Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+                    .correlation_status =
+                        Common::PerformanceTelemetry::CorrelationStatus::Complete,
+                });
+            Common::PerformanceTelemetry::RecordCandidateTerminal(
+                Common::PerformanceTelemetry::CandidateTerminalSample{
+                    .candidate_id = cand_opt->candidate_id,
+                    .resource_uid = cand_opt->image_uid,
+                    .resource_epoch = cand_opt->resource_version,
+                    .alias_epoch = cand_opt->alias_epoch,
+                    .created_timestamp_ns = cand_opt->created_timestamp_ns,
+                    .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                    .bytes_preserved = cand_opt->download_size,
+                    .reason_mask = reason_mask,
+                    .reason = Common::PerformanceTelemetry::CandidateTerminalReason::
+                        RejectedAtSchedule,
+                });
         }
     }
 
@@ -1333,6 +1688,11 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             .fence_seq = fence_seq,
             .generation = gen,
             .packet_seq = pkt_seq,
+            .candidate_id = completion_trace.candidate_id,
+            .scope_id = completion_trace.scope_id,
+            .cause_id = completion_trace.cause_id,
+            .signal_id = completion_trace.signal_id,
+            .hazard_id = completion_trace.hazard_id,
             .label_addr = packet.Address<VAddr>(),
             .label_value = packet.data,
         };
@@ -1381,6 +1741,10 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
         Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
         has_writebacks = rasterizer->ProcessDownloadImages(
             VideoCore::TextureCache::DownloadContext{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .hazard_id = completion_trace.hazard_id,
                 .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEos,
                 .fence_seq = fence_token.fence_seq,
                 .trigger_control = packet.event_control,
@@ -1390,14 +1754,15 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
     }
     if (has_writebacks && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
         auto* completion_rasterizer = rasterizer;
-        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token] {
-            SignalEventWriteEos(packet, completion_rasterizer, fence_token);
+        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
+                                        completion_trace] {
+            SignalEventWriteEos(packet, completion_rasterizer, fence_token, completion_trace);
         });
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
-    SignalEventWriteEos(packet, rasterizer, fence_token);
+    SignalEventWriteEos(packet, rasterizer, fence_token, completion_trace);
     if (packet.command == PM4CmdEventWriteEos::Command::GdsStore) {
         if (packet.size != 1) [[unlikely]] {
             GraphicsPacketAssertionFailed();
@@ -1414,6 +1779,69 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& packet) {
+    Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
+    if (Common::PerformanceTelemetry::Enabled()) {
+        completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
+        completion_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
+        if (packet.Address<void>() != nullptr) {
+            completion_trace.signal_id = Common::PerformanceTelemetry::NextSignalSeq();
+        }
+        const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+        const u64 label_value = packet.data_lo | (static_cast<u64>(packet.data_hi) << 32);
+        const bool irq = packet.int_sel.Value() != InterruptSelect::None;
+        Common::PerformanceTelemetry::RecordCompletionScope(
+            Common::PerformanceTelemetry::CompletionScopeSample{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                .first_packet_seq = packet_seq,
+                .last_packet_seq = packet_seq,
+                .completed_stage_bits = packet.event_control,
+                .completed_write_bits = packet.data_control,
+                .visible_access_bits = packet.event_type.Value(),
+                .cache_action_bits = packet.event_control,
+                .label_addr = reinterpret_cast<VAddr>(packet.Address<void>()),
+                .label_value = label_value,
+                .pm4_digest = HashCombine(packet.event_control, packet.data_control),
+                .queue_id = static_cast<u32>(GfxQueueId),
+                .engine = static_cast<u16>(Common::PerformanceTelemetry::Pm4Engine::Graphics),
+                .kind = Common::PerformanceTelemetry::CompletionScopeKind::EventWriteEop,
+                .irq_bits = static_cast<u8>(irq),
+                .confidence = 255,
+            });
+        if (completion_trace.signal_id != 0) {
+            Common::PerformanceTelemetry::RecordLogicalSignal(
+                Common::PerformanceTelemetry::LogicalSignalSample{
+                    .signal_id = completion_trace.signal_id,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .packet_seq = packet_seq,
+                    .label_addr = reinterpret_cast<VAddr>(packet.Address<void>()),
+                    .value = label_value,
+                    .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                    .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Created,
+                    .action =
+                        Common::PerformanceTelemetry::SignalAction::PublishAfterPhysicalTick,
+                    .irq = static_cast<u8>(irq),
+                });
+        }
+    }
+    RecordPendingCompletionHazard(
+        completion_trace, packet.event_control, packet.data_control,
+        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+            static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility) |
+            (completion_trace.signal_id
+                 ? static_cast<u64>(
+                       Common::PerformanceTelemetry::SyncRequirement::HostSignalVisibility)
+                 : 0) |
+            (packet.int_sel.Value() != InterruptSelect::None
+                 ? static_cast<u64>(
+                       Common::PerformanceTelemetry::SyncRequirement::InterruptPublication)
+                 : 0),
+        255);
+    Common::PerformanceTelemetry::ScopedCausalContext completion_context{completion_trace};
     Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     if (Common::PerformanceTelemetry::Enabled()) {
@@ -1433,6 +1861,11 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
             .fence_seq = fence_seq,
             .generation = gen,
             .packet_seq = pkt_seq,
+            .candidate_id = completion_trace.candidate_id,
+            .scope_id = completion_trace.scope_id,
+            .cause_id = completion_trace.cause_id,
+            .signal_id = completion_trace.signal_id,
+            .hazard_id = completion_trace.hazard_id,
             .label_addr = reinterpret_cast<VAddr>(packet.Address<void>()),
             .label_value = label_val,
         };
@@ -1482,6 +1915,10 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
         Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
         has_writebacks = rasterizer->ProcessDownloadImages(
             VideoCore::TextureCache::DownloadContext{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .hazard_id = completion_trace.hazard_id,
                 .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEop,
                 .fence_seq = fence_token.fence_seq,
                 .trigger_control = packet.event_control,
@@ -1490,14 +1927,15 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
     }
     if (has_writebacks) {
         auto* completion_rasterizer = rasterizer;
-        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token] {
-            SignalEventWriteEop(packet, completion_rasterizer, fence_token);
+        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
+                                        completion_trace] {
+            SignalEventWriteEop(packet, completion_rasterizer, fence_token, completion_trace);
         });
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
-    SignalEventWriteEop(packet, rasterizer, fence_token);
+    SignalEventWriteEop(packet, rasterizer, fence_token, completion_trace);
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
@@ -2021,8 +2459,42 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                Common::PerformanceTelemetry::CausalTraceToken event_trace{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 if (telemetry_enabled) {
+                    event_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
+                    event_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
+                    const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+                    Common::PerformanceTelemetry::RecordCompletionScope(
+                        Common::PerformanceTelemetry::CompletionScopeSample{
+                            .scope_id = event_trace.scope_id,
+                            .cause_id = event_trace.cause_id,
+                            .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                            .command_buffer_seq =
+                                Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                            .first_packet_seq = packet_seq,
+                            .last_packet_seq = packet_seq,
+                            .completed_stage_bits = event->event_control,
+                            .completed_write_bits = event->inv_l2,
+                            .visible_access_bits = static_cast<u64>(event->event_type.Value()),
+                            .cache_action_bits = event->inv_l2,
+                            .pm4_digest = HashCombine(event->event_control,
+                                                     header->type3.NumWords()),
+                            .queue_id = static_cast<u32>(GfxQueueId),
+                            .engine = static_cast<u16>(
+                                Common::PerformanceTelemetry::Pm4Engine::Graphics),
+                            .kind = Common::PerformanceTelemetry::CompletionScopeKind::EventWrite,
+                            .confidence = 160,
+                        });
+                    RecordPendingCompletionHazard(
+                        event_trace, event->event_control, event->inv_l2,
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             ExecutionOrder) |
+                            (event->inv_l2
+                                 ? static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                        MemoryVisibility)
+                                 : 0),
+                        160);
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, event->event_control, 0);
@@ -2074,6 +2546,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (rasterizer) {
+                    Common::PerformanceTelemetry::ScopedCausalContext event_context{event_trace};
                     rasterizer->FlushCaches(event->event_type.Value());
                 }
                 break;
@@ -2203,6 +2676,50 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64 size =
                     (static_cast<u64>(acquire_mem->cp_coher_size_lo) |
                      (static_cast<u64>(acquire_mem->cp_coher_size_hi) << 32)) << 8;
+                Common::PerformanceTelemetry::CausalTraceToken acquire_trace{};
+                if (telemetry_enabled) {
+                    acquire_trace.candidate_id = last_sync_packet.candidate_id;
+                    acquire_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
+                    acquire_trace.cause_id = last_sync_packet.cause_id
+                                                 ? last_sync_packet.cause_id
+                                                 : Common::PerformanceTelemetry::NextCauseSeq();
+                    acquire_trace.signal_id = last_sync_packet.signal_id;
+                    acquire_trace.hazard_id = last_sync_packet.hazard_id;
+                    const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+                    Common::PerformanceTelemetry::RecordCompletionScope(
+                        Common::PerformanceTelemetry::CompletionScopeSample{
+                            .scope_id = acquire_trace.scope_id,
+                            .cause_id = acquire_trace.cause_id,
+                            .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                            .command_buffer_seq =
+                                Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                            .first_packet_seq = packet_seq,
+                            .last_packet_seq = packet_seq,
+                            .completed_stage_bits = acquire_mem->cp_coher_cntl,
+                            .completed_write_bits = acquire_mem->cp_coher_cntl,
+                            .visible_access_bits = acquire_mem->cp_coher_cntl,
+                            .cache_action_bits = acquire_mem->cp_coher_cntl,
+                            .guest_begin = base_address,
+                            .guest_end = base_address + size,
+                            .pm4_digest = HashCombine(acquire_mem->cp_coher_cntl,
+                                                             acquire_mem->poll_interval),
+                            .queue_id = static_cast<u32>(GfxQueueId),
+                            .engine = static_cast<u16>(
+                                Common::PerformanceTelemetry::Pm4Engine::Graphics),
+                            .kind =
+                                Common::PerformanceTelemetry::CompletionScopeKind::AcquireMem,
+                            .confidence = 255,
+                        });
+                    RecordPendingCompletionHazard(
+                        acquire_trace, acquire_mem->cp_coher_cntl,
+                        acquire_mem->cp_coher_cntl,
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             ExecutionOrder) |
+                            static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                 MemoryVisibility),
+                        255);
+                }
+                Common::PerformanceTelemetry::ScopedCausalContext acquire_context{acquire_trace};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 if (telemetry_enabled) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
@@ -2270,6 +2787,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 Common::PerformanceTelemetry::WaitSeq wait_seq{};
                 Common::PerformanceTelemetry::FenceSeq matched_fence_seq{};
                 Common::PerformanceTelemetry::FenceSeq shadow_fence_seq{};
+                Common::PerformanceTelemetry::CausalTraceToken wait_trace{};
+                bool wait_producer_correlated{};
+                bool wait_required_host_block{};
                 u32 val_begin{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 u64 wait_location{};
@@ -2309,6 +2829,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         .shadow_basis = shadow_basis,
                         .matcher_status = matched_fence_seq != 0 ? Common::PerformanceTelemetry::CorrelationStatus::Complete : Common::PerformanceTelemetry::CorrelationStatus::Partial,
                     });
+                    wait_producer_correlated =
+                        last_sync_packet.fence_seq != 0 &&
+                        (matched_fence_seq == last_sync_packet.fence_seq ||
+                         shadow_fence_seq == last_sync_packet.fence_seq);
+                    const Common::PerformanceTelemetry::CausalTraceToken producer_trace{
+                        .candidate_id = wait_producer_correlated
+                                            ? last_sync_packet.candidate_id
+                                            : 0,
+                        .scope_id = wait_producer_correlated ? last_sync_packet.scope_id : 0,
+                        .cause_id = wait_producer_correlated ? last_sync_packet.cause_id : 0,
+                        .signal_id = wait_producer_correlated ? last_sync_packet.signal_id : 0,
+                        .hazard_id = wait_producer_correlated ? last_sync_packet.hazard_id : 0,
+                    };
+                    wait_trace = RecordWaitScope(
+                        Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId, wait_addr,
+                        reference, wait_seq, producer_trace, wait_producer_correlated);
                     last_wait_seq = wait_seq;
                 }
 #endif
@@ -2381,9 +2917,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
 #endif
                         if (needs_progress_submit) {
+                            Common::PerformanceTelemetry::ScopedCausalContext wait_context{
+                                wait_trace};
                             rasterizer->Flush(
                                 Common::PerformanceTelemetry::SubmitReason::WaitProgress);
                         }
+                        RecordWaitEffect(wait_trace, wait_seq, 0, true,
+                                         wait_producer_correlated);
                         break;
                     } else {
                         Common::PerformanceTelemetry::RecordFastpathWaitDecision(
@@ -2420,10 +2960,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
                         bool progress_submit_done = false;
                         if (!already_satisfied && !gpu_fence_bypass) {
-                            FlushPendingGpuCompletionsForWait();
-                            if (rasterizer) {
-                                rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
-                                progress_submit_done = true;
+                            wait_required_host_block = true;
+                            {
+                                Common::PerformanceTelemetry::ScopedCausalContext wait_context{
+                                    wait_trace};
+                                FlushPendingGpuCompletionsForWait();
+                                if (rasterizer) {
+                                    rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::
+                                                          WaitProgress);
+                                    progress_submit_done = true;
+                                }
                             }
                         }
                         if (!already_satisfied && !gpu_fence_bypass &&
@@ -2480,6 +3026,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     wait_location = (u64{1} << 63) | register_index;
 #endif
                     if (!test_value(regs.reg_array[register_index])) {
+                        wait_required_host_block = true;
+                        Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
                         FlushPendingGpuCompletionsForWait();
                     }
                     while (!test_value(regs.reg_array[register_index])) {
@@ -2499,6 +3047,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         val_end = *wait_reg_mem->Address<const u32*>();
                     }
                     const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
+                    RecordWaitEffect(wait_trace, wait_seq,
+                                     wait_required_host_block ? wait_end_ts - wait_spin_start : 0,
+                                     !wait_required_host_block, wait_producer_correlated);
                     Common::PerformanceTelemetry::RecordWaitComplete(Common::PerformanceTelemetry::WaitCompleteSample{
                         .wait_seq = wait_seq,
                         .fence_seq = matched_fence_seq,
@@ -2761,15 +3312,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+            const VAddr base_address =
+                (static_cast<VAddr>(acquire_mem->cp_coher_base_lo) |
+                 (static_cast<VAddr>(acquire_mem->cp_coher_base_hi) << 32))
+                << 8;
+            const u64 size =
+                (static_cast<u64>(acquire_mem->cp_coher_size_lo) |
+                 (static_cast<u64>(acquire_mem->cp_coher_size_hi) << 32))
+                << 8;
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
             if (telemetry_enabled) {
-                const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
-                const VAddr base_address =
-                    (static_cast<VAddr>(acquire_mem->cp_coher_base_lo) |
-                     (static_cast<VAddr>(acquire_mem->cp_coher_base_hi) << 32)) << 8;
-                const u64 size =
-                    (static_cast<u64>(acquire_mem->cp_coher_size_lo) |
-                     (static_cast<u64>(acquire_mem->cp_coher_size_hi) << 32)) << 8;
+                Common::PerformanceTelemetry::CausalTraceToken acquire_trace{
+                    .candidate_id = last_sync_packet.candidate_id,
+                    .scope_id = Common::PerformanceTelemetry::NextScopeSeq(),
+                    .cause_id = last_sync_packet.cause_id
+                                    ? last_sync_packet.cause_id
+                                    : Common::PerformanceTelemetry::NextCauseSeq(),
+                    .signal_id = last_sync_packet.signal_id,
+                    .hazard_id = last_sync_packet.hazard_id,
+                };
                 Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1,
                     static_cast<u32>(opcode), ib_depth, acquire_mem->cp_coher_cntl,
@@ -2783,6 +3345,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     static_cast<u32>(opcode), ib_depth, acquire_mem->cp_coher_base_lo,
                     acquire_mem->cp_coher_base_hi, 2);
                 const auto pkt_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+                Common::PerformanceTelemetry::RecordCompletionScope(
+                    Common::PerformanceTelemetry::CompletionScopeSample{
+                        .scope_id = acquire_trace.scope_id,
+                        .cause_id = acquire_trace.cause_id,
+                        .signal_id = acquire_trace.signal_id,
+                        .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                        .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                        .first_packet_seq = pkt_seq,
+                        .last_packet_seq = pkt_seq,
+                        .completed_stage_bits = acquire_mem->cp_coher_cntl,
+                        .completed_write_bits = acquire_mem->cp_coher_cntl,
+                        .visible_access_bits = acquire_mem->cp_coher_cntl,
+                        .cache_action_bits = acquire_mem->cp_coher_cntl,
+                        .guest_begin = base_address,
+                        .guest_end = base_address + size,
+                        .pm4_digest = HashCombine(acquire_mem->cp_coher_cntl,
+                                                         acquire_mem->poll_interval),
+                        .queue_id = static_cast<u32>(vqid + 1),
+                        .engine = static_cast<u16>(
+                            Common::PerformanceTelemetry::Pm4Engine::Compute),
+                        .kind = Common::PerformanceTelemetry::CompletionScopeKind::AcquireMem,
+                        .confidence = 192,
+                    });
                 Common::PerformanceTelemetry::RecordAcquireMem(Common::PerformanceTelemetry::AcquireMemSample{
                     .packet_seq = pkt_seq,
                     .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
@@ -2800,6 +3385,32 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     .previous_wait_seq = last_wait_seq,
                     .shadow_fence_seq = last_sync_packet.fence_seq,
                 });
+                RecordPendingCompletionHazard(
+                    acquire_trace, acquire_mem->cp_coher_cntl, acquire_mem->cp_coher_cntl,
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                         ExecutionOrder) |
+                        static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                             MemoryVisibility),
+                    192);
+                Common::PerformanceTelemetry::RecordHazardResolution(
+                    Common::PerformanceTelemetry::HazardResolutionSample{
+                        .hazard_id = acquire_trace.hazard_id,
+                        .cause_id = acquire_trace.cause_id,
+                        .candidate_id = acquire_trace.candidate_id,
+                        .guest_begin = base_address,
+                        .guest_end = base_address + size,
+                        .src_stage = static_cast<u64>(vk::PipelineStageFlagBits2::eComputeShader),
+                        .src_access = static_cast<u64>(vk::AccessFlagBits2::eShaderWrite),
+                        .dst_stage = static_cast<u64>(vk::PipelineStageFlagBits2::eComputeShader),
+                        .dst_access = static_cast<u64>(vk::AccessFlagBits2::eShaderRead) |
+                                      static_cast<u64>(vk::AccessFlagBits2::eShaderWrite),
+                        .sync_requirement_bits = static_cast<u64>(
+                            Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder),
+                        .resolution = Common::PerformanceTelemetry::HazardResolutionKind::
+                            ImplicitDependency,
+                        .avoidability = Common::PerformanceTelemetry::Avoidability::ProvenRequired,
+                        .confidence = 192,
+                    });
             }
 #endif
             break;
@@ -2951,6 +3562,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             Common::PerformanceTelemetry::WaitSeq wait_seq{};
             Common::PerformanceTelemetry::FenceSeq matched_fence_seq{};
             Common::PerformanceTelemetry::FenceSeq shadow_fence_seq{};
+            Common::PerformanceTelemetry::CausalTraceToken wait_trace{};
+            bool wait_producer_correlated{};
+            bool wait_required_host_block{};
             u32 val_begin{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
             u64 wait_location{};
@@ -2989,6 +3603,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     .shadow_basis = shadow_basis,
                     .matcher_status = matched_fence_seq != 0 ? Common::PerformanceTelemetry::CorrelationStatus::Complete : Common::PerformanceTelemetry::CorrelationStatus::Partial,
                 });
+                wait_producer_correlated =
+                    last_sync_packet.fence_seq != 0 &&
+                    (matched_fence_seq == last_sync_packet.fence_seq ||
+                     shadow_fence_seq == last_sync_packet.fence_seq);
+                const Common::PerformanceTelemetry::CausalTraceToken producer_trace{
+                    .candidate_id = wait_producer_correlated ? last_sync_packet.candidate_id : 0,
+                    .scope_id = wait_producer_correlated ? last_sync_packet.scope_id : 0,
+                    .cause_id = wait_producer_correlated ? last_sync_packet.cause_id : 0,
+                    .signal_id = wait_producer_correlated ? last_sync_packet.signal_id : 0,
+                    .hazard_id = wait_producer_correlated ? last_sync_packet.hazard_id : 0,
+                };
+                wait_trace = RecordWaitScope(
+                    Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1, wait_addr,
+                    reference, wait_seq, producer_trace, wait_producer_correlated);
                 last_wait_seq = wait_seq;
             }
 #endif
@@ -3009,9 +3637,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 failed_tests += gpu_fence_bypass;
 #endif
                 if (!already_satisfied && !gpu_fence_bypass) {
-                    FlushPendingGpuCompletionsForWait();
-                    if (rasterizer) {
-                        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+                    wait_required_host_block = true;
+                    {
+                        Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
+                        FlushPendingGpuCompletionsForWait();
+                        if (rasterizer) {
+                            rasterizer->Flush(
+                                Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+                        }
                     }
                     WAIT_MEMORY(vqid + 1, poll_address, test_value(*poll_address),
                                 YIELD_ASC(vqid));
@@ -3022,6 +3655,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 wait_location = (u64{1} << 63) | register_index;
 #endif
                 if (!test_value(regs.reg_array[register_index])) {
+                    wait_required_host_block = true;
+                    Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
                     FlushPendingGpuCompletionsForWait();
                 }
                 while (!test_value(regs.reg_array[register_index])) {
@@ -3041,6 +3676,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     val_end = *wait_reg_mem->Address<const u32*>();
                 }
                 const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
+                RecordWaitEffect(wait_trace, wait_seq,
+                                 wait_required_host_block ? wait_end_ts - wait_spin_start : 0,
+                                 !wait_required_host_block, wait_producer_correlated);
                 Common::PerformanceTelemetry::RecordWaitComplete(Common::PerformanceTelemetry::WaitCompleteSample{
                     .wait_seq = wait_seq,
                     .fence_seq = matched_fence_seq,
@@ -3078,6 +3716,73 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
+            if (telemetry_enabled) {
+                completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
+                completion_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
+                if (release_mem->Address<VAddr>() != 0) {
+                    completion_trace.signal_id = Common::PerformanceTelemetry::NextSignalSeq();
+                }
+                const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+                const u64 label_value =
+                    release_mem->data_lo | (static_cast<u64>(release_mem->data_hi) << 32);
+                const bool irq = release_mem->int_sel.Value() != InterruptSelect::None;
+                Common::PerformanceTelemetry::RecordCompletionScope(
+                    Common::PerformanceTelemetry::CompletionScopeSample{
+                        .scope_id = completion_trace.scope_id,
+                        .cause_id = completion_trace.cause_id,
+                        .signal_id = completion_trace.signal_id,
+                        .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                        .command_buffer_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                        .first_packet_seq = packet_seq,
+                        .last_packet_seq = packet_seq,
+                        .completed_stage_bits = release_mem->dw1,
+                        .completed_write_bits = release_mem->dw2,
+                        .visible_access_bits = release_mem->event_type.Value(),
+                        .cache_action_bits = release_mem->dw1,
+                        .label_addr = release_mem->Address<VAddr>(),
+                        .label_value = label_value,
+                        .pm4_digest = HashCombine(release_mem->dw1, release_mem->dw2),
+                        .queue_id = static_cast<u32>(vqid + 1),
+                        .engine = static_cast<u16>(
+                            Common::PerformanceTelemetry::Pm4Engine::Compute),
+                        .kind = Common::PerformanceTelemetry::CompletionScopeKind::ReleaseMem,
+                        .irq_bits = static_cast<u8>(irq),
+                        .confidence = 255,
+                    });
+                if (completion_trace.signal_id != 0) {
+                    Common::PerformanceTelemetry::RecordLogicalSignal(
+                        Common::PerformanceTelemetry::LogicalSignalSample{
+                            .signal_id = completion_trace.signal_id,
+                            .scope_id = completion_trace.scope_id,
+                            .cause_id = completion_trace.cause_id,
+                            .packet_seq = packet_seq,
+                            .label_addr = release_mem->Address<VAddr>(),
+                            .value = label_value,
+                            .producer_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                            .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Created,
+                            .action = Common::PerformanceTelemetry::SignalAction::
+                                PublishAfterPhysicalTick,
+                            .irq = static_cast<u8>(irq),
+                        });
+                }
+            }
+            RecordPendingCompletionHazard(
+                completion_trace, release_mem->dw1, release_mem->dw2,
+                static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+                    static_cast<u64>(
+                        Common::PerformanceTelemetry::SyncRequirement::MemoryVisibility) |
+                    (completion_trace.signal_id
+                         ? static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                HostSignalVisibility)
+                         : 0) |
+                    (release_mem->int_sel.Value() != InterruptSelect::None
+                         ? static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                InterruptPublication)
+                         : 0),
+                255);
+            Common::PerformanceTelemetry::ScopedCausalContext completion_context{
+                completion_trace};
             Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
             if (telemetry_enabled) {
@@ -3109,6 +3814,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     .fence_seq = fence_seq,
                     .generation = gen,
                     .packet_seq = pkt_seq,
+                    .candidate_id = completion_trace.candidate_id,
+                    .scope_id = completion_trace.scope_id,
+                    .cause_id = completion_trace.cause_id,
+                    .signal_id = completion_trace.signal_id,
+                    .hazard_id = completion_trace.hazard_id,
                     .label_addr = release_mem->Address<VAddr>(),
                     .label_value = label_val,
                 };
@@ -3159,6 +3869,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
                 has_writebacks = rasterizer->ProcessDownloadImages(
                     VideoCore::TextureCache::DownloadContext{
+                        .scope_id = completion_trace.scope_id,
+                        .cause_id = completion_trace.cause_id,
+                        .signal_id = completion_trace.signal_id,
+                        .hazard_id = completion_trace.hazard_id,
                         .trigger = VideoCore::TextureCache::DownloadTrigger::ReleaseMem,
                         .fence_seq = fence_token.fence_seq,
                         .trigger_control = release_mem->dw1,
@@ -3169,8 +3883,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 const PM4CmdReleaseMem packet = *release_mem;
                 auto* completion_rasterizer = rasterizer;
                 const u32 pipe_id = queue.pipe_id;
-                rasterizer->DeferGpuCompletion([packet, completion_rasterizer, pipe_id, fence_token] {
-                    SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token);
+                rasterizer->DeferGpuCompletion([packet, completion_rasterizer, pipe_id, fence_token,
+                                                completion_trace] {
+                    SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token,
+                                     completion_trace);
                 });
                 Common::PerformanceTelemetry::Add(
                     Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
@@ -3179,7 +3895,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 rasterizer->Flush(
                     Common::PerformanceTelemetry::SubmitReason::WritebackReleaseMem);
             } else {
-                SignalReleaseMem(*release_mem, rasterizer, queue.pipe_id, fence_token);
+                SignalReleaseMem(*release_mem, rasterizer, queue.pipe_id, fence_token,
+                                 completion_trace);
             }
             break;
         }
@@ -3187,6 +3904,41 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
             if (telemetry_enabled) {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                Common::PerformanceTelemetry::CausalTraceToken event_trace{
+                    .scope_id = Common::PerformanceTelemetry::NextScopeSeq(),
+                    .cause_id = Common::PerformanceTelemetry::NextCauseSeq(),
+                };
+                const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+                Common::PerformanceTelemetry::RecordCompletionScope(
+                    Common::PerformanceTelemetry::CompletionScopeSample{
+                        .scope_id = event_trace.scope_id,
+                        .cause_id = event_trace.cause_id,
+                        .frame_seq = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                        .command_buffer_seq =
+                            Common::PerformanceTelemetry::CurrentCmdBufferSeq(),
+                        .first_packet_seq = packet_seq,
+                        .last_packet_seq = packet_seq,
+                        .completed_stage_bits = event->event_control,
+                        .completed_write_bits = event->inv_l2,
+                        .visible_access_bits = static_cast<u64>(event->event_type.Value()),
+                        .cache_action_bits = event->inv_l2,
+                        .pm4_digest = HashCombine(event->event_control,
+                                                 header->type3.NumWords()),
+                        .queue_id = static_cast<u32>(vqid + 1),
+                        .engine = static_cast<u16>(
+                            Common::PerformanceTelemetry::Pm4Engine::Compute),
+                        .kind = Common::PerformanceTelemetry::CompletionScopeKind::EventWrite,
+                        .confidence = 96,
+                    });
+                RecordPendingCompletionHazard(
+                    event_trace, event->event_control, event->inv_l2,
+                    static_cast<u64>(
+                        Common::PerformanceTelemetry::SyncRequirement::ExecutionOrder) |
+                        (event->inv_l2
+                             ? static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                                    MemoryVisibility)
+                             : 0),
+                    96);
                 Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1,
                     static_cast<u32>(opcode), ib_depth, event->event_control, 0);

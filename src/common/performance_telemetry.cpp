@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <zstd.h>
@@ -22,7 +23,8 @@
 namespace Common::PerformanceTelemetry {
 namespace {
 
-constexpr u64 RingCapacity = 8192_KB;
+// Retain the recent diagnostic window without reserving tens of megabytes for every thread.
+constexpr u64 RingCapacity = 1ULL << 18;
 constexpr u64 RingMask = RingCapacity - 1;
 static_assert(std::has_single_bit(RingCapacity));
 
@@ -38,8 +40,8 @@ constexpr size_t Pm4WordOverflowBucket = 256;
 constexpr size_t Pm4WordBucketCount = Pm4WordOverflowBucket + 1;
 constexpr size_t Pm4RegisterSpaceCount = 4;
 constexpr size_t Pm4RegisterCount = 0x1000;
-constexpr size_t Pm4ControlCapacity = 1048576;
-constexpr size_t Pm4WaitCapacity = 262144;
+constexpr size_t Pm4ControlCapacity = 262144;
+constexpr size_t Pm4WaitCapacity = 65536;
 constexpr size_t Pm4HashProbeLimit = 32;
 constexpr size_t TimerSiteCount = static_cast<size_t>(TimerSite::Count);
 constexpr size_t TrackedStageCount = 6;
@@ -54,42 +56,42 @@ constexpr size_t StagingMemoryKindCount = static_cast<size_t>(StagingMemoryKind:
 constexpr size_t SubmitReasonCount = static_cast<size_t>(SubmitReason::Count);
 constexpr size_t WritebackTriggerCount = static_cast<size_t>(WritebackTrigger::Count);
 constexpr size_t StagingSizeBucketCount = std::numeric_limits<u64>::digits + 1;
-constexpr size_t WritebackRecordCapacity = 4194304;
-constexpr size_t FrameRecordCapacity = 524288;
-constexpr size_t SyncPm4PacketCapacity = 4194304;
-constexpr size_t ProducerRecordCapacity = 4194304;
-constexpr size_t ProducerEndRecordCapacity = 4194304;
-constexpr size_t ProducerFullRecordCapacity = 4194304;
-constexpr size_t ResourceWriteRecordCapacity = 4194304;
-constexpr size_t FenceRecordCapacity = 2097152;
-constexpr size_t FenceEpochLinkCapacity = 4194304;
-constexpr size_t FenceMatchAttemptCapacity = 2097152;
-constexpr size_t FenceMatchDiagnosticCapacity = 1048576;
-constexpr size_t ResourceEpochPromotedCapacity = 1048576;
-constexpr size_t FenceResourceLinkCapacity = 2097152;
-constexpr size_t WaitRecordCapacity = 2097152;
-constexpr size_t WaitCompleteCapacity = 2097152;
-constexpr size_t FirstConsumerCapacity = 1048576;
-constexpr size_t FenceClassificationCapacity = 2097152;
-constexpr size_t CpuAccessRecordCapacity = 2097152;
-constexpr size_t CpuLabelAccessCapacity = 1048576;
-constexpr size_t CpuMaterializationRecordCapacity = 1048576;
-constexpr size_t StaleGuestAttemptRecordCapacity = 1048576;
-constexpr size_t GpuAliasRecordCapacity = 1048576;
-constexpr size_t ReadbackScheduleCapacity = 4194304;
-constexpr size_t ReadbackSubmitCapacity = 4194304;
-constexpr size_t ReadbackReadyCapacity = 4194304;
-constexpr size_t ReadbackCommitCapacity = 4194304;
-constexpr size_t ReadbackSourceTerminalCapacity = 1048576;
-constexpr size_t GuestSourceConsumeCapacity = 1048576;
-constexpr size_t ResourceLineageCapacity = 1048576;
+constexpr size_t WritebackRecordCapacity = 1048576;
+constexpr size_t FrameRecordCapacity = 262144;
+constexpr size_t SyncPm4PacketCapacity = 524288;
+constexpr size_t ProducerRecordCapacity = 262144;
+constexpr size_t ProducerEndRecordCapacity = 262144;
+constexpr size_t ProducerFullRecordCapacity = 262144;
+constexpr size_t ResourceWriteRecordCapacity = 262144;
+constexpr size_t FenceRecordCapacity = 262144;
+constexpr size_t FenceEpochLinkCapacity = 524288;
+constexpr size_t FenceMatchAttemptCapacity = 262144;
+constexpr size_t FenceMatchDiagnosticCapacity = 131072;
+constexpr size_t ResourceEpochPromotedCapacity = 131072;
+constexpr size_t FenceResourceLinkCapacity = 262144;
+constexpr size_t WaitRecordCapacity = 262144;
+constexpr size_t WaitCompleteCapacity = 262144;
+constexpr size_t FirstConsumerCapacity = 262144;
+constexpr size_t FenceClassificationCapacity = 262144;
+constexpr size_t CpuAccessRecordCapacity = 262144;
+constexpr size_t CpuLabelAccessCapacity = 131072;
+constexpr size_t CpuMaterializationRecordCapacity = 131072;
+constexpr size_t StaleGuestAttemptRecordCapacity = 131072;
+constexpr size_t GpuAliasRecordCapacity = 131072;
+constexpr size_t ReadbackScheduleCapacity = 262144;
+constexpr size_t ReadbackSubmitCapacity = 262144;
+constexpr size_t ReadbackReadyCapacity = 262144;
+constexpr size_t ReadbackCommitCapacity = 262144;
+constexpr size_t ReadbackSourceTerminalCapacity = 262144;
+constexpr size_t GuestSourceConsumeCapacity = 262144;
+constexpr size_t ResourceLineageCapacity = 262144;
 constexpr size_t CpuReadObservationCapacity = 262144;
-constexpr size_t ResourceBarrierLinkCapacity = 1048576;
-constexpr size_t AcquireMemCapacity = 1048576;
-constexpr size_t FenceSignalCapacity = 2097152;
-constexpr size_t HostWaitCapacity = 4194304;
-constexpr size_t SubmitRecordCapacity = 1048576;
-constexpr size_t ShadowFencePolicyCapacity = 1048576;
+constexpr size_t ResourceBarrierLinkCapacity = 262144;
+constexpr size_t AcquireMemCapacity = 262144;
+constexpr size_t FenceSignalCapacity = 262144;
+constexpr size_t HostWaitCapacity = 524288;
+constexpr size_t SubmitRecordCapacity = 262144;
+constexpr size_t ShadowFencePolicyCapacity = 262144;
 constexpr size_t TraceGapCapacity = 131072;
 constexpr size_t RingHealthCapacity = 2048;
 constexpr size_t SemanticReadFaultCapacity = 524288;
@@ -116,6 +118,11 @@ constexpr size_t AuthorityHostMaterializeRequiredCapacity = 65536;
 constexpr size_t FastpathWaitDecisionCapacity = 65536;
 constexpr size_t VirtualFenceForcedCompletionCapacity = 65536;
 constexpr size_t CpuToGpuLabelWaitCapacity = 65536;
+constexpr size_t CausalRecordCapacity = 262144;
+constexpr size_t GpuIntervalCapacity = 262144;
+constexpr size_t GpuCalibrationCapacity = 4096;
+constexpr size_t GpuProfilerHealthCapacity = 4096;
+constexpr size_t GpuPipelineExecutableCapacity = 65536;
 constexpr size_t StageReasonBitCount = 6;
 constexpr size_t DynamicReasonBitCount = 4;
 constexpr size_t DynamicGroupBitCount = 5;
@@ -189,6 +196,11 @@ static_assert(std::has_single_bit(AuthorityHostMaterializeRequiredCapacity));
 static_assert(std::has_single_bit(FastpathWaitDecisionCapacity));
 static_assert(std::has_single_bit(VirtualFenceForcedCompletionCapacity));
 static_assert(std::has_single_bit(CpuToGpuLabelWaitCapacity));
+static_assert(std::has_single_bit(CausalRecordCapacity));
+static_assert(std::has_single_bit(GpuIntervalCapacity));
+static_assert(std::has_single_bit(GpuCalibrationCapacity));
+static_assert(std::has_single_bit(GpuProfilerHealthCapacity));
+static_assert(std::has_single_bit(GpuPipelineExecutableCapacity));
 
 constexpr std::array TimerNames{
     "stage_refresh",          "stage_flat_copy",       "stage_srt_walker",
@@ -1005,6 +1017,141 @@ constexpr std::array VirtualFenceForcedCompletionReasonNames{
 };
 static_assert(VirtualFenceForcedCompletionReasonNames.size() == static_cast<size_t>(VirtualFenceForcedCompletionReason::Count));
 
+constexpr std::array CompletionScopeKindNames{
+    "event_write_eos", "event_write_eop", "release_mem", "acquire_mem",
+    "surface_sync",    "event_write",     "wait_reg_mem", "unknown",
+};
+static_assert(CompletionScopeKindNames.size() == static_cast<size_t>(CompletionScopeKind::Count));
+
+constexpr std::array DataActionNames{
+    "direct_gpu_authority", "gpu_shadow", "lazy_cpu_materialization", "legacy_required",
+};
+static_assert(DataActionNames.size() == static_cast<size_t>(DataAction::Count));
+
+constexpr std::array SignalActionNames{
+    "publish_after_physical_tick", "virtual_gpu_wait", "force_progress_submit",
+    "force_host_completion",       "no_signal_action",
+};
+static_assert(SignalActionNames.size() == static_cast<size_t>(SignalAction::Count));
+
+constexpr std::array AvoidabilityNames{
+    "proven_required", "proven_eliminable", "conservative_fallback",
+    "unknown_due_to_trace_gap",
+};
+static_assert(AvoidabilityNames.size() == static_cast<size_t>(Avoidability::Count));
+
+constexpr std::array RepresentationKindNames{
+    "original_image", "gpu_shadow", "buffer_alias", "guest_ram",
+};
+static_assert(RepresentationKindNames.size() == static_cast<size_t>(RepresentationKind::Count));
+
+constexpr std::array CandidateConsumerKindNames{
+    "gpu_image", "gpu_buffer", "cpu_data", "cpu_label", "irq",
+    "overwrite", "unmap",      "unknown",
+};
+static_assert(CandidateConsumerKindNames.size() ==
+              static_cast<size_t>(CandidateConsumerKind::Count));
+
+constexpr std::array CandidateTerminalReasonNames{
+    "materialized", "consumed_gpu", "consumed_cpu", "overwritten", "destroyed",
+    "unmapped",     "superseded",   "rejected_at_schedule", "session_end",
+};
+static_assert(CandidateTerminalReasonNames.size() ==
+              static_cast<size_t>(CandidateTerminalReason::Count));
+
+constexpr std::array LogicalSignalPhaseNames{
+    "created", "published", "wait_matched", "cpu_observed", "irq_published", "retired",
+};
+static_assert(LogicalSignalPhaseNames.size() == static_cast<size_t>(LogicalSignalPhase::Count));
+
+constexpr std::array HazardResolutionKindNames{
+    "implicit_dependency", "barrier_emitted", "layout_transition", "queue_transfer",
+    "legacy_fallback",     "trace_gap",       "pending",
+};
+static_assert(HazardResolutionKindNames.size() ==
+              static_cast<size_t>(HazardResolutionKind::Count));
+
+constexpr std::array ScopeBreakReasonNames{
+    "required_transfer", "required_memory_dependency", "required_layout_transition",
+    "required_host_visibility", "required_queue_transfer", "required_non_graphics_command",
+    "attachment_set_change", "present", "unknown_fallback",
+};
+static_assert(ScopeBreakReasonNames.size() == static_cast<size_t>(ScopeBreakReason::Count));
+
+constexpr std::array CausalEffectKindNames{
+    "barrier", "scope_break", "copy", "resolve", "tile", "clear", "flush",
+    "submit",  "host_wait",   "gpu_interval",
+};
+static_assert(CausalEffectKindNames.size() == static_cast<size_t>(CausalEffectKind::Count));
+
+constexpr std::array EffectAttributionNames{"exclusive", "shared", "unknown"};
+static_assert(EffectAttributionNames.size() == static_cast<size_t>(EffectAttribution::Count));
+
+constexpr std::array GpuIntervalKindNames{
+    "command_buffer", "rendering_scope", "graphics_pipeline_block",
+    "compute_pipeline_block", "copy", "tile", "detile", "resolve", "clear",
+    "dependency_delay_interval", "present", "queue_gap", "unattributed",
+};
+static_assert(GpuIntervalKindNames.size() == static_cast<size_t>(GpuIntervalKind::Count));
+
+constexpr std::array GpuQueryStatusNames{
+    "available", "not_ready", "budget_exhausted", "slot_unavailable", "unsupported",
+    "invalid",
+};
+static_assert(GpuQueryStatusNames.size() == static_cast<size_t>(GpuQueryStatus::Count));
+
+constexpr std::array PipelineStatisticKindNames{"none", "graphics", "compute"};
+static_assert(PipelineStatisticKindNames.size() ==
+              static_cast<size_t>(PipelineStatisticKind::Count));
+
+constexpr std::array CandidateRejectReasonNames{
+    "no_completion_scope",
+    "producer_unknown",
+    "producer_after_scope",
+    "stage_not_covered",
+    "queue_order_unknown",
+    "cross_queue_dependency_missing",
+    "packet_gap_or_trace_loss",
+    "ambiguous_event_semantics",
+    "cache_visibility_insufficient",
+    "range_not_covered_by_scope",
+    "readback_disabled_by_configuration",
+    "guest_address_unavailable",
+    "resource_not_gpu_modified",
+    "superseded_before_evaluation",
+    "image_freed_or_reused",
+    "resource_epoch_changed",
+    "alias_epoch_changed",
+    "alias_writer_ambiguous",
+    "partial_overlap_ambiguous",
+    "topology_changed",
+    "multiple_versions_required",
+    "image_not_safe_to_download",
+    "unsupported_tiling",
+    "unsupported_format_or_aspect",
+    "unsupported_mip_layer_region",
+    "copy_region_not_representable",
+    "snapshot_allocation_failed",
+    "pin_or_lifetime_unavailable",
+    "staging_pressure_limit",
+    "immediate_cpu_data_read",
+    "cpu_partial_write_needs_preservation",
+    "unknown_consumer_without_durable_snapshot",
+    "label_read_by_cpu_before_natural_submit",
+    "irq_requires_completion",
+    "multiple_signal_consumers",
+    "unsupported_wait_comparison",
+    "label_generation_mismatch",
+    "label_address_aliased",
+    "unmap_before_completion",
+    "remap_or_aba_risk",
+    "shutdown_in_progress",
+    "device_lost",
+    "authority_pressure_eviction",
+    "internal_validation_failure",
+};
+static_assert(CandidateRejectReasonNames.size() == 44);
+
 constexpr std::array FastpathEligibilityNames{
     "eligible",
     "rejected",
@@ -1203,17 +1350,84 @@ struct EventSlot {
     std::atomic<u64> committed_sequence{};
 };
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+constexpr u32 TelemetryWriteCostSamplePeriod = 1024;
+std::atomic<u64> g_telemetry_write_cost_samples{};
+std::atomic<u64> g_telemetry_write_cost_ns{};
+std::atomic<u64> g_telemetry_page_allocations{};
+std::atomic<u64> g_telemetry_page_allocation_races{};
+std::atomic<u64> g_telemetry_page_allocation_bytes{};
+std::atomic<u64> g_telemetry_page_allocation_ns{};
+std::atomic<u64> g_frame_snapshot_cost_samples{};
+std::atomic<u64> g_frame_snapshot_cost_ns{};
+#endif
+
+template <typename Record, size_t Capacity, size_t RecordsPerPage = 256>
+class PagedStorage {
+    static_assert(std::has_single_bit(Capacity));
+    static_assert(std::has_single_bit(RecordsPerPage));
+    static_assert(Capacity % RecordsPerPage == 0);
+
+    using Page = std::array<Record, RecordsPerPage>;
+    static constexpr size_t PageCount = Capacity / RecordsPerPage;
+
+public:
+    ~PagedStorage() {
+        for (auto& slot : pages) {
+            delete slot.load(std::memory_order_relaxed);
+        }
+    }
+
+    Record& Get(size_t index) noexcept {
+        auto& slot = pages[index / RecordsPerPage];
+        Page* page = slot.load(std::memory_order_acquire);
+        if (!page) [[unlikely]] {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            const u64 allocation_start = Timestamp();
+#endif
+            auto* allocated = new Page{};
+            if (!slot.compare_exchange_strong(page, allocated, std::memory_order_release,
+                                              std::memory_order_acquire)) {
+                delete allocated;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                g_telemetry_page_allocation_races.fetch_add(1, std::memory_order_relaxed);
+#endif
+            } else {
+                page = allocated;
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                g_telemetry_page_allocations.fetch_add(1, std::memory_order_relaxed);
+                g_telemetry_page_allocation_bytes.fetch_add(sizeof(Page),
+                                                            std::memory_order_relaxed);
+#endif
+            }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+            g_telemetry_page_allocation_ns.fetch_add(Timestamp() - allocation_start,
+                                                     std::memory_order_relaxed);
+#endif
+        }
+        return (*page)[index & (RecordsPerPage - 1)];
+    }
+
+    const Record* Find(size_t index) const noexcept {
+        const Page* page = pages[index / RecordsPerPage].load(std::memory_order_acquire);
+        return page ? std::addressof((*page)[index & (RecordsPerPage - 1)]) : nullptr;
+    }
+
+private:
+    std::array<std::atomic<Page*>, PageCount> pages{};
+};
+
 struct ThreadRing {
     explicit ThreadRing(u32 id_, std::string name_) : id{id_}, name{std::move(name_)} {}
 
     alignas(64) std::atomic<u64> next_sequence{};
-    std::array<EventSlot, RingCapacity> events{};
+    std::unique_ptr<PagedStorage<EventSlot, RingCapacity>> events;
     alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Counter::Count)> counters{};
     std::array<std::atomic<u64>, 256> opcodes{};
     std::array<std::array<std::atomic<u64>, HistogramBucketCount>, HistogramCounters.size()>
         histograms{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    Pm4Detail pm4{};
+    std::unique_ptr<Pm4Detail> pm4;
     std::array<std::atomic<u64>, TimerSiteCount> timer_ns{};
     std::array<std::atomic<u64>, TimerSiteCount> timer_samples{};
     std::array<std::array<std::atomic<u64>, HistogramBucketCount>, TimerSiteCount>
@@ -1265,6 +1479,10 @@ struct RelationalRecord {
     Sample sample{};
 };
 
+// Streams retain a bounded ring while allocating only the pages actually touched by the capture.
+template <typename Sample, size_t Capacity>
+using PagedRelationalStorage = PagedStorage<RelationalRecord<Sample>, Capacity>;
+
 std::atomic<EventSeq> g_event_sequence{};
 std::atomic<PacketSeq> g_packet_sequence{};
 std::atomic<ProducerSeq> g_producer_sequence{};
@@ -1278,68 +1496,165 @@ std::atomic<CpuAccessSeq> g_cpu_access_sequence{};
 std::atomic<ReadbackSeq> g_readback_sequence{};
 std::atomic<CmdBufferSeq> g_cmdbuf_sequence{};
 
-std::unique_ptr<std::array<RelationalRecord<SyncPm4PacketSample>, SyncPm4PacketCapacity>> g_sync_pm4_records;
-std::unique_ptr<std::array<RelationalRecord<ProducerBeginSample>, ProducerRecordCapacity>> g_producer_begin_records;
-std::unique_ptr<std::array<RelationalRecord<ProducerEndSample>, ProducerEndRecordCapacity>> g_producer_end_records;
-std::unique_ptr<std::array<RelationalRecord<ProducerRecordSample>, ProducerFullRecordCapacity>> g_producer_full_records;
-std::unique_ptr<std::array<RelationalRecord<ResourceWriteSample>, ResourceWriteRecordCapacity>> g_resource_write_records;
-std::unique_ptr<std::array<RelationalRecord<FenceCreateSample>, FenceRecordCapacity>> g_fence_create_records;
-std::unique_ptr<std::array<RelationalRecord<FenceEpochLinkSample>, FenceEpochLinkCapacity>> g_fence_epoch_link_records;
-std::unique_ptr<std::array<RelationalRecord<FenceMatchAttemptSample>, FenceMatchAttemptCapacity>> g_fence_match_records;
-std::unique_ptr<std::array<RelationalRecord<FenceMatchDiagnosticSample>, FenceMatchDiagnosticCapacity>> g_fence_match_diagnostic_records;
-std::unique_ptr<std::array<RelationalRecord<ResourceEpochPromotedSample>, ResourceEpochPromotedCapacity>> g_resource_epoch_promoted_records;
-std::unique_ptr<std::array<RelationalRecord<FenceResourceLinkSample>, FenceResourceLinkCapacity>> g_fence_resource_link_records;
-std::unique_ptr<std::array<RelationalRecord<WaitCreateSample>, WaitRecordCapacity>> g_wait_create_records;
-std::unique_ptr<std::array<RelationalRecord<WaitCompleteSample>, WaitCompleteCapacity>> g_wait_complete_records;
-std::unique_ptr<std::array<RelationalRecord<FirstConsumerSample>, FirstConsumerCapacity>> g_first_consumer_records;
-std::unique_ptr<std::array<RelationalRecord<FenceClassificationSample>, FenceClassificationCapacity>> g_fence_classification_records;
-std::unique_ptr<std::array<RelationalRecord<CpuAccessSample>, CpuAccessRecordCapacity>> g_cpu_access_records;
-std::unique_ptr<std::array<RelationalRecord<CpuLabelAccessSample>, CpuLabelAccessCapacity>> g_cpu_label_records;
-std::unique_ptr<std::array<RelationalRecord<CpuMaterializationSample>, CpuMaterializationRecordCapacity>> g_cpu_materialization_records;
-std::unique_ptr<std::array<RelationalRecord<StaleGuestAttemptSample>, StaleGuestAttemptRecordCapacity>> g_stale_guest_records;
-std::unique_ptr<std::array<RelationalRecord<GpuAliasMaterializeSample>, GpuAliasRecordCapacity>> g_gpu_alias_records;
-std::unique_ptr<std::array<RelationalRecord<ReadbackScheduleSample>, ReadbackScheduleCapacity>> g_readback_schedule_records;
-std::unique_ptr<std::array<RelationalRecord<ReadbackSubmitSample>, ReadbackSubmitCapacity>> g_readback_submit_records;
-std::unique_ptr<std::array<RelationalRecord<ReadbackReadySample>, ReadbackReadyCapacity>> g_readback_ready_records;
-std::unique_ptr<std::array<RelationalRecord<ReadbackCommitSample>, ReadbackCommitCapacity>> g_readback_commit_records;
-std::unique_ptr<std::array<RelationalRecord<ReadbackSourceTerminalSample>, ReadbackSourceTerminalCapacity>> g_readback_source_terminal_records;
-std::unique_ptr<std::array<RelationalRecord<GuestSourceConsumeSample>, GuestSourceConsumeCapacity>> g_guest_source_consume_records;
-std::unique_ptr<std::array<RelationalRecord<ResourceLineageSample>, ResourceLineageCapacity>> g_resource_lineage_records;
-std::unique_ptr<std::array<RelationalRecord<CpuReadObservationSample>, CpuReadObservationCapacity>> g_cpu_read_observation_records;
-std::unique_ptr<std::array<RelationalRecord<SemanticReadFaultSample>, SemanticReadFaultCapacity>> g_semantic_read_fault_records;
-std::unique_ptr<std::array<RelationalRecord<SemanticReadUnknownSample>, SemanticReadUnknownCapacity>> g_semantic_read_unknown_records;
-std::unique_ptr<std::array<RelationalRecord<SemanticWatchCancelSample>, SemanticWatchCancelCapacity>> g_semantic_watch_cancel_records;
-std::unique_ptr<std::array<RelationalRecord<SemanticPageConflictWriteSample>, SemanticPageConflictWriteCapacity>> g_semantic_page_conflict_records;
-std::unique_ptr<std::array<RelationalRecord<ResourceBarrierLinkSample>, ResourceBarrierLinkCapacity>> g_resource_barrier_link_records;
-std::unique_ptr<std::array<RelationalRecord<AcquireMemSample>, AcquireMemCapacity>> g_acquire_mem_records;
-std::unique_ptr<std::array<RelationalRecord<FenceSignalSample>, FenceSignalCapacity>> g_fence_signal_records;
-std::unique_ptr<std::array<RelationalRecord<HostWaitSample>, HostWaitCapacity>> g_host_wait_records;
-std::unique_ptr<std::array<RelationalRecord<SubmitRecordSample>, SubmitRecordCapacity>> g_submit_records;
-std::unique_ptr<std::array<RelationalRecord<ShadowFencePolicySample>, ShadowFencePolicyCapacity>> g_shadow_fence_records;
-std::unique_ptr<std::array<RelationalRecord<TraceGapSample>, TraceGapCapacity>> g_trace_gap_records;
-std::unique_ptr<std::array<RelationalRecord<RingHealthSample>, RingHealthCapacity>> g_ring_health_records;
-std::unique_ptr<std::array<RelationalRecord<FastpathCandidateSample>, FastpathCandidateCapacity>> g_fastpath_candidate_records;
-std::unique_ptr<std::array<RelationalRecord<GpuAuthorityCreateSample>, GpuAuthorityCreateCapacity>> g_gpu_authority_create_records;
-std::unique_ptr<std::array<RelationalRecord<VirtualFenceCreateSample>, VirtualFenceCreateCapacity>> g_virtual_fence_create_records;
-std::unique_ptr<std::array<RelationalRecord<VirtualWaitConsumeSample>, VirtualWaitConsumeCapacity>> g_virtual_wait_consume_records;
-std::unique_ptr<std::array<RelationalRecord<AsyncLabelSignalSample>, AsyncLabelSignalCapacity>> g_async_label_signal_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityGpuConsumeSample>, AuthorityGpuConsumeCapacity>> g_authority_gpu_consume_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityBarrierValidationSample>, AuthorityBarrierValidationCapacity>> g_authority_barrier_validation_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityRamDemandSample>, AuthorityRamDemandCapacity>> g_authority_ram_demand_records;
-std::unique_ptr<std::array<RelationalRecord<LazyMaterializeBeginSample>, LazyMaterializeBeginCapacity>> g_lazy_materialize_begin_records;
-std::unique_ptr<std::array<RelationalRecord<LazyMaterializeEndSample>, LazyMaterializeEndCapacity>> g_lazy_materialize_end_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityRamConsumeSample>, AuthorityRamConsumeCapacity>> g_authority_ram_consume_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityCpuReadSample>, AuthorityCpuReadCapacity>> g_authority_cpu_read_records;
-std::unique_ptr<std::array<RelationalRecord<AuthoritySupersedeSample>, AuthoritySupersedeCapacity>> g_authority_supersede_records;
-std::unique_ptr<std::array<RelationalRecord<FastpathFallbackSample>, FastpathFallbackCapacity>> g_fastpath_fallback_records;
-std::unique_ptr<std::array<RelationalRecord<ConservativeDownloadDecisionSample>, ConservativeDownloadDecisionCapacity>> g_conservative_download_decision_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityConservativeReadbackSuppressedSample>, AuthorityConservativeReadbackSuppressedCapacity>> g_authority_conservative_readback_suppressed_records;
-std::unique_ptr<std::array<RelationalRecord<AuthorityHostMaterializeRequiredSample>, AuthorityHostMaterializeRequiredCapacity>> g_authority_host_materialize_required_records;
-std::unique_ptr<std::array<RelationalRecord<FastpathWaitDecisionSample>, FastpathWaitDecisionCapacity>> g_fastpath_wait_decision_records;
-std::unique_ptr<std::array<RelationalRecord<VirtualFenceForcedCompletionSample>, VirtualFenceForcedCompletionCapacity>> g_virtual_fence_forced_completion_records;
-std::unique_ptr<std::array<RelationalRecord<CpuToGpuLabelWaitSample>, CpuToGpuLabelWaitCapacity>> g_cpu_to_gpu_label_wait_records;
-std::unique_ptr<std::array<WritebackRecord, WritebackRecordCapacity>> g_writeback_records;
-std::unique_ptr<std::array<FrameRecord, FrameRecordCapacity>> g_frame_records;
+std::unique_ptr<PagedRelationalStorage<SyncPm4PacketSample, SyncPm4PacketCapacity>>
+    g_sync_pm4_records;
+std::unique_ptr<PagedRelationalStorage<ProducerBeginSample, ProducerRecordCapacity>>
+    g_producer_begin_records;
+std::unique_ptr<PagedRelationalStorage<ProducerEndSample, ProducerEndRecordCapacity>>
+    g_producer_end_records;
+std::unique_ptr<PagedRelationalStorage<ProducerRecordSample, ProducerFullRecordCapacity>>
+    g_producer_full_records;
+std::unique_ptr<PagedRelationalStorage<ResourceWriteSample, ResourceWriteRecordCapacity>>
+    g_resource_write_records;
+std::unique_ptr<PagedRelationalStorage<FenceCreateSample, FenceRecordCapacity>>
+    g_fence_create_records;
+std::unique_ptr<PagedRelationalStorage<FenceEpochLinkSample, FenceEpochLinkCapacity>>
+    g_fence_epoch_link_records;
+std::unique_ptr<PagedRelationalStorage<FenceMatchAttemptSample, FenceMatchAttemptCapacity>>
+    g_fence_match_records;
+std::unique_ptr<PagedRelationalStorage<FenceMatchDiagnosticSample, FenceMatchDiagnosticCapacity>>
+    g_fence_match_diagnostic_records;
+std::unique_ptr<PagedRelationalStorage<ResourceEpochPromotedSample,
+                                       ResourceEpochPromotedCapacity>>
+    g_resource_epoch_promoted_records;
+std::unique_ptr<PagedRelationalStorage<FenceResourceLinkSample, FenceResourceLinkCapacity>>
+    g_fence_resource_link_records;
+std::unique_ptr<PagedRelationalStorage<WaitCreateSample, WaitRecordCapacity>>
+    g_wait_create_records;
+std::unique_ptr<PagedRelationalStorage<WaitCompleteSample, WaitCompleteCapacity>>
+    g_wait_complete_records;
+std::unique_ptr<PagedRelationalStorage<FirstConsumerSample, FirstConsumerCapacity>>
+    g_first_consumer_records;
+std::unique_ptr<PagedRelationalStorage<FenceClassificationSample, FenceClassificationCapacity>>
+    g_fence_classification_records;
+std::unique_ptr<PagedRelationalStorage<CpuAccessSample, CpuAccessRecordCapacity>>
+    g_cpu_access_records;
+std::unique_ptr<PagedRelationalStorage<CpuLabelAccessSample, CpuLabelAccessCapacity>>
+    g_cpu_label_records;
+std::unique_ptr<PagedRelationalStorage<CpuMaterializationSample,
+                                       CpuMaterializationRecordCapacity>>
+    g_cpu_materialization_records;
+std::unique_ptr<PagedRelationalStorage<StaleGuestAttemptSample,
+                                       StaleGuestAttemptRecordCapacity>>
+    g_stale_guest_records;
+std::unique_ptr<PagedRelationalStorage<GpuAliasMaterializeSample, GpuAliasRecordCapacity>>
+    g_gpu_alias_records;
+std::unique_ptr<PagedRelationalStorage<ReadbackScheduleSample, ReadbackScheduleCapacity>>
+    g_readback_schedule_records;
+std::unique_ptr<PagedRelationalStorage<ReadbackSubmitSample, ReadbackSubmitCapacity>>
+    g_readback_submit_records;
+std::unique_ptr<PagedRelationalStorage<ReadbackReadySample, ReadbackReadyCapacity>>
+    g_readback_ready_records;
+std::unique_ptr<PagedRelationalStorage<ReadbackCommitSample, ReadbackCommitCapacity>>
+    g_readback_commit_records;
+std::unique_ptr<PagedRelationalStorage<ReadbackSourceTerminalSample,
+                                       ReadbackSourceTerminalCapacity>>
+    g_readback_source_terminal_records;
+std::unique_ptr<PagedRelationalStorage<GuestSourceConsumeSample, GuestSourceConsumeCapacity>>
+    g_guest_source_consume_records;
+std::unique_ptr<PagedRelationalStorage<ResourceLineageSample, ResourceLineageCapacity>>
+    g_resource_lineage_records;
+std::unique_ptr<PagedRelationalStorage<CpuReadObservationSample, CpuReadObservationCapacity>>
+    g_cpu_read_observation_records;
+std::unique_ptr<PagedRelationalStorage<SemanticReadFaultSample, SemanticReadFaultCapacity>>
+    g_semantic_read_fault_records;
+std::unique_ptr<PagedRelationalStorage<SemanticReadUnknownSample, SemanticReadUnknownCapacity>>
+    g_semantic_read_unknown_records;
+std::unique_ptr<PagedRelationalStorage<SemanticWatchCancelSample, SemanticWatchCancelCapacity>>
+    g_semantic_watch_cancel_records;
+std::unique_ptr<PagedRelationalStorage<SemanticPageConflictWriteSample,
+                                       SemanticPageConflictWriteCapacity>>
+    g_semantic_page_conflict_records;
+std::unique_ptr<PagedRelationalStorage<ResourceBarrierLinkSample, ResourceBarrierLinkCapacity>>
+    g_resource_barrier_link_records;
+std::unique_ptr<PagedRelationalStorage<AcquireMemSample, AcquireMemCapacity>>
+    g_acquire_mem_records;
+std::unique_ptr<PagedRelationalStorage<FenceSignalSample, FenceSignalCapacity>>
+    g_fence_signal_records;
+std::unique_ptr<PagedRelationalStorage<HostWaitSample, HostWaitCapacity>> g_host_wait_records;
+std::unique_ptr<PagedRelationalStorage<SubmitRecordSample, SubmitRecordCapacity>> g_submit_records;
+std::unique_ptr<PagedRelationalStorage<ShadowFencePolicySample, ShadowFencePolicyCapacity>>
+    g_shadow_fence_records;
+std::unique_ptr<PagedRelationalStorage<TraceGapSample, TraceGapCapacity>> g_trace_gap_records;
+std::unique_ptr<PagedRelationalStorage<RingHealthSample, RingHealthCapacity>>
+    g_ring_health_records;
+std::unique_ptr<PagedRelationalStorage<FastpathCandidateSample, FastpathCandidateCapacity>>
+    g_fastpath_candidate_records;
+std::unique_ptr<PagedRelationalStorage<GpuAuthorityCreateSample, GpuAuthorityCreateCapacity>>
+    g_gpu_authority_create_records;
+std::unique_ptr<PagedRelationalStorage<VirtualFenceCreateSample, VirtualFenceCreateCapacity>>
+    g_virtual_fence_create_records;
+std::unique_ptr<PagedRelationalStorage<VirtualWaitConsumeSample, VirtualWaitConsumeCapacity>>
+    g_virtual_wait_consume_records;
+std::unique_ptr<PagedRelationalStorage<AsyncLabelSignalSample, AsyncLabelSignalCapacity>>
+    g_async_label_signal_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityGpuConsumeSample, AuthorityGpuConsumeCapacity>>
+    g_authority_gpu_consume_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityBarrierValidationSample,
+                                       AuthorityBarrierValidationCapacity>>
+    g_authority_barrier_validation_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityRamDemandSample, AuthorityRamDemandCapacity>>
+    g_authority_ram_demand_records;
+std::unique_ptr<PagedRelationalStorage<LazyMaterializeBeginSample, LazyMaterializeBeginCapacity>>
+    g_lazy_materialize_begin_records;
+std::unique_ptr<PagedRelationalStorage<LazyMaterializeEndSample, LazyMaterializeEndCapacity>>
+    g_lazy_materialize_end_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityRamConsumeSample, AuthorityRamConsumeCapacity>>
+    g_authority_ram_consume_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityCpuReadSample, AuthorityCpuReadCapacity>>
+    g_authority_cpu_read_records;
+std::unique_ptr<PagedRelationalStorage<AuthoritySupersedeSample, AuthoritySupersedeCapacity>>
+    g_authority_supersede_records;
+std::unique_ptr<PagedRelationalStorage<FastpathFallbackSample, FastpathFallbackCapacity>>
+    g_fastpath_fallback_records;
+std::unique_ptr<PagedRelationalStorage<ConservativeDownloadDecisionSample,
+                                       ConservativeDownloadDecisionCapacity>>
+    g_conservative_download_decision_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityConservativeReadbackSuppressedSample,
+                                       AuthorityConservativeReadbackSuppressedCapacity>>
+    g_authority_conservative_readback_suppressed_records;
+std::unique_ptr<PagedRelationalStorage<AuthorityHostMaterializeRequiredSample,
+                                       AuthorityHostMaterializeRequiredCapacity>>
+    g_authority_host_materialize_required_records;
+std::unique_ptr<PagedRelationalStorage<FastpathWaitDecisionSample,
+                                       FastpathWaitDecisionCapacity>>
+    g_fastpath_wait_decision_records;
+std::unique_ptr<PagedRelationalStorage<VirtualFenceForcedCompletionSample,
+                                       VirtualFenceForcedCompletionCapacity>>
+    g_virtual_fence_forced_completion_records;
+std::unique_ptr<PagedRelationalStorage<CpuToGpuLabelWaitSample, CpuToGpuLabelWaitCapacity>>
+    g_cpu_to_gpu_label_wait_records;
+std::unique_ptr<PagedRelationalStorage<CandidateScheduleSample, CausalRecordCapacity>>
+    g_candidate_schedule_records;
+std::unique_ptr<PagedRelationalStorage<CompletionScopeSample, CausalRecordCapacity>>
+    g_completion_scope_records;
+std::unique_ptr<PagedRelationalStorage<CandidateDecisionSample, CausalRecordCapacity>>
+    g_candidate_decision_records;
+std::unique_ptr<PagedRelationalStorage<CandidateRepresentationSample, CausalRecordCapacity>>
+    g_candidate_representation_records;
+std::unique_ptr<PagedRelationalStorage<CandidateConsumerSample, CausalRecordCapacity>>
+    g_candidate_consumer_records;
+std::unique_ptr<PagedRelationalStorage<CandidateTerminalSample, CausalRecordCapacity>>
+    g_candidate_terminal_records;
+std::unique_ptr<PagedRelationalStorage<LogicalSignalSample, CausalRecordCapacity>>
+    g_logical_signal_records;
+std::unique_ptr<PagedRelationalStorage<HazardResolutionSample, CausalRecordCapacity>>
+    g_hazard_resolution_records;
+std::unique_ptr<PagedRelationalStorage<ScopeBreakSample, CausalRecordCapacity>>
+    g_scope_break_records;
+std::unique_ptr<PagedRelationalStorage<CausalEffectSample, CausalRecordCapacity>>
+    g_causal_effect_records;
+std::unique_ptr<PagedRelationalStorage<GpuIntervalSample, GpuIntervalCapacity>>
+    g_gpu_interval_records;
+std::unique_ptr<PagedRelationalStorage<GpuCalibrationSample, GpuCalibrationCapacity>>
+    g_gpu_calibration_records;
+std::unique_ptr<PagedRelationalStorage<GpuProfilerHealthSample, GpuProfilerHealthCapacity>>
+    g_gpu_profiler_health_records;
+std::unique_ptr<PagedRelationalStorage<GpuPipelineExecutableSample,
+                                       GpuPipelineExecutableCapacity>>
+    g_gpu_pipeline_executable_records;
+std::unique_ptr<PagedStorage<WritebackRecord, WritebackRecordCapacity>> g_writeback_records;
+std::unique_ptr<PagedStorage<FrameRecord, FrameRecordCapacity, 16>> g_frame_records;
 
 std::atomic<u64> g_sync_pm4_written{};
 std::atomic<u64> g_producer_begin_written{};
@@ -1401,6 +1716,20 @@ std::atomic<u64> g_authority_host_materialize_required_written{};
 std::atomic<u64> g_fastpath_wait_decision_written{};
 std::atomic<u64> g_virtual_fence_forced_completion_written{};
 std::atomic<u64> g_cpu_to_gpu_label_wait_written{};
+std::atomic<u64> g_candidate_schedule_written{};
+std::atomic<u64> g_completion_scope_written{};
+std::atomic<u64> g_candidate_decision_written{};
+std::atomic<u64> g_candidate_representation_written{};
+std::atomic<u64> g_candidate_consumer_written{};
+std::atomic<u64> g_candidate_terminal_written{};
+std::atomic<u64> g_logical_signal_written{};
+std::atomic<u64> g_hazard_resolution_written{};
+std::atomic<u64> g_scope_break_written{};
+std::atomic<u64> g_causal_effect_written{};
+std::atomic<u64> g_gpu_interval_written{};
+std::atomic<u64> g_gpu_calibration_written{};
+std::atomic<u64> g_gpu_profiler_health_written{};
+std::atomic<u64> g_gpu_pipeline_executable_written{};
 std::mutex g_guest_label_writes_mutex;
 struct LastGuestWriteInfo {
     u64 timestamp_ns{0};
@@ -1415,6 +1744,16 @@ std::atomic<u64> g_ram_demand_sequence{};
 std::atomic<u64> g_ram_demand_group_sequence{};
 std::atomic<u64> g_materialize_sequence{};
 std::atomic<u64> g_consumer_sequence{};
+std::atomic<u64> g_scope_sequence{};
+std::atomic<u64> g_cause_sequence{};
+std::atomic<u64> g_signal_sequence{};
+std::atomic<u64> g_representation_sequence{};
+std::atomic<u64> g_hazard_sequence{};
+std::atomic<u64> g_barrier_sequence{};
+std::atomic<u64> g_scope_break_sequence{};
+std::atomic<u64> g_effect_sequence{};
+std::atomic<u64> g_gpu_interval_sequence{};
+std::atomic<u64> g_query_frame_sequence{};
 std::atomic<u64> g_writeback_sequence{};
 std::atomic<u64> g_watch_seq{1};
 
@@ -1569,90 +1908,42 @@ inline thread_local CurrentMemoryContext tl_memory{};
     }
 }
 
-void EnsureRelationalStorageInitialized() {
-    static std::once_flag init_flag;
-    std::call_once(init_flag, [] {
-        g_sync_pm4_records = std::make_unique<std::array<RelationalRecord<SyncPm4PacketSample>, SyncPm4PacketCapacity>>();
-        g_producer_begin_records = std::make_unique<std::array<RelationalRecord<ProducerBeginSample>, ProducerRecordCapacity>>();
-        g_producer_end_records = std::make_unique<std::array<RelationalRecord<ProducerEndSample>, ProducerEndRecordCapacity>>();
-        g_producer_full_records = std::make_unique<std::array<RelationalRecord<ProducerRecordSample>, ProducerFullRecordCapacity>>();
-        g_resource_write_records = std::make_unique<std::array<RelationalRecord<ResourceWriteSample>, ResourceWriteRecordCapacity>>();
-        g_fence_create_records = std::make_unique<std::array<RelationalRecord<FenceCreateSample>, FenceRecordCapacity>>();
-        g_fence_epoch_link_records = std::make_unique<std::array<RelationalRecord<FenceEpochLinkSample>, FenceEpochLinkCapacity>>();
-        g_fence_match_records = std::make_unique<std::array<RelationalRecord<FenceMatchAttemptSample>, FenceMatchAttemptCapacity>>();
-        g_fence_match_diagnostic_records = std::make_unique<std::array<RelationalRecord<FenceMatchDiagnosticSample>, FenceMatchDiagnosticCapacity>>();
-        g_resource_epoch_promoted_records = std::make_unique<std::array<RelationalRecord<ResourceEpochPromotedSample>, ResourceEpochPromotedCapacity>>();
-        g_fence_resource_link_records = std::make_unique<std::array<RelationalRecord<FenceResourceLinkSample>, FenceResourceLinkCapacity>>();
-        g_wait_create_records = std::make_unique<std::array<RelationalRecord<WaitCreateSample>, WaitRecordCapacity>>();
-        g_wait_complete_records = std::make_unique<std::array<RelationalRecord<WaitCompleteSample>, WaitCompleteCapacity>>();
-        g_first_consumer_records = std::make_unique<std::array<RelationalRecord<FirstConsumerSample>, FirstConsumerCapacity>>();
-        g_fence_classification_records = std::make_unique<std::array<RelationalRecord<FenceClassificationSample>, FenceClassificationCapacity>>();
-        g_cpu_access_records = std::make_unique<std::array<RelationalRecord<CpuAccessSample>, CpuAccessRecordCapacity>>();
-        g_cpu_label_records = std::make_unique<std::array<RelationalRecord<CpuLabelAccessSample>, CpuLabelAccessCapacity>>();
-        g_cpu_materialization_records = std::make_unique<std::array<RelationalRecord<CpuMaterializationSample>, CpuMaterializationRecordCapacity>>();
-        g_stale_guest_records = std::make_unique<std::array<RelationalRecord<StaleGuestAttemptSample>, StaleGuestAttemptRecordCapacity>>();
-        g_gpu_alias_records = std::make_unique<std::array<RelationalRecord<GpuAliasMaterializeSample>, GpuAliasRecordCapacity>>();
-        g_readback_schedule_records = std::make_unique<std::array<RelationalRecord<ReadbackScheduleSample>, ReadbackScheduleCapacity>>();
-        g_readback_submit_records = std::make_unique<std::array<RelationalRecord<ReadbackSubmitSample>, ReadbackSubmitCapacity>>();
-        g_readback_ready_records = std::make_unique<std::array<RelationalRecord<ReadbackReadySample>, ReadbackReadyCapacity>>();
-        g_readback_commit_records = std::make_unique<std::array<RelationalRecord<ReadbackCommitSample>, ReadbackCommitCapacity>>();
-        g_readback_source_terminal_records = std::make_unique<std::array<RelationalRecord<ReadbackSourceTerminalSample>, ReadbackSourceTerminalCapacity>>();
-        g_guest_source_consume_records = std::make_unique<std::array<RelationalRecord<GuestSourceConsumeSample>, GuestSourceConsumeCapacity>>();
-        g_resource_lineage_records = std::make_unique<std::array<RelationalRecord<ResourceLineageSample>, ResourceLineageCapacity>>();
-        g_cpu_read_observation_records = std::make_unique<std::array<RelationalRecord<CpuReadObservationSample>, CpuReadObservationCapacity>>();
-        g_semantic_read_fault_records = std::make_unique<std::array<RelationalRecord<SemanticReadFaultSample>, SemanticReadFaultCapacity>>();
-        g_semantic_read_unknown_records = std::make_unique<std::array<RelationalRecord<SemanticReadUnknownSample>, SemanticReadUnknownCapacity>>();
-        g_semantic_watch_cancel_records = std::make_unique<std::array<RelationalRecord<SemanticWatchCancelSample>, SemanticWatchCancelCapacity>>();
-        g_semantic_page_conflict_records = std::make_unique<std::array<RelationalRecord<SemanticPageConflictWriteSample>, SemanticPageConflictWriteCapacity>>();
-        g_resource_barrier_link_records = std::make_unique<std::array<RelationalRecord<ResourceBarrierLinkSample>, ResourceBarrierLinkCapacity>>();
-        g_acquire_mem_records = std::make_unique<std::array<RelationalRecord<AcquireMemSample>, AcquireMemCapacity>>();
-        g_fence_signal_records = std::make_unique<std::array<RelationalRecord<FenceSignalSample>, FenceSignalCapacity>>();
-        g_host_wait_records = std::make_unique<std::array<RelationalRecord<HostWaitSample>, HostWaitCapacity>>();
-        g_submit_records = std::make_unique<std::array<RelationalRecord<SubmitRecordSample>, SubmitRecordCapacity>>();
-        g_shadow_fence_records = std::make_unique<std::array<RelationalRecord<ShadowFencePolicySample>, ShadowFencePolicyCapacity>>();
-        g_trace_gap_records = std::make_unique<std::array<RelationalRecord<TraceGapSample>, TraceGapCapacity>>();
-        g_ring_health_records = std::make_unique<std::array<RelationalRecord<RingHealthSample>, RingHealthCapacity>>();
-        g_fastpath_candidate_records = std::make_unique<std::array<RelationalRecord<FastpathCandidateSample>, FastpathCandidateCapacity>>();
-        g_gpu_authority_create_records = std::make_unique<std::array<RelationalRecord<GpuAuthorityCreateSample>, GpuAuthorityCreateCapacity>>();
-        g_virtual_fence_create_records = std::make_unique<std::array<RelationalRecord<VirtualFenceCreateSample>, VirtualFenceCreateCapacity>>();
-        g_virtual_wait_consume_records = std::make_unique<std::array<RelationalRecord<VirtualWaitConsumeSample>, VirtualWaitConsumeCapacity>>();
-        g_async_label_signal_records = std::make_unique<std::array<RelationalRecord<AsyncLabelSignalSample>, AsyncLabelSignalCapacity>>();
-        g_authority_gpu_consume_records = std::make_unique<std::array<RelationalRecord<AuthorityGpuConsumeSample>, AuthorityGpuConsumeCapacity>>();
-        g_authority_barrier_validation_records = std::make_unique<std::array<RelationalRecord<AuthorityBarrierValidationSample>, AuthorityBarrierValidationCapacity>>();
-        g_authority_ram_demand_records = std::make_unique<std::array<RelationalRecord<AuthorityRamDemandSample>, AuthorityRamDemandCapacity>>();
-        g_lazy_materialize_begin_records = std::make_unique<std::array<RelationalRecord<LazyMaterializeBeginSample>, LazyMaterializeBeginCapacity>>();
-        g_lazy_materialize_end_records = std::make_unique<std::array<RelationalRecord<LazyMaterializeEndSample>, LazyMaterializeEndCapacity>>();
-        g_authority_ram_consume_records = std::make_unique<std::array<RelationalRecord<AuthorityRamConsumeSample>, AuthorityRamConsumeCapacity>>();
-        g_authority_cpu_read_records = std::make_unique<std::array<RelationalRecord<AuthorityCpuReadSample>, AuthorityCpuReadCapacity>>();
-        g_authority_supersede_records = std::make_unique<std::array<RelationalRecord<AuthoritySupersedeSample>, AuthoritySupersedeCapacity>>();
-        g_fastpath_fallback_records = std::make_unique<std::array<RelationalRecord<FastpathFallbackSample>, FastpathFallbackCapacity>>();
-        g_conservative_download_decision_records = std::make_unique<std::array<RelationalRecord<ConservativeDownloadDecisionSample>, ConservativeDownloadDecisionCapacity>>();
-        g_authority_conservative_readback_suppressed_records = std::make_unique<std::array<RelationalRecord<AuthorityConservativeReadbackSuppressedSample>, AuthorityConservativeReadbackSuppressedCapacity>>();
-        g_authority_host_materialize_required_records = std::make_unique<std::array<RelationalRecord<AuthorityHostMaterializeRequiredSample>, AuthorityHostMaterializeRequiredCapacity>>();
-        g_fastpath_wait_decision_records = std::make_unique<std::array<RelationalRecord<FastpathWaitDecisionSample>, FastpathWaitDecisionCapacity>>();
-        g_virtual_fence_forced_completion_records = std::make_unique<std::array<RelationalRecord<VirtualFenceForcedCompletionSample>, VirtualFenceForcedCompletionCapacity>>();
-        g_cpu_to_gpu_label_wait_records = std::make_unique<std::array<RelationalRecord<CpuToGpuLabelWaitSample>, CpuToGpuLabelWaitCapacity>>();
-        g_writeback_records = std::make_unique<std::array<WritebackRecord, WritebackRecordCapacity>>();
-        g_frame_records = std::make_unique<std::array<FrameRecord, FrameRecordCapacity>>();
-    });
-}
-
 template <typename Sample, size_t Capacity>
-void WriteRelationalSample(std::unique_ptr<std::array<RelationalRecord<Sample>, Capacity>>& storage,
+void WriteRelationalSample(std::unique_ptr<PagedRelationalStorage<Sample, Capacity>>& storage,
                            std::atomic<u64>& written_counter,
                            const Sample& sample) noexcept {
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
-    EnsureRelationalStorageInitialized();
-    if (!storage) {
-        return;
+    static thread_local u32 cost_sample_sequence{};
+    const bool sample_cost =
+        (++cost_sample_sequence & (TelemetryWriteCostSamplePeriod - 1)) == 0;
+    const u64 cost_start = sample_cost ? Timestamp() : 0;
+    static std::once_flag storage_init;
+    std::call_once(storage_init, [&storage] {
+        storage = std::make_unique<PagedRelationalStorage<Sample, Capacity>>();
+    });
+    struct Reservation {
+        const void* owner{};
+        u64 next{};
+        u64 end{};
+    };
+    static thread_local Reservation reservation;
+    constexpr u64 ReservationSize = 8;
+    if (reservation.owner != std::addressof(written_counter) ||
+        reservation.next == reservation.end) {
+        const u64 begin = written_counter.fetch_add(ReservationSize, std::memory_order_relaxed);
+        reservation = {std::addressof(written_counter), begin, begin + ReservationSize};
     }
-    const u64 sequence = written_counter.fetch_add(1, std::memory_order_relaxed);
-    auto& slot = (*storage)[sequence & (Capacity - 1)];
+    const u64 sequence = reservation.next++;
+    auto& slot = storage->Get(sequence & (Capacity - 1));
     slot.timestamp_ns = Timestamp();
     slot.sample = sample;
     slot.committed_sequence.store(sequence + 1, std::memory_order_release);
+    if (sample_cost) {
+        g_telemetry_write_cost_samples.fetch_add(1, std::memory_order_relaxed);
+        g_telemetry_write_cost_ns.fetch_add(Timestamp() - cost_start, std::memory_order_relaxed);
+    }
 }
 #endif
 
@@ -2001,9 +2292,12 @@ struct Pm4Identity {
 #endif
 
 void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
+    if (!ring.events) {
+        ring.events = std::make_unique<PagedStorage<EventSlot, RingCapacity>>();
+    }
     const u64 sequence = ring.next_sequence.load(std::memory_order_relaxed);
     ring.next_sequence.store(sequence + 1, std::memory_order_release);
-    auto& slot = ring.events[sequence & RingMask];
+    auto& slot = ring.events->Get(sequence & RingMask);
     slot.timestamp_ns.store(Timestamp(), std::memory_order_relaxed);
     slot.arg0.store(arg0, std::memory_order_relaxed);
     slot.arg1.store(arg1, std::memory_order_relaxed);
@@ -2644,7 +2938,11 @@ void RecordWritebackImageEnabled(const WritebackImageSample& sample) noexcept {
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
-    EnsureRelationalStorageInitialized();
+    static std::once_flag storage_init;
+    std::call_once(storage_init, [] {
+        g_writeback_records =
+            std::make_unique<PagedStorage<WritebackRecord, WritebackRecordCapacity>>();
+    });
     if (!g_writeback_records) {
         return;
     }
@@ -2654,7 +2952,7 @@ void RecordWritebackImageEnabled(const WritebackImageSample& sample) noexcept {
         }
     }
     const u64 sequence = g_writeback_sequence.fetch_add(1, std::memory_order_relaxed);
-    auto& record = (*g_writeback_records)[sequence & (WritebackRecordCapacity - 1)];
+    auto& record = g_writeback_records->Get(sequence & (WritebackRecordCapacity - 1));
     record.timestamp_ns = Timestamp();
     record.sample = sample;
     record.committed_sequence.store(sequence + 1, std::memory_order_release);
@@ -2695,7 +2993,14 @@ void RecordFrameSampleEnabled(u32 frame_id, u64 present_start_ns) noexcept {
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
-    EnsureRelationalStorageInitialized();
+    static thread_local u32 cost_sample_sequence{};
+    const bool sample_cost = (++cost_sample_sequence & 63) == 0;
+    const u64 cost_start = sample_cost ? Timestamp() : 0;
+    static std::once_flag storage_init;
+    std::call_once(storage_init, [] {
+        g_frame_records =
+            std::make_unique<PagedStorage<FrameRecord, FrameRecordCapacity, 16>>();
+    });
     if (!g_frame_records) {
         return;
     }
@@ -2776,7 +3081,7 @@ void RecordFrameSampleEnabled(u32 frame_id, u64 present_start_ns) noexcept {
     const u64 now = Timestamp();
     std::scoped_lock lock{g_frame_mutex};
     const u64 sequence = g_frame_sequence++;
-    auto& record = (*g_frame_records)[sequence & (FrameRecordCapacity - 1)];
+    auto& record = g_frame_records->Get(sequence & (FrameRecordCapacity - 1));
     record = {};
     record.sequence = sequence;
     record.timestamp_ns = now;
@@ -2860,6 +3165,10 @@ void RecordFrameSampleEnabled(u32 frame_id, u64 present_start_ns) noexcept {
     g_previous_frame_timer_ns = timer_ns;
     g_previous_frame_timer_samples = timer_samples;
     g_previous_frame_details = details;
+    if (sample_cost) {
+        g_frame_snapshot_cost_samples.fetch_add(1, std::memory_order_relaxed);
+        g_frame_snapshot_cost_ns.fetch_add(Timestamp() - cost_start, std::memory_order_relaxed);
+    }
 #else
     static_cast<void>(frame_id);
     static_cast<void>(present_start_ns);
@@ -2876,8 +3185,11 @@ void CountPm4PacketEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth
         AddSingleWriter(ring->opcodes[opcode & 0xff], 1);
         ObserveSingleWriterMax(ring->counters[static_cast<size_t>(Counter::IbDepthMax)], depth + 1);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (!ring->pm4) {
+            ring->pm4 = std::make_unique<Pm4Detail>();
+        }
         const size_t engine_index = static_cast<size_t>(engine);
-        auto& detail = ring->pm4.opcodes[engine_index][opcode & 0xff];
+        auto& detail = ring->pm4->opcodes[engine_index][opcode & 0xff];
         AddSingleWriter(detail.packets, 1);
         AddSingleWriter(detail.words, words);
         AddSingleWriter(detail.predicated, header & 1);
@@ -2904,6 +3216,9 @@ void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 dep
     if (ring == nullptr) {
         return;
     }
+    if (!ring->pm4) {
+        ring->pm4 = std::make_unique<Pm4Detail>();
+    }
 
     const u64 identity = PackPm4Identity(engine, queue_id, opcode, depth) |
                          (static_cast<u64>(tag) << 32);
@@ -2912,7 +3227,7 @@ void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 dep
         MixPm4Hash(control1));
     size_t slot = hash & (Pm4ControlCapacity - 1);
     for (size_t probe = 0; probe < Pm4HashProbeLimit; ++probe) {
-        auto& entry = ring->pm4.controls[slot];
+        auto& entry = ring->pm4->controls[slot];
         const u64 entry_hash = entry.hash.load(std::memory_order_acquire);
         if (entry_hash == hash && entry.identity == identity && entry.control0 == control0 &&
             entry.control1 == control1) {
@@ -2929,7 +3244,7 @@ void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 dep
         }
         slot = (slot + 1) & (Pm4ControlCapacity - 1);
     }
-    AddSingleWriter(ring->pm4.control_overflow, 1);
+    AddSingleWriter(ring->pm4->control_overflow, 1);
 }
 
 void RecordPm4RegisterEnabled(Pm4Engine engine, u32 opcode, u32 register_offset, u32 words,
@@ -2941,14 +3256,17 @@ void RecordPm4RegisterEnabled(Pm4Engine engine, u32 opcode, u32 register_offset,
     if (ring == nullptr) {
         return;
     }
+    if (!ring->pm4) {
+        ring->pm4 = std::make_unique<Pm4Detail>();
+    }
     const size_t engine_index = static_cast<size_t>(engine);
     const size_t space = Pm4RegisterSpace(opcode);
     if (engine_index >= Pm4EngineCount || space >= Pm4RegisterSpaceCount ||
         register_offset >= Pm4RegisterCount) {
-        AddSingleWriter(ring->pm4.register_overflow, 1);
+        AddSingleWriter(ring->pm4->register_overflow, 1);
         return;
     }
-    auto& detail = ring->pm4.registers[engine_index][space][register_offset];
+    auto& detail = ring->pm4->registers[engine_index][space][register_offset];
     AddSingleWriter(detail.packets, 1);
     AddSingleWriter(detail.words, words);
     AddSingleWriter(detail.changed, changed);
@@ -2964,6 +3282,9 @@ void RecordPm4WaitEnabled(Pm4Engine engine, u32 queue_id, u32 depth, u32 control
     if (ring == nullptr) {
         return;
     }
+    if (!ring->pm4) {
+        ring->pm4 = std::make_unique<Pm4Detail>();
+    }
 
     const u32 identity = PackPm4Identity(engine, queue_id, 0x3c, depth);
     u64 hash = NonZeroPm4Hash(location ^ (static_cast<u64>(identity) << 32) ^ control);
@@ -2971,7 +3292,7 @@ void RecordPm4WaitEnabled(Pm4Engine engine, u32 queue_id, u32 depth, u32 control
     hash = NonZeroPm4Hash(hash ^ poll_interval);
     size_t slot = hash & (Pm4WaitCapacity - 1);
     for (size_t probe = 0; probe < Pm4HashProbeLimit; ++probe) {
-        auto& entry = ring->pm4.waits[slot];
+        auto& entry = ring->pm4->waits[slot];
         const u64 entry_hash = entry.hash.load(std::memory_order_acquire);
         if (entry_hash == hash && entry.location == location && entry.identity == identity &&
             entry.control == control && entry.reference == reference && entry.mask == mask &&
@@ -2998,7 +3319,7 @@ void RecordPm4WaitEnabled(Pm4Engine engine, u32 queue_id, u32 depth, u32 control
         }
         slot = (slot + 1) & (Pm4WaitCapacity - 1);
     }
-    AddSingleWriter(ring->pm4.wait_overflow, 1);
+    AddSingleWriter(ring->pm4->wait_overflow, 1);
 }
 #endif
 
@@ -3008,11 +3329,17 @@ EventSeq NextEventSeqEnabled() noexcept {
 }
 
 PacketSeq NextPacketSeqEnabled() noexcept {
-    return g_packet_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    // PM4 graphics and compute fibers are serialized by the single GCP worker. Avoid a locked RMW
+    // for every packet while retaining an atomic publication point for diagnostic readers.
+    const PacketSeq sequence = g_packet_sequence.load(std::memory_order_relaxed) + 1;
+    g_packet_sequence.store(sequence, std::memory_order_relaxed);
+    return sequence;
 }
 
 ProducerSeq NextProducerSeqEnabled() noexcept {
-    return g_producer_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    const ProducerSeq sequence = g_producer_sequence.load(std::memory_order_relaxed) + 1;
+    g_producer_sequence.store(sequence, std::memory_order_relaxed);
+    return sequence;
 }
 
 FenceSeq NextFenceSeqEnabled() noexcept {
@@ -3674,6 +4001,64 @@ void RecordCpuToGpuLabelWaitEnabled(const CpuToGpuLabelWaitSample& sample) noexc
     WriteRelationalSample(g_cpu_to_gpu_label_wait_records, g_cpu_to_gpu_label_wait_written, sample);
 }
 
+void RecordCandidateScheduleEnabled(const CandidateScheduleSample& sample) noexcept {
+    WriteRelationalSample(g_candidate_schedule_records, g_candidate_schedule_written, sample);
+}
+
+void RecordCompletionScopeEnabled(const CompletionScopeSample& sample) noexcept {
+    WriteRelationalSample(g_completion_scope_records, g_completion_scope_written, sample);
+}
+
+void RecordCandidateDecisionEnabled(const CandidateDecisionSample& sample) noexcept {
+    WriteRelationalSample(g_candidate_decision_records, g_candidate_decision_written, sample);
+}
+
+void RecordCandidateRepresentationEnabled(const CandidateRepresentationSample& sample) noexcept {
+    WriteRelationalSample(g_candidate_representation_records, g_candidate_representation_written,
+                          sample);
+}
+
+void RecordCandidateConsumerEnabled(const CandidateConsumerSample& sample) noexcept {
+    WriteRelationalSample(g_candidate_consumer_records, g_candidate_consumer_written, sample);
+}
+
+void RecordCandidateTerminalEnabled(const CandidateTerminalSample& sample) noexcept {
+    WriteRelationalSample(g_candidate_terminal_records, g_candidate_terminal_written, sample);
+}
+
+void RecordLogicalSignalEnabled(const LogicalSignalSample& sample) noexcept {
+    WriteRelationalSample(g_logical_signal_records, g_logical_signal_written, sample);
+}
+
+void RecordHazardResolutionEnabled(const HazardResolutionSample& sample) noexcept {
+    WriteRelationalSample(g_hazard_resolution_records, g_hazard_resolution_written, sample);
+}
+
+void RecordScopeBreakEnabled(const ScopeBreakSample& sample) noexcept {
+    WriteRelationalSample(g_scope_break_records, g_scope_break_written, sample);
+}
+
+void RecordCausalEffectEnabled(const CausalEffectSample& sample) noexcept {
+    WriteRelationalSample(g_causal_effect_records, g_causal_effect_written, sample);
+}
+
+void RecordGpuIntervalEnabled(const GpuIntervalSample& sample) noexcept {
+    WriteRelationalSample(g_gpu_interval_records, g_gpu_interval_written, sample);
+}
+
+void RecordGpuCalibrationEnabled(const GpuCalibrationSample& sample) noexcept {
+    WriteRelationalSample(g_gpu_calibration_records, g_gpu_calibration_written, sample);
+}
+
+void RecordGpuProfilerHealthEnabled(const GpuProfilerHealthSample& sample) noexcept {
+    WriteRelationalSample(g_gpu_profiler_health_records, g_gpu_profiler_health_written, sample);
+}
+
+void RecordGpuPipelineExecutableEnabled(const GpuPipelineExecutableSample& sample) noexcept {
+    WriteRelationalSample(g_gpu_pipeline_executable_records, g_gpu_pipeline_executable_written,
+                          sample);
+}
+
 void RecordGuestCpuLabelWriteEnabled(VAddr addr, u32 val, u64 timestamp, u64 thread_id) noexcept {
     std::scoped_lock lk{g_guest_label_writes_mutex};
     g_guest_label_writes[addr] = LastGuestWriteInfo{
@@ -3709,6 +4094,46 @@ u64 NextMaterializeSeqEnabled() noexcept {
 
 u64 NextConsumerSeqEnabled() noexcept {
     return g_consumer_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+ScopeSeq NextScopeSeqEnabled() noexcept {
+    return g_scope_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+CauseSeq NextCauseSeqEnabled() noexcept {
+    return g_cause_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+SignalSeq NextSignalSeqEnabled() noexcept {
+    return g_signal_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+RepresentationSeq NextRepresentationSeqEnabled() noexcept {
+    return g_representation_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+HazardSeq NextHazardSeqEnabled() noexcept {
+    return g_hazard_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+BarrierSeq NextBarrierSeqEnabled() noexcept {
+    return g_barrier_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+ScopeBreakSeq NextScopeBreakSeqEnabled() noexcept {
+    return g_scope_break_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+EffectSeq NextEffectSeqEnabled() noexcept {
+    return g_effect_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+GpuIntervalSeq NextGpuIntervalSeqEnabled() noexcept {
+    return g_gpu_interval_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+QueryFrameSeq NextQueryFrameSeqEnabled() noexcept {
+    return g_query_frame_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 void ArmReadbackSourceWatchEnabled(const ReadbackSourceWatch& watch) noexcept {
@@ -3793,6 +4218,28 @@ void ResolveReadbackSourceWatchEnabled(ResourceId res_id, ResourceVersion ver, V
             .cmd_buffer_seq = cmd_buf,
             .submit_seq = resolved_submit,
         });
+        if (matched_watch.candidate_id != 0) {
+            const bool cpu_consumer = kind == TerminalKind::CpuRead;
+            RecordCandidateConsumerEnabled(CandidateConsumerSample{
+                .candidate_id = matched_watch.candidate_id,
+                .consumer_id = NextConsumerSeqEnabled(),
+                .resource_uid = matched_watch.resource_id,
+                .resource_epoch = matched_watch.resource_version,
+                .alias_epoch = matched_watch.alias_epoch,
+                .guest_begin = addr != 0 ? addr : matched_watch.guest_addr,
+                .guest_end = (addr != 0 ? addr : matched_watch.guest_addr) +
+                             (size != 0 ? size : matched_watch.size),
+                .destination_uid = consumer_res,
+                .packet_seq = consumer_pkt,
+                .command_buffer_seq = cmd_buf,
+                .submit_seq = resolved_submit,
+                .kind = cpu_consumer ? CandidateConsumerKind::CpuData
+                                     : CandidateConsumerKind::GpuBuffer,
+                .same_version = 1,
+                .required_materialization = static_cast<u8>(cpu_consumer),
+                .confidence = 255,
+            });
+        }
     }
 }
 
@@ -4592,7 +5039,7 @@ struct RelationalSnapshotItem {
 
 template <typename Sample, size_t Capacity>
 std::vector<RelationalSnapshotItem<Sample, Capacity>> CollectCommittedRecords(
-    const std::unique_ptr<std::array<RelationalRecord<Sample>, Capacity>>& storage,
+    const std::unique_ptr<PagedRelationalStorage<Sample, Capacity>>& storage,
     const std::atomic<u64>& written_counter) {
     std::vector<RelationalSnapshotItem<Sample, Capacity>> result;
     if (!storage) {
@@ -4602,12 +5049,13 @@ std::vector<RelationalSnapshotItem<Sample, Capacity>> CollectCommittedRecords(
     const u64 start_sequence = total_written > Capacity ? total_written - Capacity : 0;
     result.reserve(static_cast<size_t>(total_written - start_sequence));
     for (u64 sequence = start_sequence; sequence < total_written; ++sequence) {
-        const auto& record = (*storage)[sequence & (Capacity - 1)];
-        if (record.committed_sequence.load(std::memory_order_acquire) == sequence + 1) {
+        const auto* record = storage->Find(sequence & (Capacity - 1));
+        if (record &&
+            record->committed_sequence.load(std::memory_order_acquire) == sequence + 1) {
             result.push_back({
                 .sequence = sequence,
-                .timestamp_ns = record.timestamp_ns,
-                .sample = record.sample,
+                .timestamp_ns = record->timestamp_ns,
+                .sample = record->sample,
             });
         }
     }
@@ -4738,7 +5186,12 @@ std::filesystem::path Dump() {
     std::array<std::array<u64, HistogramBucketCount>, HistogramCounters.size()>
         histogram_totals{};
     std::vector<EventSnapshot> events;
-    events.reserve(snapshot_rings.size() * RingCapacity);
+    size_t retained_event_capacity{};
+    for (const auto* ring : snapshot_rings) {
+        retained_event_capacity += static_cast<size_t>(
+            std::min<u64>(ring->next_sequence.load(std::memory_order_acquire), RingCapacity));
+    }
+    events.reserve(retained_event_capacity);
     u64 total_written{};
     u64 total_overwritten{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -4750,12 +5203,14 @@ std::filesystem::path Dump() {
                                         : 0;
         writeback_records.reserve(static_cast<size_t>(writeback_end - writeback_begin));
         for (u64 sequence = writeback_begin; sequence < writeback_end; ++sequence) {
-            const auto& record = (*g_writeback_records)[sequence & (WritebackRecordCapacity - 1)];
-            if (record.committed_sequence.load(std::memory_order_acquire) == sequence + 1) {
+            const auto* record =
+                g_writeback_records->Find(sequence & (WritebackRecordCapacity - 1));
+            if (record &&
+                record->committed_sequence.load(std::memory_order_acquire) == sequence + 1) {
                 writeback_records.push_back({
                     .sequence = sequence,
-                    .timestamp_ns = record.timestamp_ns,
-                    .sample = record.sample,
+                    .timestamp_ns = record->timestamp_ns,
+                    .sample = record->sample,
                 });
             }
         }
@@ -4772,7 +5227,10 @@ std::filesystem::path Dump() {
                                 : 0;
         frame_records.reserve(static_cast<size_t>(frame_written - frame_overwritten));
         for (u64 sequence = frame_overwritten; sequence < frame_written; ++sequence) {
-            frame_records.push_back((*g_frame_records)[sequence & (FrameRecordCapacity - 1)]);
+            if (const auto* record =
+                    g_frame_records->Find(sequence & (FrameRecordCapacity - 1))) {
+                frame_records.push_back(*record);
+            }
         }
     }
 
@@ -4801,10 +5259,27 @@ std::filesystem::path Dump() {
     auto readback_ready_records = CollectCommittedRecords(g_readback_ready_records, g_readback_ready_written);
     auto readback_commit_records = CollectCommittedRecords(g_readback_commit_records, g_readback_commit_written);
 
+    std::vector<ReadbackSourceWatch> session_source_watches;
     {
         std::scoped_lock lock{g_source_watches_mutex};
+        session_source_watches.reserve(g_active_source_watches.size());
         for (const auto& [key, watch] : g_active_source_watches) {
-            RecordReadbackSourceTerminalEnabled(ReadbackSourceTerminalSample{
+            session_source_watches.push_back(watch);
+        }
+        g_active_source_watches.clear();
+    }
+
+    auto readback_source_terminal_records =
+        CollectCommittedRecords(g_readback_source_terminal_records,
+                                g_readback_source_terminal_written);
+    const u64 session_end_timestamp = Timestamp();
+    for (const auto& watch : session_source_watches) {
+        const u64 sequence =
+            g_readback_source_terminal_written.fetch_add(1, std::memory_order_relaxed);
+        readback_source_terminal_records.push_back({
+            .sequence = sequence,
+            .timestamp_ns = session_end_timestamp,
+            .sample = ReadbackSourceTerminalSample{
                 .watch_seq = watch.watch_seq,
                 .fence_seq = watch.fence_seq,
                 .readback_seq = watch.readback_seq,
@@ -4823,12 +5298,9 @@ std::filesystem::path Dump() {
                 .correlation_status = CorrelationStatus::Partial,
                 .cmd_buffer_seq = 0,
                 .submit_seq = 0,
-            });
-        }
-        g_active_source_watches.clear();
+            },
+        });
     }
-
-    auto readback_source_terminal_records = CollectCommittedRecords(g_readback_source_terminal_records, g_readback_source_terminal_written);
     auto guest_source_consume_records = CollectCommittedRecords(g_guest_source_consume_records, g_guest_source_consume_written);
     auto resource_lineage_records = CollectCommittedRecords(g_resource_lineage_records, g_resource_lineage_written);
     auto cpu_read_observation_records = CollectCommittedRecords(g_cpu_read_observation_records, g_cpu_read_observation_written);
@@ -4864,6 +5336,59 @@ std::filesystem::path Dump() {
     auto fastpath_wait_decision_records = CollectCommittedRecords(g_fastpath_wait_decision_records, g_fastpath_wait_decision_written);
     auto virtual_fence_forced_completion_records = CollectCommittedRecords(g_virtual_fence_forced_completion_records, g_virtual_fence_forced_completion_written);
     auto cpu_to_gpu_label_wait_records = CollectCommittedRecords(g_cpu_to_gpu_label_wait_records, g_cpu_to_gpu_label_wait_written);
+    auto candidate_schedule_records =
+        CollectCommittedRecords(g_candidate_schedule_records, g_candidate_schedule_written);
+    auto completion_scope_records =
+        CollectCommittedRecords(g_completion_scope_records, g_completion_scope_written);
+    auto candidate_decision_records =
+        CollectCommittedRecords(g_candidate_decision_records, g_candidate_decision_written);
+    auto candidate_representation_records = CollectCommittedRecords(
+        g_candidate_representation_records, g_candidate_representation_written);
+    auto candidate_consumer_records =
+        CollectCommittedRecords(g_candidate_consumer_records, g_candidate_consumer_written);
+    auto candidate_terminal_records =
+        CollectCommittedRecords(g_candidate_terminal_records, g_candidate_terminal_written);
+    std::unordered_set<CandidateSeq> terminal_candidate_ids;
+    terminal_candidate_ids.reserve(candidate_terminal_records.size() + session_source_watches.size());
+    for (const auto& record : candidate_terminal_records) {
+        terminal_candidate_ids.insert(record.sample.candidate_id);
+    }
+    for (const auto& watch : session_source_watches) {
+        if (watch.candidate_id == 0 || !terminal_candidate_ids.insert(watch.candidate_id).second) {
+            continue;
+        }
+        const u64 sequence = g_candidate_terminal_written.fetch_add(1, std::memory_order_relaxed);
+        candidate_terminal_records.push_back({
+            .sequence = sequence,
+            .timestamp_ns = session_end_timestamp,
+            .sample = CandidateTerminalSample{
+                .candidate_id = watch.candidate_id,
+                .resource_uid = watch.resource_id,
+                .resource_epoch = watch.resource_version,
+                .alias_epoch = watch.alias_epoch,
+                .created_timestamp_ns = watch.create_timestamp_ns,
+                .terminal_timestamp_ns = session_end_timestamp,
+                .bytes_preserved = watch.size,
+                .reason = CandidateTerminalReason::SessionEnd,
+            },
+        });
+    }
+    auto logical_signal_records =
+        CollectCommittedRecords(g_logical_signal_records, g_logical_signal_written);
+    auto hazard_resolution_records =
+        CollectCommittedRecords(g_hazard_resolution_records, g_hazard_resolution_written);
+    auto scope_break_records =
+        CollectCommittedRecords(g_scope_break_records, g_scope_break_written);
+    auto causal_effect_records =
+        CollectCommittedRecords(g_causal_effect_records, g_causal_effect_written);
+    auto gpu_interval_records =
+        CollectCommittedRecords(g_gpu_interval_records, g_gpu_interval_written);
+    auto gpu_calibration_records =
+        CollectCommittedRecords(g_gpu_calibration_records, g_gpu_calibration_written);
+    auto gpu_profiler_health_records =
+        CollectCommittedRecords(g_gpu_profiler_health_records, g_gpu_profiler_health_written);
+    auto gpu_pipeline_executable_records = CollectCommittedRecords(
+        g_gpu_pipeline_executable_records, g_gpu_pipeline_executable_written);
 #endif
 
     for (const auto* ring : snapshot_rings) {
@@ -4890,22 +5415,28 @@ std::filesystem::path Dump() {
         const u64 begin = end > RingCapacity ? end - RingCapacity : 0;
         total_written += end;
         total_overwritten += begin;
+        if (!ring->events) {
+            continue;
+        }
         for (u64 sequence = begin; sequence < end; ++sequence) {
-            const auto& slot = ring->events[sequence & RingMask];
+            const auto* slot = ring->events->Find(sequence & RingMask);
+            if (!slot) {
+                continue;
+            }
             const u64 expected = sequence + 1;
-            if (slot.committed_sequence.load(std::memory_order_acquire) != expected) {
+            if (slot->committed_sequence.load(std::memory_order_acquire) != expected) {
                 continue;
             }
             EventSnapshot event{
-                .timestamp_ns = slot.timestamp_ns.load(std::memory_order_relaxed),
-                .arg0 = slot.arg0.load(std::memory_order_relaxed),
-                .arg1 = slot.arg1.load(std::memory_order_relaxed),
+                .timestamp_ns = slot->timestamp_ns.load(std::memory_order_relaxed),
+                .arg0 = slot->arg0.load(std::memory_order_relaxed),
+                .arg1 = slot->arg1.load(std::memory_order_relaxed),
                 .sequence = sequence,
                 .thread_id = ring->id,
-                .type = static_cast<EventType>(slot.metadata.load(std::memory_order_relaxed) &
+                .type = static_cast<EventType>(slot->metadata.load(std::memory_order_relaxed) &
                                                0xffff),
             };
-            if (slot.committed_sequence.load(std::memory_order_acquire) == expected) {
+            if (slot->committed_sequence.load(std::memory_order_acquire) == expected) {
                 events.push_back(event);
             }
         }
@@ -4930,7 +5461,7 @@ std::filesystem::path Dump() {
     file << "kind,thread,timestamp_ns,name,arg0,arg1,value\n";
     const auto profile = GetCaptureProfile();
     const auto* profile_str = profile == TraceCaptureProfile::SyncSemantic ? "sync_semantic" : "sync_perf";
-    file << "metadata,,0,schema_version,0,0,16\n";
+    file << "metadata,,0,schema_version,0,0,19\n";
     file << "metadata,,0,capture_profile,0,0," << profile_str << "\n";
     file << "metadata,,0,extra_read_faults_enabled,0,0," << (profile == TraceCaptureProfile::SyncSemantic ? "true" : "false") << "\n";
     file << "metadata,,0,session_duration_ns,0,0," << Timestamp() - g_session_start_ns << '\n';
@@ -4941,6 +5472,25 @@ std::filesystem::path Dump() {
     file << "metadata,,0,event_overwritten,0,0," << total_overwritten << '\n';
     file << "metadata,,0,histogram_subdivisions,0,0," << HistogramSubdivisions << '\n';
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    file << "metadata,,0,telemetry_write_cost_sample_period,0,0,"
+         << TelemetryWriteCostSamplePeriod << '\n';
+    file << "metadata,,0,telemetry_write_cost_samples,0,0,"
+         << g_telemetry_write_cost_samples.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,telemetry_write_cost_sampled_ns,0,0,"
+         << g_telemetry_write_cost_ns.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,telemetry_page_allocations,0,0,"
+         << g_telemetry_page_allocations.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,telemetry_page_allocation_races,0,0,"
+         << g_telemetry_page_allocation_races.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,telemetry_page_allocation_bytes,0,0,"
+         << g_telemetry_page_allocation_bytes.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,telemetry_page_allocation_ns,0,0,"
+         << g_telemetry_page_allocation_ns.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,frame_snapshot_cost_sample_period,0,0,64\n";
+    file << "metadata,,0,frame_snapshot_cost_samples,0,0,"
+         << g_frame_snapshot_cost_samples.load(std::memory_order_relaxed) << '\n';
+    file << "metadata,,0,frame_snapshot_cost_sampled_ns,0,0,"
+         << g_frame_snapshot_cost_ns.load(std::memory_order_relaxed) << '\n';
     file << "metadata,,0,stage_reason_sample_period,0,0," << StageReasonSamplePeriod << '\n';
     file << "metadata,,0,dynamic_reason_sample_period,0,0," << DynamicReasonSamplePeriod << '\n';
     file << "metadata,,0,descriptor_reason_sample_period,0,0," << DescriptorReasonSamplePeriod << '\n';
@@ -4992,6 +5542,12 @@ std::filesystem::path Dump() {
     file << "metadata,,0,host_wait_capacity,0,0," << HostWaitCapacity << '\n';
     file << "metadata,,0,submit_record_capacity,0,0," << SubmitRecordCapacity << '\n';
     file << "metadata,,0,shadow_fence_policy_capacity,0,0," << ShadowFencePolicyCapacity << '\n';
+    file << "metadata,,0,causal_record_capacity,0,0," << CausalRecordCapacity << '\n';
+    file << "metadata,,0,gpu_interval_capacity,0,0," << GpuIntervalCapacity << '\n';
+    file << "metadata,,0,gpu_calibration_capacity,0,0," << GpuCalibrationCapacity << '\n';
+    file << "metadata,,0,gpu_profiler_health_capacity,0,0," << GpuProfilerHealthCapacity << '\n';
+    file << "metadata,,0,gpu_pipeline_executable_capacity,0,0,"
+         << GpuPipelineExecutableCapacity << '\n';
     file << "metadata,,0,semantic_origin_tracking,0,0,true\n";
     file << "metadata,,0,semantic_guest_thread_tracking,0,0,true\n";
     file << "metadata,,0,semantic_guest_rip_tracking,0,0,true\n";
@@ -5057,6 +5613,30 @@ std::filesystem::path Dump() {
     }
     for (size_t bit = 0; bit < DescriptorReasonBitCount; ++bit) {
         write_bit_metadata(DescriptorReasonBitNames[bit], bit);
+    }
+    constexpr std::array RequirementBitNames{
+        "execution_order", "memory_visibility", "image_layout_transition",
+        "queue_ownership_transfer", "host_signal_visibility", "cpu_data_materialization",
+        "snapshot_preservation", "interrupt_publication",
+    };
+    constexpr std::array EvidenceBitNames{
+        "producer_identified", "resource_identity", "resource_epoch", "alias_epoch",
+        "range_covered", "scope_identified", "scope_after_producer", "same_queue_order",
+        "stage_covered", "cache_visibility", "snapshot_representable", "pin_lifetime",
+        "consumer_identified", "label_generation", "trace_complete",
+    };
+    const auto write_u64_bit_metadata = [&file](const char* family, const char* name,
+                                                 size_t bit) {
+        file << family << ",,0," << name << ',' << (u64{1} << bit) << ",0,1\n";
+    };
+    for (size_t bit = 0; bit < RequirementBitNames.size(); ++bit) {
+        write_u64_bit_metadata("sync_requirement_bit", RequirementBitNames[bit], bit);
+    }
+    for (size_t bit = 0; bit < EvidenceBitNames.size(); ++bit) {
+        write_u64_bit_metadata("candidate_evidence_bit", EvidenceBitNames[bit], bit);
+    }
+    for (size_t bit = 0; bit < CandidateRejectReasonNames.size(); ++bit) {
+        write_u64_bit_metadata("candidate_reject_bit", CandidateRejectReasonNames[bit], bit);
     }
 #endif
     for (const auto* ring : snapshot_rings) {
@@ -5214,7 +5794,10 @@ std::filesystem::path Dump() {
                      << detail[2].load(std::memory_order_relaxed) << '\n';
             }
         }
-        const auto& pm4 = ring->pm4;
+        if (!ring->pm4) {
+            continue;
+        }
+        const auto& pm4 = *ring->pm4;
         for (size_t engine = 0; engine < Pm4EngineCount; ++engine) {
             for (size_t opcode = 0; opcode < Pm4OpcodeCount; ++opcode) {
                 const auto& detail = pm4.opcodes[engine][opcode];
@@ -5333,6 +5916,11 @@ std::filesystem::path Dump() {
              << event.arg0 << ',' << event.arg1 << ',' << event.sequence << '\n';
     }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    const auto enum_name = []<typename Names, typename Enum>(const Names& names,
+                                                             Enum value) {
+        const size_t index = static_cast<size_t>(value);
+        return index < names.size() ? std::string_view{names[index]} : std::string_view{"unknown"};
+    };
     for (const auto& record : frame_records) {
         file << "frame," << record.sequence << ',' << record.timestamp_ns << ",timing,"
              << record.frame_id << ',' << record.interval_ns << ',' << record.present_duration_ns
@@ -6101,6 +6689,208 @@ std::filesystem::path Dump() {
              << record.sample.delta_write_to_wait_complete_ns << ',' << record.sample.yield_count << ','
              << record.sample.wait_progress_submit_count << ',' << record.sample.gpu_idle_overlap_ns << '\n';
     }
+    for (const auto& record : candidate_schedule_records) {
+        const auto& s = record.sample;
+        file << "candidate_schedule," << s.candidate_id << ',' << record.timestamp_ns
+             << ",schedule," << s.frame_seq << ',' << s.command_buffer_seq << ','
+             << s.producer_seq << ',' << s.producer_packet_seq << ',' << s.resource_uid << ','
+             << s.resource_epoch << ',' << s.alias_epoch << ',' << s.guest_begin << ','
+             << s.guest_end << ',' << s.descriptor_hash << ',' << s.image_id << ','
+             << s.pixel_format << ',' << s.width << ',' << s.height << ',' << s.depth << ','
+             << s.pitch << ',' << s.levels << ',' << s.layers << ',' << s.producer_engine << ','
+             << s.producer_stage << ',' << s.writer_kind << ',' << s.aspect << ','
+             << s.capability_bits << ',' << s.initial_reason_mask << '\n';
+    }
+    for (const auto& record : completion_scope_records) {
+        const auto& s = record.sample;
+        file << "completion_scope," << s.scope_id << ',' << record.timestamp_ns << ','
+             << enum_name(CompletionScopeKindNames, s.kind) << ',' << s.cause_id << ','
+             << s.signal_id << ',' << s.frame_seq << ',' << s.command_buffer_seq << ','
+             << s.first_packet_seq << ',' << s.last_packet_seq << ',' << s.completed_stage_bits
+             << ',' << s.completed_write_bits << ',' << s.visible_access_bits << ','
+             << s.cache_action_bits << ',' << s.guest_begin << ',' << s.guest_end << ','
+             << s.label_addr << ',' << s.label_value << ',' << s.pm4_digest << ',' << s.queue_id
+             << ',' << s.engine << ',' << static_cast<u32>(s.irq_bits) << ','
+             << static_cast<u32>(s.confidence) << '\n';
+    }
+    for (const auto& record : candidate_decision_records) {
+        const auto& s = record.sample;
+        file << "candidate_decision," << s.candidate_id << ',' << record.timestamp_ns << ','
+             << enum_name(DataActionNames, s.executed_data_action) << ',' << s.scope_id << ','
+             << s.cause_id << ',' << s.signal_id << ',' << s.authority_id << ','
+             << s.producer_ticket << ',' << s.sync_requirement_bits << ',' << s.evidence_bits
+             << ',' << s.reason_mask << ',' << s.blocked_action_bits << ','
+             << enum_name(DataActionNames, s.proposed_data_action) << ','
+             << enum_name(SignalActionNames, s.proposed_signal_action) << ','
+             << enum_name(SignalActionNames, s.executed_signal_action) << ','
+             << enum_name(AvoidabilityNames, s.avoidability) << ','
+             << static_cast<u32>(s.correlation_status) << '\n';
+    }
+    for (const auto& record : candidate_representation_records) {
+        const auto& s = record.sample;
+        file << "candidate_representation," << s.candidate_id << ',' << record.timestamp_ns << ','
+             << enum_name(RepresentationKindNames, s.representation) << ','
+             << s.representation_id << ',' << s.resource_uid << ',' << s.resource_epoch << ','
+             << s.alias_epoch << ',' << s.authority_id << ',' << s.allocation_id << ','
+             << s.copy_bytes << ',' << s.timeline_tick << ',' << s.command_buffer_seq << ','
+             << s.submit_seq << ',' << static_cast<u32>(s.pinned) << ','
+             << static_cast<u32>(s.immutable_snapshot) << '\n';
+    }
+    for (const auto& record : candidate_consumer_records) {
+        const auto& s = record.sample;
+        file << "candidate_consumer," << s.candidate_id << ',' << record.timestamp_ns << ','
+             << enum_name(CandidateConsumerKindNames, s.kind) << ',' << s.consumer_id << ','
+             << s.resource_uid << ',' << s.resource_epoch << ',' << s.alias_epoch << ','
+             << s.guest_begin << ',' << s.guest_end << ',' << s.destination_uid << ','
+             << s.packet_seq << ',' << s.command_buffer_seq << ',' << s.submit_seq << ','
+             << s.pipeline_hash << ',' << s.stage_bits << ',' << s.access_bits << ',' << s.layout
+             << ',' << static_cast<u32>(s.same_version) << ','
+             << static_cast<u32>(s.required_materialization) << ','
+             << static_cast<u32>(s.confidence) << '\n';
+    }
+    for (const auto& record : candidate_terminal_records) {
+        const auto& s = record.sample;
+        file << "candidate_terminal," << s.candidate_id << ',' << record.timestamp_ns << ','
+             << enum_name(CandidateTerminalReasonNames, s.reason) << ',' << s.resource_uid << ','
+             << s.resource_epoch << ',' << s.alias_epoch << ',' << s.first_consumer_id << ','
+             << s.created_timestamp_ns << ',' << s.terminal_timestamp_ns << ','
+             << s.bytes_preserved << ',' << s.reason_mask << ','
+             << static_cast<u32>(s.had_cpu_consumer) << ','
+             << static_cast<u32>(s.had_gpu_consumer) << '\n';
+    }
+    for (const auto& record : logical_signal_records) {
+        const auto& s = record.sample;
+        file << "logical_signal," << s.signal_id << ',' << record.timestamp_ns << ','
+             << enum_name(LogicalSignalPhaseNames, s.phase) << ',' << s.candidate_id << ','
+             << s.scope_id << ',' << s.cause_id << ',' << s.wait_seq << ',' << s.packet_seq << ','
+             << s.label_addr << ',' << s.label_generation << ',' << s.value << ','
+             << s.producer_tick << ',' << enum_name(SignalActionNames, s.action) << ','
+             << s.observation_bits << ',' << static_cast<u32>(s.irq) << ','
+             << static_cast<u32>(s.producer_submitted) << ','
+             << static_cast<u32>(s.producer_completed) << '\n';
+    }
+    for (const auto& record : hazard_resolution_records) {
+        const auto& s = record.sample;
+        file << "hazard_resolution," << s.hazard_id << ',' << record.timestamp_ns << ','
+             << enum_name(HazardResolutionKindNames, s.resolution) << ',' << s.barrier_id << ','
+             << s.cause_id << ',' << s.candidate_id << ',' << s.resource_uid << ','
+             << s.resource_epoch << ',' << s.alias_epoch << ',' << s.guest_begin << ','
+             << s.guest_end << ',' << s.src_stage << ',' << s.src_access << ',' << s.dst_stage
+             << ',' << s.dst_access << ',' << s.sync_requirement_bits << ',' << s.old_layout << ','
+             << s.new_layout << ',' << s.src_queue << ',' << s.dst_queue << ','
+             << s.memory_barrier_count << ',' << s.buffer_barrier_count << ','
+             << s.image_barrier_count << ',' << enum_name(AvoidabilityNames, s.avoidability) << ','
+             << static_cast<u32>(s.confidence) << '\n';
+    }
+    for (const auto& record : scope_break_records) {
+        const auto& s = record.sample;
+        file << "scope_break," << s.scope_break_id << ',' << record.timestamp_ns << ','
+             << enum_name(ScopeBreakReasonNames, s.reason) << ',' << s.cause_id << ','
+             << s.candidate_id << ',' << s.completion_scope_id << ',' << s.frame_seq << ','
+             << s.command_buffer_seq << ',' << s.rendering_scope_id << ',' << s.attachment_hash
+             << ',' << s.pipeline_hash << ',' << enum_name(AvoidabilityNames, s.avoidability)
+             << '\n';
+    }
+    for (const auto& record : causal_effect_records) {
+        const auto& s = record.sample;
+        file << "causal_effect," << s.effect_id << ',' << record.timestamp_ns << ','
+             << enum_name(CausalEffectKindNames, s.kind) << ',' << s.cause_id << ','
+             << s.candidate_id << ',' << s.scope_id << ',' << s.hazard_id << ',' << s.object_id
+             << ',' << s.shared_group_id << ',' << s.command_buffer_seq << ',' << s.submit_seq << ','
+             << s.timeline_tick << ',' << s.bytes << ',' << s.duration_ns << ','
+             << enum_name(EffectAttributionNames, s.attribution) << ','
+             << enum_name(AvoidabilityNames, s.avoidability) << ','
+             << static_cast<u32>(s.confidence) << '\n';
+    }
+    for (const auto& record : gpu_interval_records) {
+        const auto& s = record.sample;
+        file << "gpu_interval," << s.interval_id << ',' << record.timestamp_ns << ','
+             << enum_name(GpuIntervalKindNames, s.kind) << ',' << s.parent_interval_id << ','
+             << s.query_frame_id << ',' << s.frame_seq << ',' << s.command_buffer_seq << ','
+             << s.submit_seq << ',' << s.cause_id << ',' << s.candidate_id << ',' << s.scope_id
+             << ',' << s.object_hash << ',' << s.pipeline_hash << ',' << s.attachment_hash << ','
+             << s.gpu_begin_tick << ','
+             << s.gpu_end_tick << ',' << s.duration_ns << ',' << s.exclusive_ns << ',' << s.bytes
+             << ',' << s.input_assembly_vertices << ',' << s.input_assembly_primitives << ','
+             << s.vertex_shader_invocations << ',' << s.clipping_invocations << ','
+             << s.clipping_primitives << ',' << s.fragment_shader_invocations << ','
+             << s.compute_shader_invocations << ',' << s.command_count << ','
+             << enum_name(PipelineStatisticKindNames, s.statistic_kind) << ','
+             << enum_name(GpuQueryStatusNames, s.status) << ','
+             << enum_name(EffectAttributionNames, s.attribution) << '\n';
+    }
+    for (const auto& record : gpu_calibration_records) {
+        const auto& s = record.sample;
+        file << "gpu_calibration," << s.query_frame_id << ',' << record.timestamp_ns
+             << ",calibration," << s.device_timestamp << ',' << s.host_timestamp << ','
+             << s.host_steady_timestamp_ns << ',' << s.max_deviation << ','
+             << s.timestamp_period_ns << ',' << s.host_time_domain << ','
+             << s.timestamp_valid_bits << ',' << static_cast<u32>(s.success) << '\n';
+    }
+    for (const auto& record : gpu_profiler_health_records) {
+        const auto& s = record.sample;
+        file << "gpu_profiler_health," << s.scheduler_id << ',' << record.timestamp_ns
+             << ",health," << s.timestamp_sample_period << ',' << s.statistic_sample_period << ','
+             << s.timestamp_query_budget << ',' << s.statistic_query_budget << ','
+             << s.command_buffers_seen << ',' << s.command_buffers_sampled << ','
+             << s.command_buffers_detailed << ',' << s.slots_unavailable << ','
+             << s.intervals_seen << ',' << s.intervals_recorded << ',' << s.intervals_filtered
+             << ',' << s.intervals_budget_dropped << ',' << s.query_results_available << ','
+             << s.query_results_not_ready << ',' << s.timestamp_queries_written << ','
+             << s.statistic_queries_written << ',' << s.query_collect_calls << ','
+             << s.query_collect_cost_samples << ',' << s.query_collect_ready_slots << ','
+             << s.query_collect_sampled_ns << ',' << s.calibration_calls << ','
+             << s.calibration_cpu_ns << ',' << static_cast<u32>(s.timestamps_supported) << ','
+             << static_cast<u32>(s.pipeline_statistics_supported) << ','
+             << static_cast<u32>(s.calibrated_timestamps_supported) << ','
+             << static_cast<u32>(s.pipeline_executable_supported) << ','
+             << static_cast<u32>(s.pipeline_executable_capture_enabled) << '\n';
+    }
+    for (const auto& record : gpu_pipeline_executable_records) {
+        const auto& s = record.sample;
+        file << "gpu_pipeline_executable," << s.pipeline_hash << ',' << record.timestamp_ns
+             << ",statistic," << s.executable_index << ',' << s.subgroup_size << ','
+             << s.executable_name_hash << ',' << s.statistic_name_hash << ','
+             << s.statistic_value << ',' << s.statistic_format << ',' << s.stage_bits << ','
+             << static_cast<u32>(s.is_compute) << '\n';
+    }
+    const auto write_stream_health = [&file](const char* name, u64 reserved, size_t retained,
+                                              size_t capacity) {
+        const u64 overwritten = reserved > capacity ? reserved - capacity : 0;
+        file << "telemetry_stream_health,,0," << name << ',' << reserved << ',' << retained << ','
+             << overwritten << '\n';
+    };
+#define SHAD_CAUSAL_STREAM_HEALTH(Name, Written, Records, Capacity)                             \
+    write_stream_health(Name, Written.load(std::memory_order_relaxed), Records.size(), Capacity)
+    SHAD_CAUSAL_STREAM_HEALTH("candidate_schedule", g_candidate_schedule_written,
+                              candidate_schedule_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("completion_scope", g_completion_scope_written,
+                              completion_scope_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("candidate_decision", g_candidate_decision_written,
+                              candidate_decision_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("candidate_representation", g_candidate_representation_written,
+                              candidate_representation_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("candidate_consumer", g_candidate_consumer_written,
+                              candidate_consumer_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("candidate_terminal", g_candidate_terminal_written,
+                              candidate_terminal_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("logical_signal", g_logical_signal_written,
+                              logical_signal_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("hazard_resolution", g_hazard_resolution_written,
+                              hazard_resolution_records, CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("scope_break", g_scope_break_written, scope_break_records,
+                              CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("causal_effect", g_causal_effect_written, causal_effect_records,
+                              CausalRecordCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("gpu_interval", g_gpu_interval_written, gpu_interval_records,
+                              GpuIntervalCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("gpu_calibration", g_gpu_calibration_written,
+                              gpu_calibration_records, GpuCalibrationCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("gpu_profiler_health", g_gpu_profiler_health_written,
+                              gpu_profiler_health_records, GpuProfilerHealthCapacity);
+    SHAD_CAUSAL_STREAM_HEALTH("gpu_pipeline_executable", g_gpu_pipeline_executable_written,
+                              gpu_pipeline_executable_records, GpuPipelineExecutableCapacity);
+#undef SHAD_CAUSAL_STREAM_HEALTH
 #endif
     return path;
 }

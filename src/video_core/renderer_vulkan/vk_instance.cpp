@@ -204,7 +204,8 @@ bool Instance::CreateDevice() {
                           vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
                           vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
                           vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT,
-                          vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>();
+                          vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT,
+                          vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -340,8 +341,21 @@ bool Instance::CreateDevice() {
     swapchain_maintenance1 = add_extension(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) &&
                              feature_chain.get<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>()
                                  .swapchainMaintenance1;
-    const bool calibrated_timestamps =
-        TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+#if TRACY_GPU_ENABLED || defined(SHADPS4_ENABLE_DETAILED_TELEMETRY)
+    calibrated_timestamps = add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+#endif
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    pipeline_executable_properties =
+        add_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    if (pipeline_executable_properties) {
+        pipeline_executable_properties =
+            feature_chain.get<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>()
+                .pipelineExecutableInfo;
+        if (!pipeline_executable_properties) {
+            enabled_extensions.pop_back();
+        }
+    }
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -354,6 +368,7 @@ bool Instance::CreateDevice() {
         const u32 index = static_cast<u32>(i);
         if (family_properties[i].queueFlags & vk::QueueFlagBits::eGraphics) {
             queue_family_index = index;
+            timestamp_valid_bits = family_properties[i].timestampValidBits;
             graphics_queue_found = true;
         }
     }
@@ -398,6 +413,7 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                .pipelineStatisticsQuery = features.pipelineStatisticsQuery,
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
@@ -508,6 +524,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT{
             .swapchainMaintenance1 = true,
         },
+        vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR{
+            .pipelineExecutableInfo = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -556,6 +575,9 @@ bool Instance::CreateDevice() {
     if (!swapchain_maintenance1) {
         device_chain.unlink<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>();
     }
+    if (!pipeline_executable_properties) {
+        device_chain.unlink<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -574,27 +596,30 @@ bool Instance::CreateDevice() {
             physical_device.getCalibrateableTimeDomainsEXT();
         if (time_domains_result == vk::Result::eSuccess) {
 #if _WIN64
-            const bool has_host_time_domain =
-                std::find(time_domains.cbegin(), time_domains.cend(),
-                          vk::TimeDomainEXT::eQueryPerformanceCounter) != time_domains.cend();
+            constexpr auto preferred_host_domain = vk::TimeDomainEXT::eQueryPerformanceCounter;
 #elif __linux__
-            const bool has_host_time_domain =
-                std::find(time_domains.cbegin(), time_domains.cend(),
-                          vk::TimeDomainEXT::eClockMonotonicRaw) != time_domains.cend();
+            constexpr auto preferred_host_domain = vk::TimeDomainEXT::eClockMonotonicRaw;
 #else
-            // Tracy limitation means only Windows and Linux can use host time domain.
-            // https://github.com/shadps4-emu/tracy/blob/c6d779d78508514102fbe1b8eb28bda10d95bb2a/public/tracy/TracyVulkan.hpp#L384-L389
-            const bool has_host_time_domain = false;
+            constexpr auto preferred_host_domain = vk::TimeDomainEXT::eDevice;
 #endif
+            const bool has_host_time_domain =
+                std::find(time_domains.cbegin(), time_domains.cend(), preferred_host_domain) !=
+                time_domains.cend();
             if (has_host_time_domain) {
+                calibrated_host_time_domain = preferred_host_domain;
+#if TRACY_GPU_ENABLED
                 static constexpr std::string_view context_name{"vk_rasterizer"};
                 profiler_context = TracyVkContextHostCalibrated(
                     *instance, physical_device, *device,
                     VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
                     VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
                 TracyVkContextName(profiler_context, context_name.data(), context_name.size());
+#endif
+            } else {
+                calibrated_timestamps = false;
             }
         } else {
+            calibrated_timestamps = false;
             LOG_WARNING(Render_Vulkan, "Could not query calibrated time domains for profiling: {}",
                         vk::to_string(time_domains_result));
         }

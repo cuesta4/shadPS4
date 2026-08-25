@@ -133,7 +133,10 @@ void FaultManager::ProcessFaultBuffer() {
             .pBufferInfo = &download_info,
         },
     }};
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    constexpr u64 FaultPipelineHash = 0x6661756c745f6373ULL;
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -146,6 +149,7 @@ void FaultManager::ProcessFaultBuffer() {
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
+    scheduler.ProfileComputeDispatch(FaultPipelineHash);
     cmdbuf.dispatch(num_workgroups, 1, 1);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{

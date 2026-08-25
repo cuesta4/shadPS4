@@ -1073,7 +1073,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         copy.dstOffset += offset;
     }
     download_buffer.Commit();
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, buffer.CpuAddr(), total_size_bytes);
     const auto cmdbuf = scheduler.CommandBuffer();
     // Synchronize prior GPU writes to this buffer before the transfer read
     const vk::BufferMemoryBarrier2 pre_barrier = {
@@ -1094,6 +1097,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
                                       total_size_bytes);
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+    scheduler.EndGpuInterval(gpu_interval);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
@@ -1502,7 +1506,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             .size = num_bytes,
         },
     };
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, dst, num_bytes);
     const auto cmdbuf = scheduler.CommandBuffer();
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
@@ -1539,6 +1546,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         .bufferMemoryBarrierCount = 2,
         .pBufferMemoryBarriers = buf_barriers_after,
     });
+    scheduler.EndGpuInterval(gpu_interval);
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
@@ -1799,7 +1807,11 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .dstOffset = dst_base_offset,
         .size = overlap.SizeBytes(),
     };
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, new_buffer.CpuAddr(),
+        overlap.SizeBytes());
     const auto cmdbuf = scheduler.CommandBuffer();
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> pre_barriers{};
@@ -1836,6 +1848,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .bufferMemoryBarrierCount = static_cast<u32>(post_barriers.size()),
         .pBufferMemoryBarriers = post_barriers.data(),
     });
+    scheduler.EndGpuInterval(gpu_interval);
     DeleteBuffer(overlap_id);
 }
 
@@ -1933,7 +1946,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
     if (src_buffer) {
-        scheduler.EndRendering();
+        scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                               Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+        const u64 gpu_interval = scheduler.BeginGpuInterval(
+            Common::PerformanceTelemetry::GpuIntervalKind::Copy, device_addr, total_size_bytes);
         const auto cmdbuf = scheduler.CommandBuffer();
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
@@ -1970,6 +1986,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &post_barrier,
         });
+        scheduler.EndGpuInterval(gpu_interval);
         TouchBuffer(buffer);
     }
     return is_texel_buffer && !is_written && !IsRegionGpuModified(device_addr, size) &&
@@ -2109,7 +2126,11 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
-    scheduler.EndRendering();
+    scheduler.EndRendering(
+        image.info.props.is_tiled
+            ? Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand
+            : Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     const auto dst_access = image.info.props.is_tiled ? vk::AccessFlagBits2::eShaderWrite
                                                        : vk::AccessFlagBits2::eTransferWrite;
     const auto dst_stage = image.info.props.is_tiled ? vk::PipelineStageFlagBits2::eComputeShader
@@ -2186,7 +2207,10 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         std::memcpy(staging, value, num_bytes);
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
     }
-    scheduler.EndRendering();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const u64 gpu_interval = scheduler.BeginGpuInterval(
+        Common::PerformanceTelemetry::GpuIntervalKind::Copy, address, num_bytes);
     const auto cmdbuf = scheduler.CommandBuffer();
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
@@ -2221,6 +2245,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,
     });
+    scheduler.EndGpuInterval(gpu_interval);
 }
 
 void BufferCache::RunGarbageCollector() {

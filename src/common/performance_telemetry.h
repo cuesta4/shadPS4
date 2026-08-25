@@ -29,6 +29,18 @@ using ReadbackSeq = u64;
 using WatchSeq = u64;
 using ResourceId = ResourceSeq;
 using ResourceVer = ResourceVersion;
+using CandidateSeq = u64;
+using ScopeSeq = u64;
+using CauseSeq = u64;
+using SignalSeq = u64;
+using RepresentationSeq = u64;
+using ConsumerSeq = u64;
+using HazardSeq = u64;
+using BarrierSeq = u64;
+using ScopeBreakSeq = u64;
+using EffectSeq = u64;
+using GpuIntervalSeq = u64;
+using QueryFrameSeq = u64;
 
 enum class CorrelationStatus : u8 {
     Complete,
@@ -1677,12 +1689,14 @@ struct ReadbackCommitSample {
 
 struct ReadbackSourceWatch {
     u64 watch_seq{};
+    CandidateSeq candidate_id{};
     FenceSeq fence_seq{};
     WaitSeq wait_seq{};
     ReadbackSeq readback_seq{};
     ProducerSeq producer_seq{};
     ResourceId resource_id{};
     ResourceVersion resource_version{};
+    u64 alias_epoch{};
     VAddr guest_addr{};
     u64 size{};
     PacketSeq producer_packet{};
@@ -2272,6 +2286,589 @@ struct CpuToGpuLabelWaitSample {
     u64 gpu_idle_overlap_ns{};
 };
 
+enum class CompletionScopeKind : u8 {
+    EventWriteEos,
+    EventWriteEop,
+    ReleaseMem,
+    AcquireMem,
+    SurfaceSync,
+    EventWrite,
+    WaitRegMem,
+    Unknown,
+    Count,
+};
+
+enum class DataAction : u8 {
+    DirectGpuAuthority,
+    GpuShadow,
+    LazyCpuMaterialization,
+    LegacyRequired,
+    Count,
+};
+
+enum class SignalAction : u8 {
+    PublishAfterPhysicalTick,
+    VirtualGpuWait,
+    ForceProgressSubmit,
+    ForceHostCompletion,
+    NoSignalAction,
+    Count,
+};
+
+enum class Avoidability : u8 {
+    ProvenRequired,
+    ProvenEliminable,
+    ConservativeFallback,
+    UnknownDueToTraceGap,
+    Count,
+};
+
+enum class RepresentationKind : u8 {
+    OriginalImage,
+    GpuShadow,
+    BufferAlias,
+    GuestRam,
+    Count,
+};
+
+enum class CandidateConsumerKind : u8 {
+    GpuImage,
+    GpuBuffer,
+    CpuData,
+    CpuLabel,
+    Irq,
+    Overwrite,
+    Unmap,
+    Unknown,
+    Count,
+};
+
+enum class CandidateTerminalReason : u8 {
+    Materialized,
+    ConsumedGpu,
+    ConsumedCpu,
+    Overwritten,
+    Destroyed,
+    Unmapped,
+    Superseded,
+    RejectedAtSchedule,
+    SessionEnd,
+    Count,
+};
+
+enum class LogicalSignalPhase : u8 {
+    Created,
+    Published,
+    WaitMatched,
+    CpuObserved,
+    IrqPublished,
+    Retired,
+    Count,
+};
+
+enum class HazardResolutionKind : u8 {
+    ImplicitDependency,
+    BarrierEmitted,
+    LayoutTransition,
+    QueueTransfer,
+    LegacyFallback,
+    TraceGap,
+    Pending,
+    Count,
+};
+
+enum class ScopeBreakReason : u8 {
+    RequiredTransfer,
+    RequiredMemoryDependency,
+    RequiredLayoutTransition,
+    RequiredHostVisibility,
+    RequiredQueueTransfer,
+    RequiredNonGraphicsCommand,
+    AttachmentSetChange,
+    Present,
+    UnknownFallback,
+    Count,
+};
+
+enum class CausalEffectKind : u8 {
+    Barrier,
+    ScopeBreak,
+    Copy,
+    Resolve,
+    Tile,
+    Clear,
+    Flush,
+    Submit,
+    HostWait,
+    GpuInterval,
+    Count,
+};
+
+enum class EffectAttribution : u8 {
+    Exclusive,
+    Shared,
+    Unknown,
+    Count,
+};
+
+enum class GpuIntervalKind : u8 {
+    CommandBuffer,
+    RenderingScope,
+    GraphicsPipelineBlock,
+    ComputePipelineBlock,
+    Copy,
+    Tile,
+    Detile,
+    Resolve,
+    Clear,
+    DependencyDelay,
+    Present,
+    QueueGap,
+    Unattributed,
+    Count,
+};
+
+enum class GpuQueryStatus : u8 {
+    Available,
+    NotReady,
+    BudgetExhausted,
+    SlotUnavailable,
+    Unsupported,
+    Invalid,
+    Count,
+};
+
+enum class PipelineStatisticKind : u8 {
+    None,
+    Graphics,
+    Compute,
+    Count,
+};
+
+enum class SyncRequirement : u64 {
+    ExecutionOrder = 1ULL << 0,
+    MemoryVisibility = 1ULL << 1,
+    ImageLayoutTransition = 1ULL << 2,
+    QueueOwnershipTransfer = 1ULL << 3,
+    HostSignalVisibility = 1ULL << 4,
+    CpuDataMaterialization = 1ULL << 5,
+    SnapshotPreservation = 1ULL << 6,
+    InterruptPublication = 1ULL << 7,
+};
+
+enum class CandidateEvidence : u64 {
+    ProducerIdentified = 1ULL << 0,
+    ResourceIdentity = 1ULL << 1,
+    ResourceEpoch = 1ULL << 2,
+    AliasEpoch = 1ULL << 3,
+    RangeCovered = 1ULL << 4,
+    ScopeIdentified = 1ULL << 5,
+    ScopeAfterProducer = 1ULL << 6,
+    SameQueueOrder = 1ULL << 7,
+    StageCovered = 1ULL << 8,
+    CacheVisibility = 1ULL << 9,
+    SnapshotRepresentable = 1ULL << 10,
+    PinLifetime = 1ULL << 11,
+    ConsumerIdentified = 1ULL << 12,
+    LabelGeneration = 1ULL << 13,
+    TraceComplete = 1ULL << 14,
+};
+
+enum class CandidateCapability : u32 {
+    DirectAuthority = 1U << 0,
+    GpuShadow = 1U << 1,
+    CpuMaterialization = 1U << 2,
+    Linear = 1U << 3,
+    Tiled = 1U << 4,
+    SafeDownload = 1U << 5,
+    DurablePin = 1U << 6,
+};
+
+enum class CandidateRejectReason : u64 {
+    NoCompletionScope = 1ULL << 0,
+    ProducerUnknown = 1ULL << 1,
+    ProducerAfterScope = 1ULL << 2,
+    StageNotCovered = 1ULL << 3,
+    QueueOrderUnknown = 1ULL << 4,
+    CrossQueueDependencyMissing = 1ULL << 5,
+    PacketGapOrTraceLoss = 1ULL << 6,
+    AmbiguousEventSemantics = 1ULL << 7,
+    CacheVisibilityInsufficient = 1ULL << 8,
+    RangeNotCoveredByScope = 1ULL << 9,
+    ReadbackDisabledByConfiguration = 1ULL << 10,
+    GuestAddressUnavailable = 1ULL << 11,
+    ResourceNotGpuModified = 1ULL << 12,
+    SupersededBeforeEvaluation = 1ULL << 13,
+    ImageFreedOrReused = 1ULL << 14,
+    ResourceEpochChanged = 1ULL << 15,
+    AliasEpochChanged = 1ULL << 16,
+    AliasWriterAmbiguous = 1ULL << 17,
+    PartialOverlapAmbiguous = 1ULL << 18,
+    TopologyChanged = 1ULL << 19,
+    MultipleVersionsRequired = 1ULL << 20,
+    ImageNotSafeToDownload = 1ULL << 21,
+    UnsupportedTiling = 1ULL << 22,
+    UnsupportedFormatOrAspect = 1ULL << 23,
+    UnsupportedMipLayerRegion = 1ULL << 24,
+    CopyRegionNotRepresentable = 1ULL << 25,
+    SnapshotAllocationFailed = 1ULL << 26,
+    PinOrLifetimeUnavailable = 1ULL << 27,
+    StagingPressureLimit = 1ULL << 28,
+    ImmediateCpuDataRead = 1ULL << 29,
+    CpuPartialWriteNeedsPreservation = 1ULL << 30,
+    UnknownConsumerWithoutDurableSnapshot = 1ULL << 31,
+    LabelReadByCpuBeforeNaturalSubmit = 1ULL << 32,
+    IrqRequiresCompletion = 1ULL << 33,
+    MultipleSignalConsumers = 1ULL << 34,
+    UnsupportedWaitComparison = 1ULL << 35,
+    LabelGenerationMismatch = 1ULL << 36,
+    LabelAddressAliased = 1ULL << 37,
+    UnmapBeforeCompletion = 1ULL << 38,
+    RemapOrAbaRisk = 1ULL << 39,
+    ShutdownInProgress = 1ULL << 40,
+    DeviceLost = 1ULL << 41,
+    AuthorityPressureEviction = 1ULL << 42,
+    InternalValidationFailure = 1ULL << 43,
+};
+
+struct CandidateScheduleSample {
+    CandidateSeq candidate_id{};
+    FrameSeq frame_seq{};
+    CmdBufferSeq command_buffer_seq{};
+    ProducerSeq producer_seq{};
+    PacketSeq producer_packet_seq{};
+    ResourceId resource_uid{};
+    ResourceVersion resource_epoch{};
+    u64 alias_epoch{};
+    VAddr guest_begin{};
+    VAddr guest_end{};
+    u64 descriptor_hash{};
+    u32 image_id{};
+    u32 pixel_format{};
+    u32 width{};
+    u32 height{};
+    u32 depth{};
+    u32 pitch{};
+    u16 levels{};
+    u16 layers{};
+    u16 producer_engine{};
+    u16 producer_stage{};
+    u16 writer_kind{};
+    u16 aspect{};
+    u32 capability_bits{};
+    u64 initial_reason_mask{};
+};
+
+struct CompletionScopeSample {
+    ScopeSeq scope_id{};
+    CauseSeq cause_id{};
+    SignalSeq signal_id{};
+    FrameSeq frame_seq{};
+    CmdBufferSeq command_buffer_seq{};
+    PacketSeq first_packet_seq{};
+    PacketSeq last_packet_seq{};
+    u64 completed_stage_bits{};
+    u64 completed_write_bits{};
+    u64 visible_access_bits{};
+    u64 cache_action_bits{};
+    VAddr guest_begin{};
+    VAddr guest_end{};
+    VAddr label_addr{};
+    u64 label_value{};
+    u64 pm4_digest{};
+    u32 queue_id{};
+    u16 engine{};
+    CompletionScopeKind kind{CompletionScopeKind::Unknown};
+    u8 irq_bits{};
+    u8 confidence{};
+};
+
+struct CandidateDecisionSample {
+    CandidateSeq candidate_id{};
+    ScopeSeq scope_id{};
+    CauseSeq cause_id{};
+    SignalSeq signal_id{};
+    u64 authority_id{};
+    u64 producer_ticket{};
+    u64 sync_requirement_bits{};
+    u64 evidence_bits{};
+    u64 reason_mask{};
+    u64 blocked_action_bits{};
+    DataAction proposed_data_action{DataAction::LegacyRequired};
+    SignalAction proposed_signal_action{SignalAction::NoSignalAction};
+    DataAction executed_data_action{DataAction::LegacyRequired};
+    SignalAction executed_signal_action{SignalAction::NoSignalAction};
+    Avoidability avoidability{Avoidability::ConservativeFallback};
+    CorrelationStatus correlation_status{CorrelationStatus::Complete};
+};
+
+struct CandidateRepresentationSample {
+    CandidateSeq candidate_id{};
+    RepresentationSeq representation_id{};
+    ResourceId resource_uid{};
+    ResourceVersion resource_epoch{};
+    u64 alias_epoch{};
+    u64 authority_id{};
+    u64 allocation_id{};
+    u64 copy_bytes{};
+    u64 timeline_tick{};
+    CmdBufferSeq command_buffer_seq{};
+    SubmitSeq submit_seq{};
+    RepresentationKind representation{RepresentationKind::GuestRam};
+    u8 pinned{};
+    u8 immutable_snapshot{};
+};
+
+struct CandidateConsumerSample {
+    CandidateSeq candidate_id{};
+    ConsumerSeq consumer_id{};
+    ResourceId resource_uid{};
+    ResourceVersion resource_epoch{};
+    u64 alias_epoch{};
+    VAddr guest_begin{};
+    VAddr guest_end{};
+    ResourceId destination_uid{};
+    PacketSeq packet_seq{};
+    CmdBufferSeq command_buffer_seq{};
+    SubmitSeq submit_seq{};
+    u64 pipeline_hash{};
+    u64 stage_bits{};
+    u64 access_bits{};
+    u32 layout{};
+    CandidateConsumerKind kind{CandidateConsumerKind::Unknown};
+    u8 same_version{};
+    u8 required_materialization{};
+    u8 confidence{};
+};
+
+struct CandidateTerminalSample {
+    CandidateSeq candidate_id{};
+    ResourceId resource_uid{};
+    ResourceVersion resource_epoch{};
+    u64 alias_epoch{};
+    ConsumerSeq first_consumer_id{};
+    u64 created_timestamp_ns{};
+    u64 terminal_timestamp_ns{};
+    u64 bytes_preserved{};
+    u64 reason_mask{};
+    CandidateTerminalReason reason{CandidateTerminalReason::SessionEnd};
+    u8 had_cpu_consumer{};
+    u8 had_gpu_consumer{};
+};
+
+struct LogicalSignalSample {
+    SignalSeq signal_id{};
+    CandidateSeq candidate_id{};
+    ScopeSeq scope_id{};
+    CauseSeq cause_id{};
+    WaitSeq wait_seq{};
+    PacketSeq packet_seq{};
+    VAddr label_addr{};
+    u64 label_generation{};
+    u64 value{};
+    u64 producer_tick{};
+    LogicalSignalPhase phase{LogicalSignalPhase::Created};
+    SignalAction action{SignalAction::NoSignalAction};
+    u32 observation_bits{};
+    u8 irq{};
+    u8 producer_submitted{};
+    u8 producer_completed{};
+};
+
+struct HazardResolutionSample {
+    HazardSeq hazard_id{};
+    BarrierSeq barrier_id{};
+    CauseSeq cause_id{};
+    CandidateSeq candidate_id{};
+    ResourceId resource_uid{};
+    ResourceVersion resource_epoch{};
+    u64 alias_epoch{};
+    VAddr guest_begin{};
+    VAddr guest_end{};
+    u64 src_stage{};
+    u64 src_access{};
+    u64 dst_stage{};
+    u64 dst_access{};
+    u64 sync_requirement_bits{};
+    u32 old_layout{};
+    u32 new_layout{};
+    u16 src_queue{};
+    u16 dst_queue{};
+    u16 memory_barrier_count{};
+    u16 buffer_barrier_count{};
+    u16 image_barrier_count{};
+    HazardResolutionKind resolution{HazardResolutionKind::LegacyFallback};
+    Avoidability avoidability{Avoidability::ConservativeFallback};
+    u8 confidence{};
+};
+
+struct ScopeBreakSample {
+    ScopeBreakSeq scope_break_id{};
+    CauseSeq cause_id{};
+    CandidateSeq candidate_id{};
+    ScopeSeq completion_scope_id{};
+    FrameSeq frame_seq{};
+    CmdBufferSeq command_buffer_seq{};
+    u64 rendering_scope_id{};
+    u64 attachment_hash{};
+    u64 pipeline_hash{};
+    ScopeBreakReason reason{ScopeBreakReason::UnknownFallback};
+    Avoidability avoidability{Avoidability::ConservativeFallback};
+};
+
+struct CausalEffectSample {
+    EffectSeq effect_id{};
+    CauseSeq cause_id{};
+    CandidateSeq candidate_id{};
+    ScopeSeq scope_id{};
+    HazardSeq hazard_id{};
+    u64 object_id{};
+    u64 shared_group_id{};
+    CmdBufferSeq command_buffer_seq{};
+    SubmitSeq submit_seq{};
+    u64 timeline_tick{};
+    u64 bytes{};
+    u64 duration_ns{};
+    CausalEffectKind kind{CausalEffectKind::Barrier};
+    EffectAttribution attribution{EffectAttribution::Unknown};
+    Avoidability avoidability{Avoidability::ConservativeFallback};
+    u8 confidence{};
+};
+
+struct GpuIntervalSample {
+    GpuIntervalSeq interval_id{};
+    GpuIntervalSeq parent_interval_id{};
+    QueryFrameSeq query_frame_id{};
+    FrameSeq frame_seq{};
+    CmdBufferSeq command_buffer_seq{};
+    SubmitSeq submit_seq{};
+    CauseSeq cause_id{};
+    CandidateSeq candidate_id{};
+    ScopeSeq scope_id{};
+    u64 object_hash{};
+    u64 pipeline_hash{};
+    u64 attachment_hash{};
+    u64 gpu_begin_tick{};
+    u64 gpu_end_tick{};
+    u64 duration_ns{};
+    u64 exclusive_ns{};
+    u64 bytes{};
+    u64 input_assembly_vertices{};
+    u64 input_assembly_primitives{};
+    u64 vertex_shader_invocations{};
+    u64 clipping_invocations{};
+    u64 clipping_primitives{};
+    u64 fragment_shader_invocations{};
+    u64 compute_shader_invocations{};
+    u32 command_count{};
+    GpuIntervalKind kind{GpuIntervalKind::Unattributed};
+    PipelineStatisticKind statistic_kind{PipelineStatisticKind::None};
+    GpuQueryStatus status{GpuQueryStatus::Invalid};
+    EffectAttribution attribution{EffectAttribution::Unknown};
+};
+
+struct GpuCalibrationSample {
+    QueryFrameSeq query_frame_id{};
+    u64 device_timestamp{};
+    u64 host_timestamp{};
+    u64 host_steady_timestamp_ns{};
+    u64 max_deviation{};
+    double timestamp_period_ns{};
+    u32 host_time_domain{};
+    u32 timestamp_valid_bits{};
+    u8 success{};
+};
+
+struct GpuProfilerHealthSample {
+    u32 scheduler_id{};
+    u32 timestamp_sample_period{};
+    u32 statistic_sample_period{};
+    u32 timestamp_query_budget{};
+    u32 statistic_query_budget{};
+    u64 command_buffers_seen{};
+    u64 command_buffers_sampled{};
+    u64 command_buffers_detailed{};
+    u64 slots_unavailable{};
+    u64 intervals_seen{};
+    u64 intervals_recorded{};
+    u64 intervals_filtered{};
+    u64 intervals_budget_dropped{};
+    u64 query_results_available{};
+    u64 query_results_not_ready{};
+    u64 timestamp_queries_written{};
+    u64 statistic_queries_written{};
+    u64 query_collect_calls{};
+    u64 query_collect_cost_samples{};
+    u64 query_collect_ready_slots{};
+    u64 query_collect_sampled_ns{};
+    u64 calibration_calls{};
+    u64 calibration_cpu_ns{};
+    u8 timestamps_supported{};
+    u8 pipeline_statistics_supported{};
+    u8 calibrated_timestamps_supported{};
+    u8 pipeline_executable_supported{};
+    u8 pipeline_executable_capture_enabled{};
+};
+
+struct GpuPipelineExecutableSample {
+    u64 pipeline_hash{};
+    u64 executable_name_hash{};
+    u64 statistic_name_hash{};
+    u64 statistic_value{};
+    u64 stage_bits{};
+    u32 executable_index{};
+    u32 subgroup_size{};
+    u32 statistic_format{};
+    u8 is_compute{};
+};
+
+struct CausalTraceToken {
+    CandidateSeq candidate_id{};
+    ScopeSeq scope_id{};
+    CauseSeq cause_id{};
+    SignalSeq signal_id{};
+    HazardSeq hazard_id{};
+};
+
+inline thread_local CausalTraceToken tl_causal_context{};
+
+class ScopedCausalContext {
+public:
+    explicit ScopedCausalContext(const CausalTraceToken& token) noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (Enabled()) {
+            active = true;
+            previous = tl_causal_context;
+            tl_causal_context = token;
+        }
+#else
+        static_cast<void>(token);
+#endif
+    }
+
+    ~ScopedCausalContext() {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (active) {
+            tl_causal_context = previous;
+        }
+#endif
+    }
+
+private:
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    CausalTraceToken previous{};
+    bool active{};
+#endif
+};
+
+[[nodiscard]] inline CausalTraceToken CurrentCausalContext() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? tl_causal_context : CausalTraceToken{};
+#else
+    return {};
+#endif
+}
+
 class TelemetryProducerScope {
 public:
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -2478,6 +3075,20 @@ void RecordFastpathWaitDecisionEnabled(const FastpathWaitDecisionSample& sample)
 void RecordVirtualFenceForcedCompletionEnabled(const VirtualFenceForcedCompletionSample& sample) noexcept;
 void RecordCpuToGpuLabelWaitEnabled(const CpuToGpuLabelWaitSample& sample) noexcept;
 void RecordGuestCpuLabelWriteEnabled(VAddr addr, u32 val, u64 timestamp, u64 thread_id) noexcept;
+void RecordCandidateScheduleEnabled(const CandidateScheduleSample& sample) noexcept;
+void RecordCompletionScopeEnabled(const CompletionScopeSample& sample) noexcept;
+void RecordCandidateDecisionEnabled(const CandidateDecisionSample& sample) noexcept;
+void RecordCandidateRepresentationEnabled(const CandidateRepresentationSample& sample) noexcept;
+void RecordCandidateConsumerEnabled(const CandidateConsumerSample& sample) noexcept;
+void RecordCandidateTerminalEnabled(const CandidateTerminalSample& sample) noexcept;
+void RecordLogicalSignalEnabled(const LogicalSignalSample& sample) noexcept;
+void RecordHazardResolutionEnabled(const HazardResolutionSample& sample) noexcept;
+void RecordScopeBreakEnabled(const ScopeBreakSample& sample) noexcept;
+void RecordCausalEffectEnabled(const CausalEffectSample& sample) noexcept;
+void RecordGpuIntervalEnabled(const GpuIntervalSample& sample) noexcept;
+void RecordGpuCalibrationEnabled(const GpuCalibrationSample& sample) noexcept;
+void RecordGpuProfilerHealthEnabled(const GpuProfilerHealthSample& sample) noexcept;
+void RecordGpuPipelineExecutableEnabled(const GpuPipelineExecutableSample& sample) noexcept;
 
 u64 NextCandidateSeqEnabled() noexcept;
 u64 NextAuthoritySeqEnabled() noexcept;
@@ -2486,6 +3097,16 @@ u64 NextRamDemandSeqEnabled() noexcept;
 u64 NextRamDemandGroupSeqEnabled() noexcept;
 u64 NextMaterializeSeqEnabled() noexcept;
 u64 NextConsumerSeqEnabled() noexcept;
+ScopeSeq NextScopeSeqEnabled() noexcept;
+CauseSeq NextCauseSeqEnabled() noexcept;
+SignalSeq NextSignalSeqEnabled() noexcept;
+RepresentationSeq NextRepresentationSeqEnabled() noexcept;
+HazardSeq NextHazardSeqEnabled() noexcept;
+BarrierSeq NextBarrierSeqEnabled() noexcept;
+ScopeBreakSeq NextScopeBreakSeqEnabled() noexcept;
+EffectSeq NextEffectSeqEnabled() noexcept;
+GpuIntervalSeq NextGpuIntervalSeqEnabled() noexcept;
+QueryFrameSeq NextQueryFrameSeqEnabled() noexcept;
 #endif
 
 inline EventSeq NextEventSeq() noexcept {
@@ -2627,6 +3248,86 @@ inline u64 NextMaterializeSeq() noexcept {
 inline u64 NextConsumerSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     return Enabled() ? NextConsumerSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline ScopeSeq NextScopeSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextScopeSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline CauseSeq NextCauseSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextCauseSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline SignalSeq NextSignalSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextSignalSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline RepresentationSeq NextRepresentationSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextRepresentationSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline HazardSeq NextHazardSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextHazardSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline BarrierSeq NextBarrierSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextBarrierSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline ScopeBreakSeq NextScopeBreakSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextScopeBreakSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline EffectSeq NextEffectSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextEffectSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline GpuIntervalSeq NextGpuIntervalSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextGpuIntervalSeqEnabled() : 0;
+#else
+    return 0;
+#endif
+}
+
+inline QueryFrameSeq NextQueryFrameSeq() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Enabled() ? NextQueryFrameSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3259,6 +3960,37 @@ inline void RecordCpuToGpuLabelWait(const CpuToGpuLabelWaitSample& sample) noexc
     static_cast<void>(sample);
 #endif
 }
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+#define SHAD_TELEMETRY_CAUSAL_WRAPPER(Name, Sample)                                               \
+    inline void Name(const Sample& sample) noexcept {                                             \
+        if (Enabled()) [[unlikely]] {                                                             \
+            Name##Enabled(sample);                                                                \
+        }                                                                                         \
+    }
+#else
+#define SHAD_TELEMETRY_CAUSAL_WRAPPER(Name, Sample)                                               \
+    inline void Name(const Sample& sample) noexcept {                                             \
+        static_cast<void>(sample);                                                                \
+    }
+#endif
+
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCandidateSchedule, CandidateScheduleSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCompletionScope, CompletionScopeSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCandidateDecision, CandidateDecisionSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCandidateRepresentation, CandidateRepresentationSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCandidateConsumer, CandidateConsumerSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCandidateTerminal, CandidateTerminalSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordLogicalSignal, LogicalSignalSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordHazardResolution, HazardResolutionSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordScopeBreak, ScopeBreakSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordCausalEffect, CausalEffectSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordGpuInterval, GpuIntervalSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordGpuCalibration, GpuCalibrationSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordGpuProfilerHealth, GpuProfilerHealthSample)
+SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordGpuPipelineExecutable, GpuPipelineExecutableSample)
+
+#undef SHAD_TELEMETRY_CAUSAL_WRAPPER
 
 inline void RecordGuestCpuLabelWrite(VAddr addr, u32 val, u64 timestamp, u64 thread_id) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY

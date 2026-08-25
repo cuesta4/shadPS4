@@ -11,6 +11,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -414,8 +415,14 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    const bool capture_executable = PipelineExecutableCaptureEnabled() &&
+                                    instance.SupportsPipelineExecutableProperties();
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = capture_executable
+                     ? vk::PipelineCreateFlags{
+                           vk::PipelineCreateFlagBits::eCaptureStatisticsKHR}
+                     : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -436,6 +443,8 @@ GraphicsPipeline::GraphicsPipeline(
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
+    RecordPipelineExecutableStatistics(instance, *pipeline,
+                                       std::hash<GraphicsPipelineKey>{}(key), false);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
     std::ranges::copy(runtime_stages, stages.begin());
 }
