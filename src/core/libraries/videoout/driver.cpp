@@ -55,8 +55,8 @@ static s32 ValidateBufferAttribute(const BufferAttribute* attribute) {
 }
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height)
-    : pending_presents{presenter->UsesMailboxPresentation() ? PresentationQueuePolicy::Mailbox
-                                                            : PresentationQueuePolicy::Fifo} {
+    : pending_presents{presenter->CoalescesPendingFrames() ? PresentationQueuePolicy::Mailbox
+                                                          : PresentationQueuePolicy::Fifo} {
     main_port.resolution.full_width = width;
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;

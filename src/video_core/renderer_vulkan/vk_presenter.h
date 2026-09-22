@@ -117,8 +117,8 @@ public:
 
     FifoTimingFeedback GetFifoTimingFeedback() const;
 
-    bool UsesMailboxPresentation() const {
-        return swapchain.IsMailbox();
+    bool CoalescesPendingFrames() const {
+        return swapchain.IsMailbox() || swapchain.IsFIFO();
     }
 
     /// Invalidates feedback from work belonging to an older video-out lifecycle.
