@@ -88,6 +88,8 @@ God of War 3 Remastered settings:
    **Readback Linear Images**.
 7. Enjoy!
 
+Use the [God of War III Remastered patch XML](https://github.com/cuesta4/shadPS4/releases/download/tutz-gow-2026-08-23/God_of_War_III_Remastered.xml) instead of setting **HDD Read Speed** to **75 MiB/s** for texture corruption. Enable **Bug Fix - Texture Corruption Fix**; enable either this patch or one resolution patch, never both.
+
 Other info:
 The HDD speed might help other games, but at cost of loading speeds. 
 The `Disable Time Dilation` mitigates that, but it might regress games.
