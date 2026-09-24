@@ -1,0 +1,206 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <memory>
+#include <span>
+#include <thread>
+#include <vector>
+
+#include "common/types.h"
+
+namespace VideoCore {
+
+/// Moves guest RAM -> host staging copies off the GPU command processor thread.
+///
+/// The command processor (the producer) keeps making every decision it made before: which bytes
+/// are uploaded, where they land in the staging rings and which Vulkan commands consume them. Only
+/// the byte movement is deferred to worker threads.
+///
+/// Ordering contract (the "captured" watermark):
+///  - The GPU observes staging memory only through a queue submission. Every submission of the
+///    draw scheduler waits until the jobs enqueued before it have completed.
+///  - The guest observes command processor progress only through completion signals (EOP/EOS/
+///    RELEASE_MEM labels and IRQs, flip IRQs, GPU idle, submit retirement). Each of those waits
+///    for the jobs enqueued before the signalling packet. A well-formed guest only rewrites memory
+///    referenced by submitted work after observing such a signal, so the bytes a pending job reads
+///    are stable until the job runs.
+///  - Writes the emulator itself performs on guest memory (CE RAM dumps, WRITE_DATA, DMA, fence
+///    labels, readback write-backs) first wait for pending jobs that read an overlapping range.
+///  - Unmapping guest memory drains all pending jobs.
+class GuestCopyEngine {
+public:
+    enum class OpKind : u8 {
+        /// Copies from guest memory through the memory manager.
+        Guest,
+        /// Fills the destination with zeroes.
+        Zero,
+        /// Copies from a host pointer that stays valid until the job completes.
+        Host,
+    };
+
+    struct Op {
+        VAddr source{};
+        u8* destination{};
+        u64 size{};
+        OpKind kind{OpKind::Guest};
+    };
+
+    struct Stats {
+        u64 jobs{};
+        u64 ops{};
+        u64 bytes{};
+        u64 inline_bytes{};
+        u64 worker_ns{};
+        u64 help_ns{};
+        u64 wait_calls{};
+        u64 wait_ns{};
+        u64 overlap_waits{};
+        u64 slot_full_waits{};
+    };
+
+    static GuestCopyEngine& Instance();
+
+    GuestCopyEngine(const GuestCopyEngine&) = delete;
+    GuestCopyEngine& operator=(const GuestCopyEngine&) = delete;
+
+    /// Starts the worker pool. A worker count of zero keeps every copy inline.
+    void Start(u32 num_workers);
+
+    /// Drains and joins the worker pool.
+    void Stop();
+
+    /// Marks the calling thread as the single producer allowed to defer copies.
+    void SetProducerThread() noexcept;
+
+    /// Returns true when the calling thread may defer copies through Enqueue.
+    [[nodiscard]] bool CanDefer() const noexcept {
+        return is_producer_thread && active.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool IsActive() const noexcept {
+        return active.load(std::memory_order_relaxed);
+    }
+
+    /// Enqueues copy operations and returns the sequence of the last job created. When the
+    /// calling thread cannot defer, the operations run inline and the current submitted sequence
+    /// is returned.
+    u64 Enqueue(std::span<const Op> ops);
+
+    [[nodiscard]] u64 SubmittedSeq() const noexcept {
+        return submitted.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] u64 CompletedSeq() const noexcept {
+        return completed.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool HasPending() const noexcept {
+        return completed.load(std::memory_order_acquire) !=
+               submitted.load(std::memory_order_acquire);
+    }
+
+    /// Blocks until every job up to and including seq has completed. Callable from any thread;
+    /// the caller executes queued jobs while it waits.
+    void WaitCompleted(u64 seq);
+
+    /// Blocks until every job enqueued so far has completed.
+    void Drain() {
+        if (HasPending()) [[unlikely]] {
+            WaitCompleted(SubmittedSeq());
+        }
+    }
+
+    /// Must be called before the emulator writes [addr, addr + size) of guest memory.
+    void WaitForGuestWrite(VAddr addr, u64 size) {
+        if (HasPending()) [[unlikely]] {
+            WaitForGuestWriteSlow(addr, size);
+        }
+    }
+
+    [[nodiscard]] Stats GetStats() const noexcept;
+
+    [[nodiscard]] u32 NumWorkers() const noexcept {
+        return static_cast<u32>(workers.size());
+    }
+
+    /// Stress-tests ordering, completion waits and overlap waits on host memory. Must run before
+    /// the command processor produces work. Returns true when every check passed.
+    bool RunSelfTest();
+
+private:
+    static constexpr u64 SlotCount = 1024;
+    static constexpr u64 SlotMask = SlotCount - 1;
+    static constexpr u32 MaxOpsPerJob = 32;
+    static constexpr u64 SplitBytes = 256 * 1024;
+    static constexpr u64 GranuleBits = 16;
+    static constexpr u64 PendingTableSize = 8192;
+    static_assert((SlotCount & SlotMask) == 0);
+    static_assert((PendingTableSize & (PendingTableSize - 1)) == 0);
+
+    struct alignas(64) Slot {
+        std::atomic<u64> done_seq{0};
+        u64 bytes{};
+        u32 num_ops{};
+        std::array<Op, MaxOpsPerJob> ops{};
+    };
+
+    GuestCopyEngine();
+    ~GuestCopyEngine();
+
+    void WorkerLoop(std::stop_token stoken, u32 index);
+    bool TryRunOne(bool from_worker);
+    void RunJob(u64 seq, bool from_worker);
+    void AdvanceCompleted();
+    void PublishJob(u32 num_ops, u64 bytes);
+    void WaitForSlot();
+    void WaitForGuestWriteSlow(VAddr addr, u64 size);
+    void ExecuteInline(std::span<const Op> ops);
+    void ExecuteOps(std::span<const Op> ops, bool telemetry_enabled);
+    void MarkPending(const Op& op, bool add) noexcept;
+    [[nodiscard]] bool OverlapsPending(VAddr addr, u64 size) const noexcept;
+
+    [[nodiscard]] static u64 PendingIndex(u64 granule) noexcept {
+        u64 value = granule * 0x9E3779B97F4A7C15ULL;
+        value ^= value >> 29;
+        return value & (PendingTableSize - 1);
+    }
+
+    static thread_local bool is_producer_thread;
+
+    std::unique_ptr<std::array<Slot, SlotCount>> slots;
+    std::unique_ptr<std::array<std::atomic<u32>, PendingTableSize>> pending_reads;
+
+    alignas(64) std::atomic<u64> submitted{0};
+    alignas(64) std::atomic<u64> claimed{0};
+    alignas(64) std::atomic<u64> completed{0};
+    alignas(64) std::atomic<u64> wake_signal{0};
+    std::atomic<u32> parked_workers{0};
+    std::atomic<u32> completion_waiters{0};
+    std::atomic<bool> active{false};
+
+    // Producer-side staging for the job being built.
+    u32 building_ops{};
+    u64 building_bytes{};
+
+    struct alignas(64) AtomicStats {
+        std::atomic<u64> jobs{};
+        std::atomic<u64> ops{};
+        std::atomic<u64> bytes{};
+        std::atomic<u64> inline_bytes{};
+        std::atomic<u64> worker_ns{};
+        std::atomic<u64> help_ns{};
+        std::atomic<u64> wait_calls{};
+        std::atomic<u64> wait_ns{};
+        std::atomic<u64> overlap_waits{};
+        std::atomic<u64> slot_full_waits{};
+    };
+    AtomicStats stats;
+
+    std::vector<std::jthread> workers;
+};
+
+} // namespace VideoCore

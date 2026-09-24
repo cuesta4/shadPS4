@@ -28,12 +28,36 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/gpu_authority_tracker.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
 
 namespace {
+
+/// The command processor is about to write guest memory that deferred copies may still read.
+inline void PrepareGuestWrite(VAddr address, u64 size) {
+    VideoCore::GuestCopyEngine::Instance().WaitForGuestWrite(address, size);
+}
+
+inline void PrepareGuestWrite(const void* address, u64 size) {
+    PrepareGuestWrite(std::bit_cast<VAddr>(address), size);
+}
+
+/// Everything parsed before a completion signal must have finished reading guest memory before
+/// the guest can observe the signal and recycle that memory.
+inline void CompleteGuestReads(u64 guest_copy_seq) {
+    VideoCore::GuestCopyEngine::Instance().WaitCompleted(guest_copy_seq);
+}
+
+inline void CompleteGuestReads() {
+    VideoCore::GuestCopyEngine::Instance().Drain();
+}
+
+[[nodiscard]] inline u64 GuestCopySeq() {
+    return VideoCore::GuestCopyEngine::Instance().SubmittedSeq();
+}
 
 constexpr bool IsSyncPm4Opcode(PM4ItOpcode op) {
     switch (op) {
@@ -586,6 +610,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    VideoCore::GuestCopyEngine::Instance().SetProducerThread();
     curr_qid = -1;
 
     while (!stoken.stop_requested()) {
@@ -692,6 +717,8 @@ void Liverpool::Process(std::stop_token stoken) {
                     }
                 }
 
+                // WaitGpuIdle and IsGpuIdle let the guest treat a retired submit as consumed.
+                CompleteGuestReads();
                 {
                     std::scoped_lock lock{submit_mutex};
                     --num_submits;
@@ -710,6 +737,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 submit_done = false;
             }
+            CompleteGuestReads();
             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         }
     }
@@ -759,6 +787,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, u32 ib_dept
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            PrepareGuestWrite(dump_const->Address<void*>(), dump_const->Size());
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             if (rasterizer) {
@@ -1017,6 +1046,7 @@ namespace {
 
 SHAD_NO_INLINE void WriteFenceMemory(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
                                      u32 num_bytes) {
+    PrepareGuestWrite(address, num_bytes);
     auto* memory = Core::Memory::Instance();
     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
         memcpy(address, &data, num_bytes);
@@ -1752,16 +1782,19 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
             },
             &gpu_resident);
     }
+    const u64 guest_copy_seq = GuestCopySeq();
     if (has_writebacks && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
         auto* completion_rasterizer = rasterizer;
         rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
-                                        completion_trace] {
+                                        completion_trace, guest_copy_seq] {
+            CompleteGuestReads(guest_copy_seq);
             SignalEventWriteEos(packet, completion_rasterizer, fence_token, completion_trace);
         });
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
+    CompleteGuestReads(guest_copy_seq);
     SignalEventWriteEos(packet, rasterizer, fence_token, completion_trace);
     if (packet.command == PM4CmdEventWriteEos::Command::GdsStore) {
         if (packet.size != 1) [[unlikely]] {
@@ -1925,16 +1958,19 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
                 .trigger_data_control = packet.data_control,
             });
     }
+    const u64 guest_copy_seq = GuestCopySeq();
     if (has_writebacks) {
         auto* completion_rasterizer = rasterizer;
         rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
-                                        completion_trace] {
+                                        completion_trace, guest_copy_seq] {
+            CompleteGuestReads(guest_copy_seq);
             SignalEventWriteEop(packet, completion_rasterizer, fence_token, completion_trace);
         });
         Common::PerformanceTelemetry::Add(
             Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
+    CompleteGuestReads(guest_copy_seq);
     SignalEventWriteEop(packet, rasterizer, fence_token, completion_trace);
 }
 
@@ -2022,6 +2058,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
+                    CompleteGuestReads();
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     break;
                 }
@@ -2517,6 +2554,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                  static_cast<VAddr>(event->address[1]) << 32;
                     u64* results = std::bit_cast<u64*>(result_address);
                     const s32 counter_pairs = num_counter_pairs;
+                    PrepareGuestWrite(result_address,
+                                      static_cast<u64>(counter_pairs) * 2 * sizeof(u64));
                     const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
                     {
                         Common::PerformanceTelemetry::SampledDuration<
@@ -2632,6 +2671,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
+                    PrepareGuestWrite(address, data_size);
                     std::memcpy(address, write_data->data, data_size);
                     if (rasterizer) {
                         rasterizer->NotifyMemoryWrite(
@@ -2650,6 +2690,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                PrepareGuestWrite(mem_semaphore->Address<VAddr>(), sizeof(u64));
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
@@ -3191,6 +3232,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
+                PrepareGuestWrite(acb.data(), acb.size_bytes());
+                PrepareGuestWrite(queue.read_addr, sizeof(u32));
                 *queue.read_addr += acb.size();
                 *queue.read_addr &= queue.ring_size_dw - 1;
             }
@@ -3206,6 +3249,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
+                PrepareGuestWrite(queue.read_addr, sizeof(u32));
                 *queue.read_addr += next_dw_off;
                 *queue.read_addr &= queue.ring_size_dw - 1;
             }
@@ -3517,6 +3561,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                PrepareGuestWrite(write_data->Address<void*>(), data_size);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
                 if (rasterizer) {
                     rasterizer->NotifyMemoryWrite(
@@ -3530,6 +3575,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            PrepareGuestWrite(mem_semaphore->Address<VAddr>(), sizeof(u64));
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
@@ -3879,12 +3925,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                         .trigger_data_control = release_mem->dw2,
                     });
             }
+            const u64 guest_copy_seq = GuestCopySeq();
             if (has_writebacks && data_sel != DataSelect::GdsMemStore) {
                 const PM4CmdReleaseMem packet = *release_mem;
                 auto* completion_rasterizer = rasterizer;
                 const u32 pipe_id = queue.pipe_id;
                 rasterizer->DeferGpuCompletion([packet, completion_rasterizer, pipe_id, fence_token,
-                                                completion_trace] {
+                                                completion_trace, guest_copy_seq] {
+                    CompleteGuestReads(guest_copy_seq);
                     SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token,
                                      completion_trace);
                 });
@@ -3895,6 +3943,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 rasterizer->Flush(
                     Common::PerformanceTelemetry::SubmitReason::WritebackReleaseMem);
             } else {
+                CompleteGuestReads(guest_copy_seq);
                 SignalReleaseMem(*release_mem, rasterizer, queue.pipe_id, fence_token,
                                  completion_trace);
             }
@@ -3957,6 +4006,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                             static_cast<u32>(opcode), header->type3.NumWords());
         }
 
+        if constexpr (!is_indirect) {
+            PrepareGuestWrite(acb.data(), static_cast<u64>(next_dw_off) * sizeof(u32));
+            PrepareGuestWrite(queue.read_addr, sizeof(u32));
+        }
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {

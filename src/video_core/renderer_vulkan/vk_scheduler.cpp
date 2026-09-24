@@ -7,6 +7,7 @@
 #include "common/performance_telemetry.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -283,6 +284,10 @@ void Scheduler::SubmitThread(std::stop_token stoken) {
             .signalSemaphoreCount = job.info.num_signal_semas,
             .pSignalSemaphores = job.info.signal_semas.data(),
         };
+        if (job.guest_copy_seq != 0) {
+            // The command buffer reads staging bytes that copy workers may still be writing.
+            VideoCore::GuestCopyEngine::Instance().WaitCompleted(job.guest_copy_seq);
+        }
         const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
         const u64 wait_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
         std::unique_lock lk{instance.GetGraphicsQueueMutex()};
@@ -415,6 +420,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
+    // Every staging write recorded into this command buffer has been enqueued by now.
+    const u64 guest_copy_seq =
+        gate_guest_copies ? VideoCore::GuestCopyEngine::Instance().SubmittedSeq() : 0;
+
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
         .pWaitSemaphoreValues = info.wait_ticks.data(),
@@ -445,9 +454,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
     if (async_submit) {
         submit_queue.EmplaceWait(SubmitJob{.info = info,
                                            .cmdbuf = current_cmdbuf,
+                                           .guest_copy_seq = guest_copy_seq,
                                            .signal_tick = signal_value,
                                            .reason = reason});
     } else {
+        if (guest_copy_seq != 0) {
+            VideoCore::GuestCopyEngine::Instance().WaitCompleted(guest_copy_seq);
+        }
         master_semaphore.TelemetrySubmit(signal_value);
         const auto submit_result = [&] {
             Common::PerformanceTelemetry::ScopedDuration submit_duration{

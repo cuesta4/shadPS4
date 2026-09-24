@@ -406,6 +406,12 @@ public:
     explicit Scheduler(const Instance& instance, bool async_submit = false);
     ~Scheduler();
 
+    /// Makes every submission wait for the guest copies enqueued before it. Staging memory
+    /// written by the copy engine is only read by the GPU after the owning submission.
+    void GateSubmitsOnGuestCopies() noexcept {
+        gate_guest_copies = true;
+    }
+
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
     void Flush(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason =
@@ -570,6 +576,7 @@ private:
 
     const Instance& instance;
     const bool async_submit;
+    bool gate_guest_copies{};
     MasterSemaphore master_semaphore;
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     std::unique_ptr<GpuProfiler> gpu_profiler;
@@ -602,6 +609,7 @@ private:
     struct SubmitJob {
         SubmitInfo info{};
         vk::CommandBuffer cmdbuf{};
+        u64 guest_copy_seq{};
         u64 signal_tick{};
         Common::PerformanceTelemetry::SubmitReason reason{};
     };

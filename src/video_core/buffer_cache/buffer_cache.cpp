@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/gpu_authority_tracker.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -32,6 +33,8 @@ static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 256_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
+/// Smaller zero fills are cheaper inline than as a deferred copy operation.
+static constexpr u64 DeferredZeroFillThreshold = 4_KB;
 
 static SHAD_NO_INLINE void ValidateStreamCopyRequest(
     const bool finalized, const u16 request_count, const size_t max_requests,
@@ -131,6 +134,7 @@ struct BufferCache::StreamCopyScratch {
     std::array<RequestMap, MaxStreamCopyRequests> request_map{};
     std::array<HashSlot, HashTableSize> hash_table{};
     std::array<Core::MemoryManager::SparseCopyRequest, MaxStreamCopyRequests> guest_copies{};
+    std::array<GuestCopyEngine::Op, MaxStreamCopyRequests> deferred_copies{};
     u16 hash_generation{1};
 };
 
@@ -437,6 +441,10 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
 
     auto& scratch = *stream_copy_scratch;
     auto& reuse = *stream_batch_reuse;
+    // Deferred copies make the content-based reuse below impossible: it compares the bytes being
+    // uploaded now against a shadow. The copy engine moves the bytes instead of skipping them.
+    auto& copy_engine = GuestCopyEngine::Instance();
+    const bool defer_copies = copy_engine.CanDefer() && transient_read_buffer.is_coherent;
     if (++scratch.hash_generation == 0) {
         for (auto& slot : scratch.hash_table) {
             slot.generation = 0;
@@ -475,7 +483,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
                 reuse_duration{telemetry_enabled};
-            if (request.deduplicate && request.source_type == StreamCopySource::Guest &&
+            if (!defer_copies && request.deduplicate &&
+                request.source_type == StreamCopySource::Guest &&
                 request.size <= CACHING_PAGESIZE) {
                 size_t set_index{};
                 size_t way_index{};
@@ -594,6 +603,13 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         case StreamCopySource::Guest:
             if (captured) {
                 std::memcpy(destination, reuse.capture.get(), request.size);
+            } else if (defer_copies) {
+                const GuestCopyEngine::Op op{
+                    .source = request.guest_address,
+                    .destination = destination,
+                    .size = request.size,
+                };
+                copy_engine.Enqueue(std::span{&op, 1});
             } else {
                 const Core::MemoryManager::SparseCopyRequest copy{
                     .source = request.guest_address,
@@ -613,11 +629,21 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             std::memcpy(destination, request.host_address, request.size);
             break;
         case StreamCopySource::Zero:
-            std::memset(destination, 0, request.size);
+            if (defer_copies && request.size >= DeferredZeroFillThreshold) {
+                const GuestCopyEngine::Op op{
+                    .destination = destination,
+                    .size = request.size,
+                    .kind = GuestCopyEngine::OpKind::Zero,
+                };
+                copy_engine.Enqueue(std::span{&op, 1});
+            } else {
+                std::memset(destination, 0, request.size);
+            }
             break;
         }
         transient_read_buffer.Commit();
-        if (request.deduplicate && request.source_type == StreamCopySource::Guest &&
+        if (!defer_copies && request.deduplicate &&
+            request.source_type == StreamCopySource::Guest &&
             request.size <= CACHING_PAGESIZE) {
             if (reuse_entry == nullptr) {
                 reuse_entry = &reuse.Select(request.guest_address, request.size);
@@ -780,7 +806,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             if (telemetry_staging_sampled) {
                 batch_sample.canonical_bytes += source.key.size;
             }
-            if (!source.deduplicate || source.key.type != StreamCopySource::Guest ||
+            if (defer_copies || !source.deduplicate ||
+                source.key.type != StreamCopySource::Guest ||
                 source.key.size > CACHING_PAGESIZE) {
                 continue;
             }
@@ -922,6 +949,7 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
 
     u16 guest_copy_count = 0;
     u64 guest_copy_size = 0;
+    u16 deferred_copy_count = 0;
     {
         Common::PerformanceTelemetry::SampledDuration<
             Common::PerformanceTelemetry::TimerSite::StagingBatchCopy>
@@ -943,6 +971,16 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     if (placement.captured) {
                         std::memcpy(copy_destination,
                                     reuse.capture.get() + placement.capture_offset, size);
+                    } else if (defer_copies) {
+                        scratch.deferred_copies[deferred_copy_count++] = GuestCopyEngine::Op{
+                            .source = source.key.address,
+                            .destination = copy_destination,
+                            .size = size,
+                        };
+                        if (telemetry_staging_sampled) {
+                            ++batch_sample.guest_copies;
+                            batch_sample.guest_bytes += size;
+                        }
                     } else {
                         scratch.guest_copies[guest_copy_count++] =
                             Core::MemoryManager::SparseCopyRequest{
@@ -968,7 +1006,15 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     }
                     break;
                 case StreamCopySource::Zero:
-                    std::memset(copy_destination, 0, size);
+                    if (defer_copies && size >= DeferredZeroFillThreshold) {
+                        scratch.deferred_copies[deferred_copy_count++] = GuestCopyEngine::Op{
+                            .destination = copy_destination,
+                            .size = size,
+                            .kind = GuestCopyEngine::OpKind::Zero,
+                        };
+                    } else {
+                        std::memset(copy_destination, 0, size);
+                    }
                     if (telemetry_staging_sampled) {
                         ++batch_sample.zero_copies;
                         batch_sample.zero_bytes += size;
@@ -985,6 +1031,10 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                                                                          guest_copy_count},
                 guest_copy_size, telemetry_enabled, telemetry_staging_sampled);
         }
+        if (deferred_copy_count != 0) {
+            copy_engine.Enqueue(std::span<const GuestCopyEngine::Op>{
+                scratch.deferred_copies.data(), deferred_copy_count});
+        }
         if (total_size != 0) {
             transient_read_buffer.Commit();
         }
@@ -995,8 +1045,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
         const auto& source = scratch.canonical_sources[canonical_index];
         const auto& placement = scratch.canonical_placements[canonical_index];
-        if (placement.reused || !source.deduplicate || source.key.type != StreamCopySource::Guest ||
-            source.key.size > CACHING_PAGESIZE) {
+        if (defer_copies || placement.reused || !source.deduplicate ||
+            source.key.type != StreamCopySource::Guest || source.key.size > CACHING_PAGESIZE) {
             continue;
         }
 
@@ -1546,6 +1596,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!HasGpuReadSource(address, num_bytes)) {
+            GuestCopyEngine::Instance().WaitForGuestWrite(address, num_bytes);
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
             return;
@@ -1566,6 +1617,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         if (!src_gds && !HasGpuReadSource(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            GuestCopyEngine::Instance().WaitForGuestWrite(dst, num_bytes);
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
@@ -1741,7 +1793,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
             Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy,
             Common::PerformanceTelemetry::ResourceType::Image, 0);
         if (resolved) {
-            memory->CopySparseMemory(gpu_addr, data, size);
+            auto& copy_engine = GuestCopyEngine::Instance();
+            if (copy_engine.CanDefer() && staging_buffer.is_coherent) {
+                const GuestCopyEngine::Op op{
+                    .source = gpu_addr,
+                    .destination = data,
+                    .size = size,
+                };
+                copy_engine.Enqueue(std::span{&op, 1});
+            } else {
+                memory->CopySparseMemory(gpu_addr, data, size);
+            }
         }
     }
     staging_buffer.Commit();
@@ -2121,7 +2183,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
             Common::PerformanceTelemetry::StagingSite::UploadCopies,
             Common::PerformanceTelemetry::StagingSource::Guest, total_size_bytes);
     }
+    auto& copy_engine = GuestCopyEngine::Instance();
+    boost::container::small_vector<GuestCopyEngine::Op, 4> deferred_copies;
     if (staging) {
+        const bool defer_copies = copy_engine.CanDefer() && staging_buffer.is_coherent;
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
@@ -2138,11 +2203,23 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                     Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
                     Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid);
                 if (resolved) {
-                    memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                    if (defer_copies) {
+                        deferred_copies.push_back(GuestCopyEngine::Op{
+                            .source = device_addr,
+                            .destination = src_pointer,
+                            .size = copy.size,
+                        });
+                    } else {
+                        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                    }
                 }
             }
             // Apply the staging offset
             copy.srcOffset += offset;
+        }
+        if (!deferred_copies.empty()) {
+            copy_engine.Enqueue(std::span<const GuestCopyEngine::Op>{deferred_copies.data(),
+                                                                    deferred_copies.size()});
         }
         staging_buffer.Commit();
         return staging_buffer.Handle();
@@ -2153,6 +2230,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
         const vk::Buffer src_buffer = temp_buffer->Handle();
         u8* const staging = temp_buffer->mapped_data.data();
+        const bool defer_copies = copy_engine.CanDefer() && temp_buffer->is_coherent;
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
@@ -2169,9 +2247,23 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                     Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
                     Common::PerformanceTelemetry::ResourceType::Buffer, buffer.uid);
                 if (resolved) {
-                    memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                    if (defer_copies) {
+                        deferred_copies.push_back(GuestCopyEngine::Op{
+                            .source = device_addr,
+                            .destination = src_pointer,
+                            .size = copy.size,
+                        });
+                    } else {
+                        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                    }
                 }
             }
+        }
+        if (!deferred_copies.empty()) {
+            // The buffer is released only after the GPU completes the current tick, which in
+            // turn waits for these copies before the command buffer is submitted.
+            copy_engine.Enqueue(std::span<const GuestCopyEngine::Op>{deferred_copies.data(),
+                                                                    deferred_copies.size()});
         }
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;

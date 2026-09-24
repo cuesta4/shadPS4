@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
+#include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -15,6 +19,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/hash.h"
+#include "common/logging/log.h"
 #include "common/performance_telemetry.h"
 #include "common/signal_context.h"
 #include "core/debug_state.h"
@@ -30,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/gpu_authority_tracker.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -363,6 +369,48 @@ struct Rasterizer::DynamicStateInputCache {
     bool valid{};
 };
 
+namespace {
+
+/// Splits Rasterizer::Draw into consecutive phases for the telemetry build.
+class DrawPhaseClock {
+public:
+    explicit DrawPhaseClock(bool enabled_) noexcept
+        : enabled{enabled_}, last{enabled_ ? Common::PerformanceTelemetry::Timestamp() : 0} {}
+
+    void Lap(Common::PerformanceTelemetry::Counter counter) noexcept {
+        if (!enabled) {
+            return;
+        }
+        const u64 now = Common::PerformanceTelemetry::Timestamp();
+        Common::PerformanceTelemetry::AddEnabled(counter, now - last);
+        last = now;
+    }
+
+private:
+    bool enabled;
+    u64 last;
+};
+
+/// Number of guest copy workers. SHADPS4_ASYNC_COPIES=0 keeps copies on the command processor,
+/// SHADPS4_COPY_WORKERS=N overrides the worker count.
+[[nodiscard]] u32 GuestCopyWorkerCount() {
+    if (const char* env = std::getenv("SHADPS4_ASYNC_COPIES"); env != nullptr && env[0] == '0') {
+        return 0;
+    }
+    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        // Precise readbacks read-protect GPU-written pages; a worker touching one would fault
+        // into the caches from outside the command processor thread.
+        return 0;
+    }
+    if (const char* env = std::getenv("SHADPS4_COPY_WORKERS"); env != nullptr) {
+        return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
+    }
+    const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+    return std::clamp(hardware_threads / 4, 2u, 4u);
+}
+
+} // Anonymous namespace
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -373,12 +421,26 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     dynamic_state_inputs = std::make_unique<DynamicStateInputCache>();
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
+        scheduler.GateSubmitsOnGuestCopies();
+        auto& copy_engine = VideoCore::GuestCopyEngine::Instance();
+        copy_engine.Start(GuestCopyWorkerCount());
+        // SHADPS4_GUEST_COPY_SELFTEST=1 stress-tests the copy engine before any guest work;
+        // "exit" terminates with status 0 (passed) or 3 (failed) afterwards.
+        if (const char* env = std::getenv("SHADPS4_GUEST_COPY_SELFTEST");
+            env != nullptr && env[0] != ' ' && env[0] != '0') {
+            const bool passed = copy_engine.RunSelfTest();
+            if (std::string_view{env} == "exit") {
+                Common::Log::Flush();
+                std::quick_exit(passed ? 0 : 3);
+            }
+        }
     }
     memory->SetRasterizer(this);
     VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(this);
 }
 
 Rasterizer::~Rasterizer() {
+    VideoCore::GuestCopyEngine::Instance().Stop();
     VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(nullptr);
 }
 
@@ -826,6 +888,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     Common::PerformanceTelemetry::ScopedDuration draw_duration{
         telemetry_enabled, Common::PerformanceTelemetry::Counter::DrawCpuNs};
+    using Common::PerformanceTelemetry::Counter;
+    DrawPhaseClock phases{telemetry_enabled};
 
     scheduler.PopPendingOperations();
 
@@ -834,20 +898,28 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
+    phases.Lap(Counter::DrawPhaseRenderStateNs);
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    phases.Lap(Counter::DrawPhasePipelineNs);
     if (!pipeline) {
         return;
     }
 
     PrepareRenderState(pipeline);
+    phases.Lap(Counter::DrawPhaseRenderStateNs);
     if (!BindResources(pipeline)) {
         return;
     }
+    phases.Lap(Counter::DrawPhaseBindNs);
     buffer_cache.PrepareVertexIndexBuffers(*pipeline, is_indexed, index_offset);
+    phases.Lap(Counter::DrawPhaseVertexIndexNs);
     const auto state = BeginRendering(pipeline);
+    phases.Lap(Counter::DrawPhaseBeginRenderingNs);
     buffer_cache.FinalizeStreamCopyBatch();
+    phases.Lap(Counter::DrawPhaseStreamCopyNs);
     FinalizeBuffers(push_data, true);
     buffer_cache.FinalizeVertexIndexBuffers(buffer_barriers);
+    phases.Lap(Counter::DrawPhaseFinalizeNs);
 
     BindPipelineResources(pipeline);
     UpdateDynamicState(pipeline, is_indexed);
@@ -872,6 +944,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
+    phases.Lap(Counter::DrawPhaseRecordNs);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -2598,6 +2671,8 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    // Workers must not read a range after its guest mapping is torn down.
+    VideoCore::GuestCopyEngine::Instance().Drain();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     page_manager.OnGpuUnmap(addr, size);
