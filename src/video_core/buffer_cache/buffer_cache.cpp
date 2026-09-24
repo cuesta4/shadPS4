@@ -2026,6 +2026,13 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    Common::PerformanceTelemetry::ScopedFastDuration create_time{
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::BufferCreateNs};
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::BufferCreates, 1);
+    }
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);

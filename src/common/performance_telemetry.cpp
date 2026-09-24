@@ -625,7 +625,31 @@ constexpr std::array FrameCounters{
     Counter::DrawPhaseBeginRenderingNs,
     Counter::DrawPhaseStreamCopyNs,
     Counter::DrawPhaseFinalizeNs,
-    Counter::DrawPhaseRecordNs,
+    Counter::DrawPhasePendingOpsNs,
+    Counter::DrawPhaseFilterNs,
+    Counter::DrawPhaseDescriptorsNs,
+    Counter::DrawPhaseDynamicStateNs,
+    Counter::DrawPhaseCmdNs,
+    Counter::DrawPhaseMarkWritesNs,
+    Counter::BindBuffersNs,
+    Counter::BindTexturesNs,
+    Counter::GcpSyncPacketNs,
+    Counter::GuestCopyProducerWaitNs,
+    Counter::GuestCopyProtectedInlineOps,
+    Counter::GuestCopyQueueDepthMax,
+    Counter::TextureUploads,
+    Counter::TextureUploadBytes,
+    Counter::TextureUploadNs,
+    Counter::TextureHashBytes,
+    Counter::TextureHashNs,
+    Counter::BufferCreates,
+    Counter::BufferCreateNs,
+    Counter::StreamBufferWaitNs,
+    Counter::DispatchPhasePendingOpsNs,
+    Counter::DispatchPhasePipelineNs,
+    Counter::DispatchPhaseHleNs,
+    Counter::DispatchPhaseBindNs,
+    Counter::DispatchPhaseRecordNs,
     Counter::RenderTargetHits,
     Counter::RenderTargetMisses,
     Counter::ImageTokenHits,
@@ -751,6 +775,11 @@ constexpr std::array FrameCounters{
     Counter::RenderTargetTransitions,
     Counter::BruteForceBarriers,
     Counter::BruteForceHostFinishes,
+    Counter::WaitCalls,
+    Counter::WaitNs,
+    Counter::WaitRegMemCalls,
+    Counter::WaitRegMemSpinNs,
+    Counter::PriorityOpsExecuteNs,
 };
 
 struct FrameRecord {
@@ -1019,7 +1048,31 @@ constexpr std::array CounterNames{
     "draw_phase_begin_rendering_ns",
     "draw_phase_stream_copy_ns",
     "draw_phase_finalize_ns",
-    "draw_phase_record_ns",
+    "draw_phase_pending_ops_ns",
+    "draw_phase_filter_ns",
+    "draw_phase_descriptors_ns",
+    "draw_phase_dynamic_state_ns",
+    "draw_phase_cmd_ns",
+    "draw_phase_mark_writes_ns",
+    "bind_buffers_ns",
+    "bind_textures_ns",
+    "gcp_sync_packet_ns",
+    "guest_copy_producer_wait_ns",
+    "guest_copy_protected_inline_ops",
+    "guest_copy_queue_depth_max",
+    "texture_uploads",
+    "texture_upload_bytes",
+    "texture_upload_ns",
+    "texture_hash_bytes",
+    "texture_hash_ns",
+    "buffer_creates",
+    "buffer_create_ns",
+    "stream_buffer_wait_ns",
+    "dispatch_phase_pending_ops_ns",
+    "dispatch_phase_pipeline_ns",
+    "dispatch_phase_hle_ns",
+    "dispatch_phase_bind_ns",
+    "dispatch_phase_record_ns",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 
@@ -2340,7 +2393,8 @@ void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
 
 [[nodiscard]] bool IsMaxCounter(Counter counter) noexcept {
     return counter == Counter::IbDepthMax || counter == Counter::SubmitQueueDepthMax ||
-           counter == Counter::ShaderModuleQueueDepthMax;
+           counter == Counter::ShaderModuleQueueDepthMax ||
+           counter == Counter::GuestCopyQueueDepthMax;
 }
 
 [[nodiscard]] std::string CsvSafe(std::string value) {
@@ -2379,6 +2433,38 @@ TraceCaptureProfile GetCaptureProfileEnabled() noexcept {
         return TraceCaptureProfile::SyncFastpathValidation;
     }();
     return profile;
+}
+
+namespace {
+
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+/// Nanoseconds per FastTicks tick, measured once at startup against steady_clock.
+[[nodiscard]] double CalibrateFastTicks() noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto clock_begin = std::chrono::steady_clock::now();
+    const u64 ticks_begin = FastTicks();
+    while (std::chrono::steady_clock::now() - clock_begin < std::chrono::milliseconds{5}) {
+    }
+    const auto clock_end = std::chrono::steady_clock::now();
+    const u64 ticks_end = FastTicks();
+    const double elapsed_ns =
+        std::chrono::duration<double, std::nano>(clock_end - clock_begin).count();
+    return ticks_end > ticks_begin ? elapsed_ns / static_cast<double>(ticks_end - ticks_begin)
+                                   : 1.0;
+#else
+    return 1.0;
+#endif
+}
+
+const double g_fast_ns_per_tick = CalibrateFastTicks();
+#else
+constexpr double g_fast_ns_per_tick = 1.0;
+#endif
+
+} // Anonymous namespace
+
+u64 FastTicksToNs(u64 ticks) noexcept {
+    return static_cast<u64>(static_cast<double>(ticks) * g_fast_ns_per_tick);
 }
 
 void AddEnabled(Counter counter, u64 value) noexcept {

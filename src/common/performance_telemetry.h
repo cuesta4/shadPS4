@@ -5,6 +5,9 @@
 
 #include <bit>
 #include <chrono>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <filesystem>
 #include <limits>
 
@@ -747,7 +750,31 @@ enum class Counter : u16 {
     DrawPhaseBeginRenderingNs,
     DrawPhaseStreamCopyNs,
     DrawPhaseFinalizeNs,
-    DrawPhaseRecordNs,
+    DrawPhasePendingOpsNs,
+    DrawPhaseFilterNs,
+    DrawPhaseDescriptorsNs,
+    DrawPhaseDynamicStateNs,
+    DrawPhaseCmdNs,
+    DrawPhaseMarkWritesNs,
+    BindBuffersNs,
+    BindTexturesNs,
+    GcpSyncPacketNs,
+    GuestCopyProducerWaitNs,
+    GuestCopyProtectedInlineOps,
+    GuestCopyQueueDepthMax,
+    TextureUploads,
+    TextureUploadBytes,
+    TextureUploadNs,
+    TextureHashBytes,
+    TextureHashNs,
+    BufferCreates,
+    BufferCreateNs,
+    StreamBufferWaitNs,
+    DispatchPhasePendingOpsNs,
+    DispatchPhasePipelineNs,
+    DispatchPhaseHleNs,
+    DispatchPhaseBindNs,
+    DispatchPhaseRecordNs,
     Count,
 };
 
@@ -1264,6 +1291,19 @@ private:
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
 }
+
+/// Cheapest available timestamp for per-draw phase accounting. Raw ticks; convert the
+/// difference with FastTicksToNs.
+[[nodiscard]] inline u64 FastTicks() noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+    return __rdtsc();
+#else
+    return Timestamp();
+#endif
+}
+
+/// Converts a FastTicks difference to nanoseconds (the TSC rate is calibrated at startup).
+[[nodiscard]] u64 FastTicksToNs(u64 ticks) noexcept;
 
 void AddEnabled(Counter counter, u64 value) noexcept;
 void ObserveMaxEnabled(Counter counter, u64 value) noexcept;
@@ -4472,6 +4512,27 @@ private:
     EventType type;
     u64 arg0;
     u64 start_ns;
+};
+
+/// Unsampled duration measured with FastTicks; cheap enough for every draw.
+class ScopedFastDuration {
+public:
+    ScopedFastDuration(bool enabled_, Counter counter_) noexcept
+        : counter{counter_}, start{enabled_ ? FastTicks() : 0}, enabled{enabled_} {}
+
+    ~ScopedFastDuration() {
+        if (enabled) [[unlikely]] {
+            AddEnabled(counter, FastTicksToNs(FastTicks() - start));
+        }
+    }
+
+    ScopedFastDuration(const ScopedFastDuration&) = delete;
+    ScopedFastDuration& operator=(const ScopedFastDuration&) = delete;
+
+private:
+    Counter counter;
+    u64 start;
+    bool enabled;
 };
 
 template <TimerSite Site>

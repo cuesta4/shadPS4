@@ -2430,6 +2430,9 @@ void TextureCache::RefreshImage(Image& image) {
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    Common::PerformanceTelemetry::ScopedFastDuration refresh_time{
+        telemetry_enabled, Common::PerformanceTelemetry::Counter::TextureUploadNs};
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
@@ -2466,6 +2469,12 @@ void TextureCache::RefreshImage(Image& image) {
 
         // Protect GPU modified resources from accidental CPU reuploads.
         if (is_gpu_modified && !is_gpu_dirty) {
+            Common::PerformanceTelemetry::ScopedFastDuration hash_time{
+                telemetry_enabled, Common::PerformanceTelemetry::Counter::TextureHashNs};
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    Common::PerformanceTelemetry::Counter::TextureHashBytes, mip_size);
+            }
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
             if (image.mip_hashes[m] == hash) {
@@ -2502,6 +2511,12 @@ void TextureCache::RefreshImage(Image& image) {
             : Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
         Common::PerformanceTelemetry::Avoidability::ProvenRequired);
 
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::TextureUploads, 1);
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::TextureUploadBytes, image.info.guest_size);
+    }
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,

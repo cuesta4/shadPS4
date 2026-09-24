@@ -284,8 +284,13 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
             !allow_wait) {
             return false;
         }
-        scheduler->Wait(required_tick,
-                        Common::PerformanceTelemetry::HostWaitReason::StreamBufferReuse);
+        {
+            Common::PerformanceTelemetry::ScopedFastDuration wait_time{
+                Common::PerformanceTelemetry::Enabled(),
+                Common::PerformanceTelemetry::Counter::StreamBufferWaitNs};
+            scheduler->Wait(required_tick,
+                            Common::PerformanceTelemetry::HostWaitReason::StreamBufferReuse);
+        }
         if (pin) {
             pin->Reclaim();
             if (!pin->IsReleased()) {

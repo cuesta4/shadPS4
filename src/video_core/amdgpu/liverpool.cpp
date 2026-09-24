@@ -1342,6 +1342,9 @@ void Liverpool::FlushPendingGpuCompletionsForWait() {
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& packet) {
+    Common::PerformanceTelemetry::ScopedFastDuration sync_time{
+        Common::PerformanceTelemetry::Enabled(),
+        Common::PerformanceTelemetry::Counter::GcpSyncPacketNs};
     Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
     if (Common::PerformanceTelemetry::Enabled()) {
         completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
@@ -1812,6 +1815,9 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& packet) {
+    Common::PerformanceTelemetry::ScopedFastDuration sync_time{
+        Common::PerformanceTelemetry::Enabled(),
+        Common::PerformanceTelemetry::Counter::GcpSyncPacketNs};
     Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
     if (Common::PerformanceTelemetry::Enabled()) {
         completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
@@ -3761,6 +3767,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
+            Common::PerformanceTelemetry::ScopedFastDuration sync_time{
+                telemetry_enabled, Common::PerformanceTelemetry::Counter::GcpSyncPacketNs};
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
             if (telemetry_enabled) {

@@ -127,6 +127,10 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
                     // Faults on this range must be handled on the command processor thread.
                     MarkPending(piece_op, false);
                     stats.protected_inline_ops.fetch_add(1, std::memory_order_relaxed);
+                    if (Common::PerformanceTelemetry::Enabled()) {
+                        Common::PerformanceTelemetry::AddEnabled(
+                            Common::PerformanceTelemetry::Counter::GuestCopyProtectedInlineOps, 1);
+                    }
                     ExecuteInline(std::span{&piece_op, 1});
                     continue;
                 }
@@ -166,6 +170,9 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
             Common::PerformanceTelemetry::Counter::GuestCopyJobs, 1);
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyBytes, bytes);
+        Common::PerformanceTelemetry::ObserveMaxEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyQueueDepthMax,
+            seq - completed.load(std::memory_order_relaxed));
     }
 
     submitted.store(seq, std::memory_order_seq_cst);
@@ -321,7 +328,9 @@ void GuestCopyEngine::WaitCompleted(u64 seq) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyWaitCalls, 1);
         Common::PerformanceTelemetry::AddEnabled(
-            Common::PerformanceTelemetry::Counter::GuestCopyWaitNs, elapsed);
+            is_producer_thread ? Common::PerformanceTelemetry::Counter::GuestCopyProducerWaitNs
+                               : Common::PerformanceTelemetry::Counter::GuestCopyWaitNs,
+            elapsed);
     }
 }
 
@@ -367,7 +376,9 @@ void GuestCopyEngine::DrainRange(VAddr addr, u64 size) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyWaitCalls, 1);
         Common::PerformanceTelemetry::AddEnabled(
-            Common::PerformanceTelemetry::Counter::GuestCopyWaitNs, elapsed);
+            is_producer_thread ? Common::PerformanceTelemetry::Counter::GuestCopyProducerWaitNs
+                               : Common::PerformanceTelemetry::Counter::GuestCopyWaitNs,
+            elapsed);
     }
 }
 

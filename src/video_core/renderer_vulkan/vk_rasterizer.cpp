@@ -370,24 +370,88 @@ struct Rasterizer::DynamicStateInputCache {
 
 namespace {
 
-/// Splits Rasterizer::Draw into consecutive phases for the telemetry build.
+/// Per-thread phase totals in raw TSC ticks, published to the telemetry counters every few
+/// operations so a phase lap costs one rdtsc and one add.
+class PhaseAccumulator {
+public:
+    using Counter = Common::PerformanceTelemetry::Counter;
+    static constexpr Counter First = Counter::DrawPhasePipelineNs;
+    static constexpr Counter Last = Counter::DispatchPhaseRecordNs;
+    static constexpr u32 OperationsPerFlush = 32;
+
+    void Add(Counter counter, u64 ticks) noexcept {
+        ticks_by_counter[static_cast<size_t>(counter) - static_cast<size_t>(First)] += ticks;
+    }
+
+    void EndOperation() noexcept {
+        if (++pending_operations >= OperationsPerFlush) {
+            Flush();
+        }
+    }
+
+    void Flush() noexcept {
+        for (size_t i = 0; i < ticks_by_counter.size(); ++i) {
+            if (ticks_by_counter[i] != 0) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    static_cast<Counter>(static_cast<size_t>(First) + i),
+                    Common::PerformanceTelemetry::FastTicksToNs(ticks_by_counter[i]));
+                ticks_by_counter[i] = 0;
+            }
+        }
+        pending_operations = 0;
+    }
+
+private:
+    std::array<u64, static_cast<size_t>(Last) - static_cast<size_t>(First) + 1>
+        ticks_by_counter{};
+    u32 pending_operations{};
+};
+
+thread_local PhaseAccumulator phase_accumulator;
+
+/// Splits Rasterizer::Draw/Dispatch into consecutive phases for the telemetry build.
 class DrawPhaseClock {
 public:
     explicit DrawPhaseClock(bool enabled_) noexcept
-        : enabled{enabled_}, last{enabled_ ? Common::PerformanceTelemetry::Timestamp() : 0} {}
+        : enabled{enabled_}, last{enabled_ ? Common::PerformanceTelemetry::FastTicks() : 0} {}
+
+    ~DrawPhaseClock() {
+        if (enabled) {
+            phase_accumulator.EndOperation();
+        }
+    }
 
     void Lap(Common::PerformanceTelemetry::Counter counter) noexcept {
         if (!enabled) {
             return;
         }
-        const u64 now = Common::PerformanceTelemetry::Timestamp();
-        Common::PerformanceTelemetry::AddEnabled(counter, now - last);
+        const u64 now = Common::PerformanceTelemetry::FastTicks();
+        phase_accumulator.Add(counter, now - last);
         last = now;
     }
 
 private:
     bool enabled;
     u64 last;
+};
+
+/// Unsampled scope timer feeding the phase accumulator.
+class PhaseScope {
+public:
+    PhaseScope(bool enabled_, Common::PerformanceTelemetry::Counter counter_) noexcept
+        : counter{counter_}, start{enabled_ ? Common::PerformanceTelemetry::FastTicks() : 0},
+          enabled{enabled_} {}
+
+    ~PhaseScope() {
+        if (enabled) {
+            phase_accumulator.Add(counter, Common::PerformanceTelemetry::FastTicks() - start);
+        }
+    }
+
+private:
+    Common::PerformanceTelemetry::Counter counter;
+    u64 start;
+    bool enabled;
 };
 
 /// Number of guest copy workers. SHADPS4_ASYNC_COPIES=0 keeps copies on the command processor,
@@ -405,7 +469,7 @@ private:
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
     const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
-    return std::clamp(hardware_threads / 4, 2u, 4u);
+    return std::clamp(hardware_threads / 2, 2u, 8u);
 }
 
 } // Anonymous namespace
@@ -888,13 +952,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DrawPhaseClock phases{telemetry_enabled};
 
     scheduler.PopPendingOperations();
+    phases.Lap(Counter::DrawPhasePendingOpsNs);
 
     if (!FilterDraw()) {
+        phases.Lap(Counter::DrawPhaseFilterNs);
         return;
     }
 
     const auto& regs = liverpool->regs;
-    phases.Lap(Counter::DrawPhaseRenderStateNs);
+    phases.Lap(Counter::DrawPhaseFilterNs);
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     phases.Lap(Counter::DrawPhasePipelineNs);
     if (!pipeline) {
@@ -918,7 +984,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     phases.Lap(Counter::DrawPhaseFinalizeNs);
 
     BindPipelineResources(pipeline);
+    phases.Lap(Counter::DrawPhaseDescriptorsNs);
     UpdateDynamicState(pipeline, is_indexed);
+    phases.Lap(Counter::DrawPhaseDynamicStateNs);
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
@@ -937,10 +1005,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    phases.Lap(Counter::DrawPhaseCmdNs);
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
-    phases.Lap(Counter::DrawPhaseRecordNs);
+    phases.Lap(Counter::DrawPhaseMarkWritesNs);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1040,23 +1109,31 @@ void Rasterizer::DispatchDirect() {
     }
     Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
         telemetry_enabled, Common::PerformanceTelemetry::Counter::DispatchCpuNs};
+    using Common::PerformanceTelemetry::Counter;
+    DrawPhaseClock phases{telemetry_enabled};
 
     scheduler.PopPendingOperations();
+    phases.Lap(Counter::DispatchPhasePendingOpsNs);
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    phases.Lap(Counter::DispatchPhasePipelineNs);
     if (!pipeline) {
         return;
     }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        phases.Lap(Counter::DispatchPhaseHleNs);
         return;
     }
+    phases.Lap(Counter::DispatchPhaseHleNs);
 
     if (!BindResources(pipeline)) {
+        phases.Lap(Counter::DispatchPhaseBindNs);
         return;
     }
+    phases.Lap(Counter::DispatchPhaseBindNs);
 
     scheduler.EndRendering(
         Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand,
@@ -1071,6 +1148,7 @@ void Rasterizer::DispatchDirect() {
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
 
     ResetBindings();
+    phases.Lap(Counter::DispatchPhaseRecordNs);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1082,18 +1160,24 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
     Common::PerformanceTelemetry::ScopedDuration dispatch_duration{
         telemetry_enabled, Common::PerformanceTelemetry::Counter::DispatchCpuNs};
+    using Common::PerformanceTelemetry::Counter;
+    DrawPhaseClock phases{telemetry_enabled};
 
     scheduler.PopPendingOperations();
+    phases.Lap(Counter::DispatchPhasePendingOpsNs);
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    phases.Lap(Counter::DispatchPhasePipelineNs);
     if (!pipeline) {
         return;
     }
 
     if (!BindResources(pipeline)) {
+        phases.Lap(Counter::DispatchPhaseBindNs);
         return;
     }
+    phases.Lap(Counter::DispatchPhaseBindNs);
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
 
@@ -1115,6 +1199,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::ComputeDispatch, false);
 
     ResetBindings();
+    phases.Lap(Counter::DispatchPhaseRecordNs);
 }
 
 u64 Rasterizer::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
@@ -1186,6 +1271,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DescriptorBuffers>
                 buffer_duration{telemetry_enabled};
+            PhaseScope buffers_time{telemetry_enabled,
+                                    Common::PerformanceTelemetry::Counter::BindBuffersNs};
             const u32 first_binding = static_cast<u32>(pending_buffer_bindings.size());
             PrepareBuffers(*stage, binding);
             FinalizeBuffers(push_data, false, first_binding);
@@ -1194,6 +1281,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DescriptorTextures>
                 texture_duration{telemetry_enabled};
+            PhaseScope textures_time{telemetry_enabled,
+                                     Common::PerformanceTelemetry::Counter::BindTexturesNs};
             BindTextures(*stage, binding);
         }
         uses_dma |= stage->uses_dma;
