@@ -13,6 +13,7 @@
 #include <queue>
 
 #include "common/assert.h"
+#include "common/bounded_threadsafe_queue.h"
 #include "common/performance_telemetry.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -402,7 +403,7 @@ struct DynamicState {
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    explicit Scheduler(const Instance& instance, bool async_submit = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -551,6 +552,9 @@ private:
 
     void SubmitExecution(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason);
 
+    void SubmitThread(std::stop_token stoken);
+    void WaitSubmitted(u64 tick) const;
+
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
@@ -565,6 +569,7 @@ private:
     };
 
     const Instance& instance;
+    const bool async_submit;
     MasterSemaphore master_semaphore;
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     std::unique_ptr<GpuProfiler> gpu_profiler;
@@ -594,6 +599,15 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+    struct SubmitJob {
+        SubmitInfo info{};
+        vk::CommandBuffer cmdbuf{};
+        u64 signal_tick{};
+        Common::PerformanceTelemetry::SubmitReason reason{};
+    };
+    Common::SPSCQueue<SubmitJob, 8> submit_queue;
+    std::atomic<u64> submitted_tick{0};
+    std::jthread submit_thread;
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};

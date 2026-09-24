@@ -2113,9 +2113,8 @@ ImageId TextureCache::FindImageContainingRange(VAddr address, size_t size) {
     return result;
 }
 
-void TextureCache::PrepareTexture(ImageId image_id, const ImageDesc& desc, bool is_compute) {
-    static_cast<void>(is_compute);
-    const bool is_storage = desc.type == BindingType::Storage;
+void TextureCache::PrepareTexture(ImageId image_id, BindingType type) {
+    const bool is_storage = type == BindingType::Storage;
     PrepareImageAccess(image_id, is_storage ? AliasAccess::ReadWrite : AliasAccess::Read);
 }
 
@@ -2343,7 +2342,7 @@ bool TextureCache::MaterializeGpuAuthority(
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
-    PrepareTexture(image_id, desc);
+    PrepareTexture(image_id, desc.type);
     Image& image = slot_images[image_id];
     return image.FindView(desc.view_info);
 }

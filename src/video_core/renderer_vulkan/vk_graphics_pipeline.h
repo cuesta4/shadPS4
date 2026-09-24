@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -102,6 +103,12 @@ public:
         return key;
     }
 
+    [[nodiscard]] u64 VertexPlanIdentity() const noexcept {
+        return vertex_plan_identity;
+    }
+
+    [[nodiscard]] std::span<const AmdGpu::Buffer> GetVertexBuffers() const;
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -114,6 +121,7 @@ private:
 
 private:
     GraphicsPipelineKey key;
+    u64 vertex_plan_identity{};
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
     VertexInputs<Shader::Gcn::VertexAttribute> vertex_input_plan;
 };

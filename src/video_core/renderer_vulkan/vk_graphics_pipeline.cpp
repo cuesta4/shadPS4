@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -22,6 +23,8 @@ namespace Vulkan {
 using Shader::Backend::SPIRV::AuxShaderType;
 
 namespace {
+
+std::atomic<u64> next_vertex_plan_identity{1};
 
 u64 BuildAuxTessPreviousStageOutputMask(const Shader::Info* vs_info,
                                         const Shader::FragmentRuntimeInfo& fs_info) {
@@ -75,6 +78,7 @@ GraphicsPipeline::GraphicsPipeline(
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
+    vertex_plan_identity = next_vertex_plan_identity.fetch_add(1, std::memory_order_relaxed);
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     if (fetch_shader) {
@@ -451,24 +455,31 @@ GraphicsPipeline::GraphicsPipeline(
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
+std::span<const AmdGpu::Buffer> GraphicsPipeline::GetVertexBuffers() const {
+    if (vertex_input_plan.empty()) {
+        return {};
+    }
+    const auto& buffers = GetStage(Shader::LogicalStage::Vertex).resolved_vertex_buffers;
+    if (buffers.size() != vertex_input_plan.size()) [[unlikely]] {
+        ValidateVertexInputPlanSize(buffers.size(), vertex_input_plan.size());
+    }
+    return buffers;
+}
+
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
     VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (vertex_input_plan.empty()) {
+    const auto guest_buffer_plan = GetVertexBuffers();
+    if (guest_buffer_plan.empty()) {
         return;
-    }
-    const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
-    if (vs_info.resolved_vertex_buffers.size() != vertex_input_plan.size()) [[unlikely]] {
-        ValidateVertexInputPlanSize(vs_info.resolved_vertex_buffers.size(),
-                                    vertex_input_plan.size());
     }
     for (u32 attribute_index = 0; attribute_index < vertex_input_plan.size(); ++attribute_index) {
         const auto& attrib = vertex_input_plan[attribute_index];
         const auto step_rate = attrib.GetStepRate();
-        const auto buffer = vs_info.resolved_vertex_buffers[attribute_index];
+        const auto buffer = guest_buffer_plan[attribute_index];
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,

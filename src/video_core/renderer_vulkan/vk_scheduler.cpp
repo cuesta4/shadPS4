@@ -36,8 +36,9 @@ u64 RenderStateHash(const RenderState& state) {
 
 } // namespace
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
+Scheduler::Scheduler(const Instance& instance, bool async_submit)
+    : instance{instance}, async_submit{async_submit}, master_semaphore{instance},
+      command_pool{instance, &master_semaphore} {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     gpu_profiler = std::make_unique<GpuProfiler>(instance, master_semaphore);
 #endif
@@ -47,9 +48,17 @@ Scheduler::Scheduler(const Instance& instance)
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+    if (async_submit) {
+        submit_thread = std::jthread(std::bind_front(&Scheduler::SubmitThread, this));
+    }
 }
 
 Scheduler::~Scheduler() {
+    if (async_submit) {
+        WaitSubmitted(CurrentTick() - 1);
+        submit_thread.request_stop();
+        submit_thread.join();
+    }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     gpu_profiler.reset();
 #endif
@@ -209,8 +218,11 @@ void Scheduler::EndGpuInterval(u64 token) {
 }
 
 void Scheduler::Flush(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason) {
-    // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info, reason);
+    // The presentation thread can enqueue a wait for this frame as soon as it is published.
+    if (reason == Common::PerformanceTelemetry::SubmitReason::PresentFrameBuild) {
+        WaitSubmitted(CurrentTick() - 1);
+    }
 }
 
 void Scheduler::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
@@ -232,7 +244,66 @@ void Scheduler::Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reas
         SubmitInfo info{};
         Flush(info, Common::PerformanceTelemetry::SubmitReason::WaitProgress);
     }
+    WaitSubmitted(tick);
     master_semaphore.Wait(tick, reason);
+}
+
+void Scheduler::WaitSubmitted(u64 tick) const {
+    if (!async_submit) {
+        return;
+    }
+    u64 submitted = submitted_tick.load(std::memory_order_acquire);
+    while (submitted < tick) {
+        submitted_tick.wait(submitted, std::memory_order_relaxed);
+        submitted = submitted_tick.load(std::memory_order_acquire);
+    }
+}
+
+void Scheduler::SubmitThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:VkQueueSubmit");
+    while (!stoken.stop_requested()) {
+        SubmitJob job{};
+        submit_queue.PopWait(job, stoken);
+        if (stoken.stop_requested()) {
+            break;
+        }
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = job.info.num_wait_semas,
+            .pWaitSemaphoreValues = job.info.wait_ticks.data(),
+            .signalSemaphoreValueCount = job.info.num_signal_semas,
+            .pSignalSemaphoreValues = job.info.signal_ticks.data(),
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = job.info.num_wait_semas,
+            .pWaitSemaphores = job.info.wait_semas.data(),
+            .pWaitDstStageMask = job.info.wait_stages.data(),
+            .commandBufferCount = 1U,
+            .pCommandBuffers = &job.cmdbuf,
+            .signalSemaphoreCount = job.info.num_signal_semas,
+            .pSignalSemaphores = job.info.signal_semas.data(),
+        };
+        const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+        const u64 wait_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        std::unique_lock lk{instance.GetGraphicsQueueMutex()};
+        const u64 driver_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        master_semaphore.TelemetrySubmit(job.signal_tick);
+        const auto result = [&] {
+            Common::PerformanceTelemetry::ScopedDuration submit_duration{
+                Common::PerformanceTelemetry::Counter::DriverSubmitNs};
+            return instance.GetGraphicsQueue().submit(submit_info, job.info.fence);
+        }();
+        const u64 driver_end = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        lk.unlock();
+        submitted_tick.store(job.signal_tick, std::memory_order_release);
+        submitted_tick.notify_all();
+        if (telemetry_enabled) {
+            Common::PerformanceTelemetry::RecordSubmitTimingEnabled(
+                job.reason, driver_start - wait_start, 0, driver_end - driver_start, 0,
+                driver_end - wait_start);
+        }
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -307,9 +378,16 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info,
                                 Common::PerformanceTelemetry::SubmitReason reason) {
+    if (async_submit) {
+        // TextureManager::Submit uses the same queue directly; submit the previous job first.
+        WaitSubmitted(CurrentTick() - 1);
+    }
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     const u64 wait_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
-    std::unique_lock lk{instance.GetGraphicsQueueMutex()};
+    std::unique_lock lk{instance.GetGraphicsQueueMutex(), std::defer_lock};
+    if (!async_submit) {
+        lk.lock();
+    }
     const u64 lock_acquired = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
     const u64 signal_value = master_semaphore.NextTick();
     const auto submitted_cmdbuf = current_command_buffer_seq;
@@ -355,18 +433,34 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
+    if (async_submit) {
+        lk.lock();
+    }
     ImGui::Core::TextureManager::Submit();
-    master_semaphore.TelemetrySubmit(signal_value);
+    if (async_submit) {
+        lk.unlock();
+    }
     const u64 driver_start = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
-    const auto submit_result = [&] {
-        Common::PerformanceTelemetry::ScopedDuration submit_duration{
-            Common::PerformanceTelemetry::Counter::DriverSubmitNs};
-        return instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    }();
-    const u64 driver_end = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    u64 driver_end = driver_start;
+    if (async_submit) {
+        submit_queue.EmplaceWait(SubmitJob{.info = info,
+                                           .cmdbuf = current_cmdbuf,
+                                           .signal_tick = signal_value,
+                                           .reason = reason});
+    } else {
+        master_semaphore.TelemetrySubmit(signal_value);
+        const auto submit_result = [&] {
+            Common::PerformanceTelemetry::ScopedDuration submit_duration{
+                Common::PerformanceTelemetry::Counter::DriverSubmitNs};
+            return instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        }();
+        driver_end = telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    }
 
-    master_semaphore.Refresh();
+    if (!async_submit) {
+        master_semaphore.Refresh();
+    }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     gpu_profiler->Collect();
 #endif
@@ -376,10 +470,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
     PopPendingOperations();
     if (telemetry_enabled) {
         const u64 post_end = Common::PerformanceTelemetry::Timestamp();
-        lk.unlock();
-        Common::PerformanceTelemetry::RecordSubmitTimingEnabled(
-            reason, lock_acquired - wait_start, driver_start - lock_acquired,
-            driver_end - driver_start, post_end - driver_end, post_end - lock_acquired);
+        if (!async_submit) {
+            lk.unlock();
+            Common::PerformanceTelemetry::RecordSubmitTimingEnabled(
+                reason, lock_acquired - wait_start, driver_start - lock_acquired,
+                driver_end - driver_start, post_end - driver_end, post_end - lock_acquired);
+        }
         Common::PerformanceTelemetry::RecordEnabled(
             Common::PerformanceTelemetry::EventType::VulkanSubmit, static_cast<u64>(reason),
             signal_value);

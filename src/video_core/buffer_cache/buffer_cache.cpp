@@ -91,8 +91,21 @@ struct BufferCache::StreamCopyScratch {
     static constexpr u16 NoCanonicalCopy = std::numeric_limits<u16>::max();
     static_assert(std::has_single_bit(HashTableSize));
 
-    struct CanonicalCopy {
-        StreamCopyRequest request{};
+    struct SourceKey {
+        StreamCopySource type{};
+        u32 size{};
+        u64 address{};
+
+        bool operator==(const SourceKey&) const = default;
+    };
+
+    struct CanonicalSource {
+        SourceKey key{};
+        u64 alignment{1};
+        bool deduplicate{};
+    };
+
+    struct CanonicalPlacement {
         u64 relative_offset{};
         u64 absolute_offset{};
         u32 capture_offset{};
@@ -113,7 +126,8 @@ struct BufferCache::StreamCopyScratch {
         u16 canonical{};
     };
 
-    std::array<CanonicalCopy, MaxStreamCopyRequests> canonical_copies{};
+    std::array<CanonicalSource, MaxStreamCopyRequests> canonical_sources{};
+    std::array<CanonicalPlacement, MaxStreamCopyRequests> canonical_placements{};
     std::array<RequestMap, MaxStreamCopyRequests> request_map{};
     std::array<HashSlot, HashTableSize> hash_table{};
     std::array<Core::MemoryManager::SparseCopyRequest, MaxStreamCopyRequests> guest_copies{};
@@ -228,9 +242,16 @@ struct BufferCache::StreamBatchReuseState {
 struct BufferCache::VertexIndexState {
     static constexpr u16 NoStreamCopy = std::numeric_limits<u16>::max();
 
+    struct BufferToken {
+        BufferId id{};
+        u64 uid{};
+        u64 topology_epoch{};
+    };
+
     struct BufferRange {
         VAddr base_address{};
         VAddr end_address{};
+        BufferToken token{};
         vk::Buffer vk_buffer{};
         Buffer* buffer{};
         u64 offset{};
@@ -254,12 +275,20 @@ struct BufferCache::VertexIndexState {
         bool was_gpu_modified{};
     };
 
-    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
-    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    Vulkan::VertexInputs<BufferRange> ranges;
-    Vulkan::VertexInputs<BufferRange> ranges_merged;
+    struct Plan {
+        Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
+        Vulkan::VertexInputs<BufferRange> ranges_merged;
+        Vulkan::VertexInputs<u16> input_keys;
+        u64 identity{};
+        u32 step_rate_0{};
+        u32 step_rate_1{};
+        bool valid{};
+    };
+    std::array<Plan, 2> plans{};
+    u8 active_plan{};
+    BufferToken index_token{};
     IndexBinding index{};
     bool bind_index_buffer{};
     bool prepared{};
@@ -426,13 +455,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         }
         std::unreachable();
     };
-    const auto equivalent = [&](const StreamCopyRequest& lhs, const StreamCopyRequest& rhs) {
-        return lhs.source_type == rhs.source_type && lhs.size == rhs.size &&
-               source_key(lhs) == source_key(rhs);
-    };
-    const auto hash_request = [&](const StreamCopyRequest& request) {
-        u64 value = source_key(request) ^ (static_cast<u64>(request.size) << 17) ^
-                    (static_cast<u64>(request.source_type) << 61);
+    const auto hash_key = [](const StreamCopyScratch::SourceKey& key) {
+        u64 value = key.address ^ (static_cast<u64>(key.size) << 17) ^
+                    (static_cast<u64>(key.type) << 61);
         value ^= value >> 29;
         value *= 0x9E3779B185EBCA87ULL;
         value ^= value >> 32;
@@ -641,23 +666,29 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             deduplicate_duration{telemetry_enabled};
         for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
             const auto& request = requests[request_index];
+            const StreamCopyScratch::SourceKey key{
+                .type = request.source_type,
+                .size = request.size,
+                .address = source_key(request),
+            };
             auto& mapping = scratch.request_map[request_index];
             mapping = {};
             if (telemetry_staging_sampled) {
                 batch_sample.requested_bytes += request.size;
             }
 
+            const bool hashable = request.deduplicate && key.type != StreamCopySource::Zero;
+            const size_t hash_slot = use_hash && hashable ? hash_key(key) : 0;
             s32 canonical_index = -1;
-            if (request.deduplicate && request.source_type != StreamCopySource::Zero) {
+            if (hashable) {
                 if (use_hash) {
-                    size_t slot_index = hash_request(request);
+                    size_t slot_index = hash_slot;
                     for (size_t probe = 0; probe < StreamCopyScratch::HashTableSize; ++probe) {
                         const auto& slot = scratch.hash_table[slot_index];
                         if (slot.generation != scratch.hash_generation) {
                             break;
                         }
-                        if (equivalent(scratch.canonical_copies[slot.canonical].request,
-                                       request)) {
+                        if (scratch.canonical_sources[slot.canonical].key == key) {
                             canonical_index = slot.canonical;
                             break;
                         }
@@ -666,7 +697,7 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     }
                 } else {
                     for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
-                        if (equivalent(scratch.canonical_copies[candidate].request, request)) {
+                        if (scratch.canonical_sources[candidate].key == key) {
                             canonical_index = candidate;
                             break;
                         }
@@ -678,21 +709,19 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                         ++batch_sample.exact_reuses;
                     }
                 } else {
-                    const u64 request_start = source_key(request);
                     for (u16 candidate = 0; candidate < canonical_count; ++candidate) {
-                        auto& canonical = scratch.canonical_copies[candidate].request;
+                        auto& canonical = scratch.canonical_sources[candidate];
                         if (!canonical.deduplicate ||
-                            canonical.source_type != request.source_type ||
-                            canonical.source_type == StreamCopySource::Zero) {
+                            canonical.key.type != key.type ||
+                            canonical.key.type == StreamCopySource::Zero) {
                             continue;
                         }
-                        const u64 canonical_start = source_key(canonical);
-                        if (request_start < canonical_start) {
+                        if (key.address < canonical.key.address) {
                             continue;
                         }
-                        const u64 source_offset = request_start - canonical_start;
-                        if (source_offset > canonical.size ||
-                            request.size > canonical.size - source_offset ||
+                        const u64 source_offset = key.address - canonical.key.address;
+                        if (source_offset > canonical.key.size ||
+                            key.size > canonical.key.size - source_offset ||
                             source_offset % request.alignment != 0) {
                             continue;
                         }
@@ -709,11 +738,14 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
 
             if (canonical_index < 0) {
                 canonical_index = canonical_count++;
-                auto& canonical = scratch.canonical_copies[canonical_index];
-                canonical = {.request = request, .relative_offset = 0};
-                if (use_hash && request.deduplicate &&
-                    request.source_type != StreamCopySource::Zero) {
-                    size_t slot_index = hash_request(request);
+                scratch.canonical_sources[canonical_index] = {
+                    .key = key,
+                    .alignment = request.alignment,
+                    .deduplicate = request.deduplicate,
+                };
+                scratch.canonical_placements[canonical_index] = {};
+                if (use_hash && hashable) {
+                    size_t slot_index = hash_slot;
                     while (scratch.hash_table[slot_index].generation ==
                            scratch.hash_generation) {
                         slot_index =
@@ -725,7 +757,7 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     };
                 }
             } else {
-                auto& canonical = scratch.canonical_copies[canonical_index].request;
+                auto& canonical = scratch.canonical_sources[canonical_index];
                 canonical.alignment = std::max(canonical.alignment, request.alignment);
             }
             mapping.canonical = static_cast<u16>(canonical_index);
@@ -743,25 +775,25 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
             reuse_duration{telemetry_enabled};
         for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-            auto& canonical = scratch.canonical_copies[canonical_index];
-            const auto& request = canonical.request;
+            const auto& source = scratch.canonical_sources[canonical_index];
+            auto& placement = scratch.canonical_placements[canonical_index];
             if (telemetry_staging_sampled) {
-                batch_sample.canonical_bytes += request.size;
+                batch_sample.canonical_bytes += source.key.size;
             }
-            if (!request.deduplicate || request.source_type != StreamCopySource::Guest ||
-                request.size > CACHING_PAGESIZE) {
+            if (!source.deduplicate || source.key.type != StreamCopySource::Guest ||
+                source.key.size > CACHING_PAGESIZE) {
                 continue;
             }
 
             size_t set_index{};
             size_t way_index{};
-            auto* entry = reuse.Find(request.guest_address, request.size, set_index, way_index);
+            auto* entry = reuse.Find(source.key.address, source.key.size, set_index, way_index);
             if (entry == nullptr || entry->generation != reuse_generation ||
-                entry->tick != reuse_tick || entry->offset % request.alignment != 0) {
+                entry->tick != reuse_tick || entry->offset % source.alignment != 0) {
                 continue;
             }
-            canonical.reuse_set = static_cast<u16>(set_index);
-            canonical.reuse_way = static_cast<u8>(way_index);
+            placement.reuse_set = static_cast<u16>(set_index);
+            placement.reuse_way = static_cast<u8>(way_index);
             if (entry->cooldown != 0) {
                 --entry->cooldown;
                 if (telemetry_staging_sampled) {
@@ -770,25 +802,25 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                 continue;
             }
 
-            canonical.capture_offset = static_cast<u32>(reuse_capture_size);
-            canonical.captured = true;
-            canonical.compare_candidate = entry->shadow_valid;
+            placement.capture_offset = static_cast<u32>(reuse_capture_size);
+            placement.captured = true;
+            placement.compare_candidate = entry->shadow_valid;
             reuse.capture_canonicals[reuse_candidate_count] = canonical_index;
             reuse.capture_copies[reuse_candidate_count++] = {
-                .source = request.guest_address,
+                .source = source.key.address,
                 .destination = reuse.capture.get() + reuse_capture_size,
-                .size = request.size,
+                .size = source.key.size,
             };
-            reuse_capture_size += request.size;
+            reuse_capture_size += source.key.size;
             if (telemetry_staging_sampled) {
                 ++batch_sample.guest_copies;
-                batch_sample.guest_bytes += request.size;
-                if (canonical.compare_candidate) {
+                batch_sample.guest_bytes += source.key.size;
+                if (placement.compare_candidate) {
                     ++batch_sample.reuse_candidates;
-                    batch_sample.reuse_candidate_bytes += request.size;
+                    batch_sample.reuse_candidate_bytes += source.key.size;
                 } else {
                     ++batch_sample.reuse_warmups;
-                    batch_sample.reuse_warmup_bytes += request.size;
+                    batch_sample.reuse_warmup_bytes += source.key.size;
                 }
             }
         }
@@ -802,19 +834,20 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                 reuse_capture_size, telemetry_enabled, telemetry_staging_sampled, false);
         }
         for (u16 candidate = 0; candidate < reuse_candidate_count; ++candidate) {
-            auto& canonical =
-                scratch.canonical_copies[reuse.capture_canonicals[candidate]];
-            auto& entry = reuse.sets[canonical.reuse_set].ways[canonical.reuse_way];
-            const auto size = canonical.request.size;
-            const auto* captured = reuse.capture.get() + canonical.capture_offset;
-            if (!canonical.compare_candidate) {
+            const u16 canonical_index = reuse.capture_canonicals[candidate];
+            const auto& source = scratch.canonical_sources[canonical_index];
+            auto& placement = scratch.canonical_placements[canonical_index];
+            auto& entry = reuse.sets[placement.reuse_set].ways[placement.reuse_way];
+            const auto size = source.key.size;
+            const auto* captured = reuse.capture.get() + placement.capture_offset;
+            if (!placement.compare_candidate) {
                 entry.mismatch_streak = 0;
                 continue;
             }
             if (std::memcmp(captured,
-                            reuse.Shadow(canonical.reuse_set, canonical.reuse_way), size) == 0) {
-                canonical.reused = true;
-                canonical.absolute_offset = entry.offset;
+                            reuse.Shadow(placement.reuse_set, placement.reuse_way), size) == 0) {
+                placement.reused = true;
+                placement.absolute_offset = entry.offset;
                 entry.mismatch_streak = 0;
                 entry.cooldown = 0;
                 ++provisional_reuse_hits;
@@ -837,14 +870,15 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         total_size = 0;
         max_alignment = 1;
         for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-            auto& canonical = scratch.canonical_copies[canonical_index];
-            if (canonical.reused) {
+            const auto& source = scratch.canonical_sources[canonical_index];
+            auto& placement = scratch.canonical_placements[canonical_index];
+            if (placement.reused) {
                 continue;
             }
-            max_alignment = std::max(max_alignment, canonical.request.alignment);
-            total_size = Common::AlignUp(total_size, canonical.request.alignment);
-            canonical.relative_offset = total_size;
-            total_size += canonical.request.size;
+            max_alignment = std::max(max_alignment, source.alignment);
+            total_size = Common::AlignUp(total_size, source.alignment);
+            placement.relative_offset = total_size;
+            total_size += source.key.size;
         }
     };
     u8* destination{};
@@ -867,7 +901,7 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             }
             for (u16 canonical_index = 0; canonical_index < canonical_count;
                  ++canonical_index) {
-                scratch.canonical_copies[canonical_index].reused = false;
+                scratch.canonical_placements[canonical_index].reused = false;
             }
             provisional_reuse_hits = 0;
             provisional_reuse_bytes = 0;
@@ -880,9 +914,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         ValidateStreamCopyDestination(destination);
     }
     for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-        auto& canonical = scratch.canonical_copies[canonical_index];
-        if (!canonical.reused) {
-            canonical.absolute_offset = base_offset + canonical.relative_offset;
+        auto& placement = scratch.canonical_placements[canonical_index];
+        if (!placement.reused) {
+            placement.absolute_offset = base_offset + placement.relative_offset;
         }
     }
 
@@ -897,21 +931,22 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                 Common::PerformanceTelemetry::TimerSite::StagingBatchRequestPrepare>
                 request_prepare_duration{telemetry_enabled};
             for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-                const auto& canonical = scratch.canonical_copies[canonical_index];
-                if (canonical.reused) {
+                const auto& source = scratch.canonical_sources[canonical_index];
+                const auto& placement = scratch.canonical_placements[canonical_index];
+                if (placement.reused) {
                     continue;
                 }
-                const auto size = canonical.request.size;
-                u8* const copy_destination = destination + canonical.relative_offset;
-                switch (canonical.request.source_type) {
+                const auto size = source.key.size;
+                u8* const copy_destination = destination + placement.relative_offset;
+                switch (source.key.type) {
                 case StreamCopySource::Guest:
-                    if (canonical.captured) {
+                    if (placement.captured) {
                         std::memcpy(copy_destination,
-                                    reuse.capture.get() + canonical.capture_offset, size);
+                                    reuse.capture.get() + placement.capture_offset, size);
                     } else {
                         scratch.guest_copies[guest_copy_count++] =
                             Core::MemoryManager::SparseCopyRequest{
-                                .source = canonical.request.guest_address,
+                                .source = source.key.address,
                                 .destination = copy_destination,
                                 .size = size,
                             };
@@ -923,7 +958,10 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     }
                     break;
                 case StreamCopySource::Host:
-                    std::memcpy(copy_destination, canonical.request.host_address, size);
+                    std::memcpy(copy_destination,
+                                reinterpret_cast<const u8*>(
+                                    static_cast<uintptr_t>(source.key.address)),
+                                size);
                     if (telemetry_staging_sampled) {
                         ++batch_sample.host_copies;
                         batch_sample.host_bytes += size;
@@ -955,32 +993,31 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     const u64 committed_generation = transient_read_buffer.Generation();
     const u64 committed_tick = scheduler.CurrentTick();
     for (u16 canonical_index = 0; canonical_index < canonical_count; ++canonical_index) {
-        const auto& canonical = scratch.canonical_copies[canonical_index];
-        const auto& request = canonical.request;
-        if (canonical.reused || !request.deduplicate ||
-            request.source_type != StreamCopySource::Guest ||
-            request.size > CACHING_PAGESIZE) {
+        const auto& source = scratch.canonical_sources[canonical_index];
+        const auto& placement = scratch.canonical_placements[canonical_index];
+        if (placement.reused || !source.deduplicate || source.key.type != StreamCopySource::Guest ||
+            source.key.size > CACHING_PAGESIZE) {
             continue;
         }
 
         StreamBatchReuseState::Entry* entry{};
-        if (canonical.reuse_way != StreamBatchReuseState::NoWay) {
-            entry = &reuse.sets[canonical.reuse_set].ways[canonical.reuse_way];
+        if (placement.reuse_way != StreamBatchReuseState::NoWay) {
+            entry = &reuse.sets[placement.reuse_set].ways[placement.reuse_way];
         } else {
-            entry = &reuse.Select(request.guest_address, request.size);
+            entry = &reuse.Select(source.key.address, source.key.size);
             entry->mismatch_streak = 0;
             entry->cooldown = 0;
         }
-        entry->address = request.guest_address;
+        entry->address = source.key.address;
         entry->generation = committed_generation;
         entry->tick = committed_tick;
-        entry->size = static_cast<u32>(request.size);
-        entry->offset = static_cast<u32>(canonical.absolute_offset);
-        entry->shadow_valid = canonical.captured;
+        entry->size = source.key.size;
+        entry->offset = static_cast<u32>(placement.absolute_offset);
+        entry->shadow_valid = placement.captured;
         entry->valid = true;
-        if (canonical.captured) {
-            std::memcpy(reuse.Shadow(canonical.reuse_set, canonical.reuse_way),
-                        reuse.capture.get() + canonical.capture_offset, request.size);
+        if (placement.captured) {
+            std::memcpy(reuse.Shadow(placement.reuse_set, placement.reuse_way),
+                        reuse.capture.get() + placement.capture_offset, source.key.size);
         }
     }
 
@@ -993,10 +1030,10 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
             if (mapping.canonical == StreamCopyScratch::NoCanonicalCopy) [[unlikely]] {
                 ValidateStreamCopyMapping(mapping.canonical, StreamCopyScratch::NoCanonicalCopy);
             }
-            const auto& canonical = scratch.canonical_copies[mapping.canonical];
+            const auto& placement = scratch.canonical_placements[mapping.canonical];
             results[request_index] = {
                 .buffer = &transient_read_buffer,
-                .offset = canonical.absolute_offset + mapping.source_offset,
+                .offset = placement.absolute_offset + mapping.source_offset,
             };
         }
     }
@@ -1121,62 +1158,122 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
     auto& state = *vertex_index_state;
     const auto& regs = liverpool->regs;
 
-    state.attributes.clear();
-    state.bindings.clear();
-    state.divisors.clear();
-    state.guest_buffers.clear();
-    state.ranges.clear();
-    state.ranges_merged.clear();
     state.index = {};
     state.bind_index_buffer = bind_index_buffer;
     state.prepared = true;
 
-    pipeline.GetVertexInputs(state.attributes, state.bindings, state.divisors, state.guest_buffers,
-                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
-
-    for (u32 binding_index = 0; binding_index < state.guest_buffers.size(); ++binding_index) {
-        const auto& buffer = state.guest_buffers[binding_index];
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            state.ranges.emplace_back(VertexIndexState::BufferRange{
-                .base_address = buffer.base_address,
-                .end_address = buffer.base_address + buffer.GetSize(),
-                .binding_mask = 1U << binding_index,
-            });
+    const auto vertex_buffers = pipeline.GetVertexBuffers();
+    const bool dynamic_input = instance.IsVertexInputDynamicState();
+    const auto matches_plan = [&](const VertexIndexState::Plan& plan) {
+        if (!plan.valid || plan.step_rate_0 != regs.vgt_instance_step_rate_0 ||
+            plan.step_rate_1 != regs.vgt_instance_step_rate_1 ||
+            !std::ranges::equal(vertex_buffers, plan.guest_buffers)) {
+            return false;
+        }
+        if (plan.identity == pipeline.VertexPlanIdentity() || !dynamic_input) {
+            return true;
+        }
+        const auto& fetch = pipeline.GetFetchShader();
+        if (!fetch) {
+            return plan.input_keys.empty();
+        }
+        const auto& attributes = fetch->attributes;
+        if (attributes.size() != plan.input_keys.size()) {
+            return false;
+        }
+        for (u32 i = 0; i < attributes.size(); ++i) {
+            const u16 key = static_cast<u16>(attributes[i].semantic) |
+                            (static_cast<u16>(attributes[i].GetStepRate()) << 8);
+            if (plan.input_keys[i] != key) {
+                return false;
+            }
+        }
+        return true;
+    };
+    u8 selected_plan = state.active_plan;
+    bool hit = matches_plan(state.plans[selected_plan]);
+    if (!hit) {
+        const u8 other_plan = selected_plan ^ 1;
+        if (matches_plan(state.plans[other_plan])) {
+            selected_plan = other_plan;
+            hit = true;
+        } else if (state.plans[selected_plan].valid) {
+            selected_plan = other_plan;
         }
     }
-
-    if (!state.ranges.empty()) {
-        const auto less_by_address = [](const auto& lhs, const auto& rhs) {
-            return lhs.base_address < rhs.base_address;
-        };
-        if (state.ranges.size() <= 8) {
-            for (u32 range_index = 1; range_index < state.ranges.size(); ++range_index) {
-                auto range = state.ranges[range_index];
-                u32 insert_index = range_index;
-                while (insert_index != 0 &&
-                       less_by_address(range, state.ranges[insert_index - 1])) {
-                    state.ranges[insert_index] = state.ranges[insert_index - 1];
-                    --insert_index;
+    auto& plan = state.plans[selected_plan];
+    state.active_plan = selected_plan;
+    if (!hit) {
+        plan.attributes.clear();
+        plan.bindings.clear();
+        plan.guest_buffers.clear();
+        plan.ranges_merged.clear();
+        plan.input_keys.clear();
+        if (dynamic_input) {
+            Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> unused_divisors;
+            pipeline.GetVertexInputs(plan.attributes, plan.bindings, unused_divisors,
+                                     plan.guest_buffers, regs.vgt_instance_step_rate_0,
+                                     regs.vgt_instance_step_rate_1);
+            if (const auto& fetch = pipeline.GetFetchShader()) {
+                for (const auto& attribute : fetch->attributes) {
+                    plan.input_keys.push_back(static_cast<u16>(attribute.semantic) |
+                                              (static_cast<u16>(attribute.GetStepRate()) << 8));
                 }
-                state.ranges[insert_index] = range;
             }
         } else {
-            std::ranges::sort(state.ranges, less_by_address);
+            plan.guest_buffers.assign(vertex_buffers.begin(), vertex_buffers.end());
         }
-        state.ranges_merged.emplace_back(state.ranges.front());
-        for (u32 range_index = 1; range_index < state.ranges.size(); ++range_index) {
-            const auto& range = state.ranges[range_index];
-            auto& previous = state.ranges_merged.back();
-            if (previous.end_address < range.base_address) {
-                state.ranges_merged.emplace_back(range);
-            } else {
-                previous.end_address = std::max(previous.end_address, range.end_address);
-                previous.binding_mask |= range.binding_mask;
+
+        Vulkan::VertexInputs<VertexIndexState::BufferRange> ranges;
+        for (u32 binding_index = 0; binding_index < plan.guest_buffers.size(); ++binding_index) {
+            const auto& buffer = plan.guest_buffers[binding_index];
+            if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+                ranges.emplace_back(VertexIndexState::BufferRange{
+                    .base_address = buffer.base_address,
+                    .end_address = buffer.base_address + buffer.GetSize(),
+                    .binding_mask = 1U << binding_index,
+                });
             }
         }
+
+        if (!ranges.empty()) {
+            const auto less_by_address = [](const auto& lhs, const auto& rhs) {
+                return lhs.base_address < rhs.base_address;
+            };
+            if (ranges.size() <= 8) {
+                for (u32 range_index = 1; range_index < ranges.size(); ++range_index) {
+                    auto range = ranges[range_index];
+                    u32 insert_index = range_index;
+                    while (insert_index != 0 &&
+                           less_by_address(range, ranges[insert_index - 1])) {
+                        ranges[insert_index] = ranges[insert_index - 1];
+                        --insert_index;
+                    }
+                    ranges[insert_index] = range;
+                }
+            } else {
+                std::ranges::sort(ranges, less_by_address);
+            }
+            plan.ranges_merged.emplace_back(ranges.front());
+            for (u32 range_index = 1; range_index < ranges.size(); ++range_index) {
+                const auto& range = ranges[range_index];
+                auto& previous = plan.ranges_merged.back();
+                if (previous.end_address < range.base_address) {
+                    plan.ranges_merged.emplace_back(range);
+                } else {
+                    previous.end_address = std::max(previous.end_address, range.end_address);
+                    previous.binding_mask |= range.binding_mask;
+                }
+            }
+        }
+        plan.identity = pipeline.VertexPlanIdentity();
+        plan.step_rate_0 = regs.vgt_instance_step_rate_0;
+        plan.step_rate_1 = regs.vgt_instance_step_rate_1;
+        plan.valid = true;
     }
 
-    for (auto& range : state.ranges_merged) {
+    for (auto& range : plan.ranges_merged) {
+        range.stream_index = VertexIndexState::NoStreamCopy;
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (size > std::numeric_limits<u32>::max()) [[unlikely]] {
             ValidateVertexRangeSize(size);
@@ -1217,18 +1314,31 @@ void BufferCache::PrepareVertexIndexBuffers(const Vulkan::GraphicsPipeline& pipe
 void BufferCache::FinalizeVertexIndexBuffers(
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     auto& state = *vertex_index_state;
+    auto& plan = state.plans[state.active_plan];
     if (!state.prepared || !stream_copy_finalized) [[unlikely]] {
         ValidateVertexIndexState(state.prepared, stream_copy_finalized);
     }
 
-    for (auto& range : state.ranges_merged) {
+    const auto resolve_token = [&](VertexIndexState::BufferToken& token, VAddr address, u32 size) {
+        if (token.topology_epoch != TopologyEpoch() ||
+            pending_image_readback_ranges.Contains(address, size) ||
+            !IsBufferCacheEntryValid(token.id, token.uid, address, size)) {
+            token.id = FindBuffer(address, size);
+            token.uid = GetBufferUid(token.id);
+            token.topology_epoch = TopologyEpoch();
+        }
+        return token.id;
+    };
+
+    for (auto& range : plan.ranges_merged) {
         if (range.stream_index != VertexIndexState::NoStreamCopy) {
             const auto& result = GetStreamCopyResult(range.stream_index);
             range.buffer = result.buffer;
             range.vk_buffer = result.buffer->Handle();
             range.offset = result.offset;
         } else {
-            const BufferId buffer_id = FindBuffer(range.base_address, range.size);
+            const BufferId buffer_id =
+                resolve_token(range.token, range.base_address, range.size);
             range.buffer = &slot_buffers[buffer_id];
             SynchronizeBuffer(*range.buffer, range.base_address, range.size, false, false);
             range.vk_buffer = range.buffer->Handle();
@@ -1257,7 +1367,8 @@ void BufferCache::FinalizeVertexIndexBuffers(
             index.buffer = result.buffer;
             index.offset = result.offset;
         } else {
-            const BufferId buffer_id = FindBuffer(index.address, index.size);
+            const BufferId buffer_id =
+                resolve_token(state.index_token, index.address, index.size);
             index.buffer = &slot_buffers[buffer_id];
             SynchronizeBuffer(*index.buffer, index.address, index.size, false, false);
             index.offset = index.buffer->Offset(index.address);
@@ -1319,37 +1430,37 @@ void BufferCache::FinalizeVertexIndexBuffers(
     const auto cmdbuf = scheduler.CommandBuffer();
     if (instance.IsVertexInputDynamicState() &&
         (!state.vertex_input_valid ||
-         !attributes_equal(state.attributes, state.emitted_attributes,
+         !attributes_equal(plan.attributes, state.emitted_attributes,
                            state.emitted_attribute_count) ||
-         !bindings_equal(state.bindings, state.emitted_bindings, state.emitted_binding_count))) {
-        cmdbuf.setVertexInputEXT(state.bindings, state.attributes);
-        state.emitted_attribute_count = static_cast<u32>(state.attributes.size());
-        state.emitted_binding_count = static_cast<u32>(state.bindings.size());
-        std::ranges::copy(state.attributes, state.emitted_attributes.begin());
-        std::ranges::copy(state.bindings, state.emitted_bindings.begin());
+         !bindings_equal(plan.bindings, state.emitted_bindings, state.emitted_binding_count))) {
+        cmdbuf.setVertexInputEXT(plan.bindings, plan.attributes);
+        state.emitted_attribute_count = static_cast<u32>(plan.attributes.size());
+        state.emitted_binding_count = static_cast<u32>(plan.bindings.size());
+        std::ranges::copy(plan.attributes, state.emitted_attributes.begin());
+        std::ranges::copy(plan.bindings, state.emitted_bindings.begin());
         state.vertex_input_valid = true;
     }
 
-    if (!state.bindings.empty()) {
-        const u32 num_buffers = static_cast<u32>(state.guest_buffers.size());
+    if (!plan.guest_buffers.empty()) {
+        const u32 num_buffers = static_cast<u32>(plan.guest_buffers.size());
         auto& host_buffers = state.host_buffers;
         auto& host_offsets = state.host_offsets;
         auto& host_sizes = state.host_sizes;
         auto& host_strides = state.host_strides;
         for (u32 i = 0; i < num_buffers; ++i) {
-            const auto& buffer = state.guest_buffers[i];
+            const auto& buffer = plan.guest_buffers[i];
             host_buffers[i] = VK_NULL_HANDLE;
             host_offsets[i] = 0;
             host_sizes[i] = buffer.GetSize();
             host_strides[i] = buffer.GetStride();
         }
 
-        for (const auto& range : state.ranges_merged) {
+        for (const auto& range : plan.ranges_merged) {
             u32 binding_mask = range.binding_mask;
             while (binding_mask != 0) {
                 const u32 binding_index = std::countr_zero(binding_mask);
                 binding_mask &= binding_mask - 1;
-                const auto& buffer = state.guest_buffers[binding_index];
+                const auto& buffer = plan.guest_buffers[binding_index];
                 host_buffers[binding_index] = range.vk_buffer;
                 host_offsets[binding_index] =
                     range.offset + buffer.base_address - range.base_address;

@@ -198,7 +198,7 @@ public:
     [[nodiscard]] ImageId FindImageContainingRange(VAddr address, size_t size);
 
     /// Retrieves an image view with the properties of the specified image id.
-    void PrepareTexture(ImageId image_id, const ImageDesc& desc, bool is_compute = false);
+    void PrepareTexture(ImageId image_id, BindingType type);
 
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 

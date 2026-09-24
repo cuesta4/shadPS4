@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
+#include <type_traits>
+#include <utility>
 
 #include <immintrin.h>
 
@@ -310,6 +314,55 @@ static SHAD_NO_INLINE void SetMultipleViewportScissorState(
     dynamic_state.SetScissors(scissors);
 }
 
+template <typename... Fields>
+[[nodiscard]] static auto CaptureDynamicInputs(const Fields&... fields) {
+    static_assert((std::is_trivially_copyable_v<Fields> && ...));
+    static_assert(((sizeof(Fields) % sizeof(u32) == 0) && ...));
+    std::array<u32, (... + sizeof(Fields)) / sizeof(u32)> values{};
+    u32* output = values.data();
+    ((std::memcpy(output, &fields, sizeof(Fields)), output += sizeof(Fields) / sizeof(u32)), ...);
+    return values;
+}
+
+[[nodiscard]] static auto CaptureViewportInputs(const AmdGpu::Regs& regs) {
+    return CaptureDynamicInputs(
+        regs.screen_scissor, regs.window_scissor, regs.generic_scissor, regs.window_offset,
+        regs.viewport_scissors, regs.viewports, regs.viewport_control, regs.mode_control,
+        regs.clipper_control, regs.primitive_type, regs.polygon_control);
+}
+
+[[nodiscard]] static auto CaptureDepthStencilInputs(const AmdGpu::Regs& regs) {
+    return CaptureDynamicInputs(
+        regs.depth_control, regs.depth_render_control, regs.depth_render_override,
+        regs.depth_buffer, regs.depth_bounds_min, regs.depth_bounds_max, regs.polygon_control,
+        regs.poly_offset, regs.stencil_control, regs.stencil_ref_front, regs.stencil_ref_back);
+}
+
+[[nodiscard]] static auto CapturePrimitiveInputs(const AmdGpu::Regs& regs) {
+    return CaptureDynamicInputs(regs.enable_primitive_restart, regs.primitive_type,
+                                regs.primitive_restart_index, regs.polygon_control,
+                                regs.clipper_control);
+}
+
+[[nodiscard]] static auto CaptureRasterizationInputs(const AmdGpu::Regs& regs) {
+    return CaptureDynamicInputs(regs.line_control);
+}
+
+[[nodiscard]] static auto CaptureBlendInputs(const AmdGpu::Regs& regs,
+                                             const GraphicsPipeline& pipeline) {
+    return CaptureDynamicInputs(regs.blend_constants, pipeline.GetGraphicsKey().write_masks);
+}
+
+struct Rasterizer::DynamicStateInputCache {
+    decltype(CaptureViewportInputs(std::declval<const AmdGpu::Regs&>())) viewport{};
+    decltype(CaptureDepthStencilInputs(std::declval<const AmdGpu::Regs&>())) depth_stencil{};
+    decltype(CapturePrimitiveInputs(std::declval<const AmdGpu::Regs&>())) primitive{};
+    decltype(CaptureRasterizationInputs(std::declval<const AmdGpu::Regs&>())) rasterization{};
+    decltype(CaptureBlendInputs(std::declval<const AmdGpu::Regs&>(),
+                                std::declval<const GraphicsPipeline&>())) blend{};
+    bool valid{};
+};
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -317,6 +370,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool} {
+    dynamic_state_inputs = std::make_unique<DynamicStateInputCache>();
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -616,6 +670,10 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    static_assert(std::is_trivially_copyable_v<AmdGpu::ColorBuffer>);
+    static_assert(std::is_trivially_copyable_v<AmdGpu::DepthBuffer>);
+    static_assert(std::is_trivially_copyable_v<AmdGpu::DepthView>);
+    static_assert(std::is_trivially_copyable_v<AmdGpu::DepthControl>);
     Common::PerformanceTelemetry::SampledDuration<
         Common::PerformanceTelemetry::TimerSite::RenderPrepare>
         duration{telemetry_enabled};
@@ -637,17 +695,35 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        {
+        auto& cached = cached_color_targets[cb];
+        const bool same_desc = cached.image_id && cached.hint == hint.raw &&
+                               std::memcmp(&cached.buffer, &col_buf, sizeof(col_buf)) == 0;
+        if (!same_desc) {
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::RenderImageDesc>
                 desc_duration{telemetry_enabled};
             std::construct_at(&desc, col_buf, hint);
+            std::memcpy(&cached.buffer, &col_buf, sizeof(col_buf));
+            cached.hint = hint.raw;
+        }
+        if (!same_desc || !texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
+                                                       cached.topology_epoch)) {
+            if (same_desc) {
+                desc.view_info = VideoCore::ImageViewInfo{col_buf};
+            }
+            image_id = texture_cache.FindImage(desc);
+            const auto& image = texture_cache.GetImage(image_id);
+            cached.image_id = image_id;
+            cached.image_uid = image.image_uid;
+            cached.topology_epoch = texture_cache.TopologyEpoch();
+        } else {
+            image_id = cached.image_id;
         }
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::RenderColorAttachments, 1);
         }
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -657,18 +733,44 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        {
+        auto& cached = cached_depth_target;
+        const bool same_desc =
+            cached.image_id && cached.hint == hint.raw &&
+            cached.htile_address == htile_address &&
+            std::memcmp(&cached.buffer, &regs.depth_buffer, sizeof(cached.buffer)) == 0 &&
+            std::memcmp(&cached.view, &regs.depth_view, sizeof(cached.view)) == 0 &&
+            std::memcmp(&cached.control, &regs.depth_control, sizeof(cached.control)) == 0;
+        if (!same_desc) {
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::RenderImageDesc>
                 desc_duration{telemetry_enabled};
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
+            std::memcpy(&cached.buffer, &regs.depth_buffer, sizeof(cached.buffer));
+            std::memcpy(&cached.view, &regs.depth_view, sizeof(cached.view));
+            std::memcpy(&cached.control, &regs.depth_control, sizeof(cached.control));
+            cached.htile_address = htile_address;
+            cached.hint = hint.raw;
+        }
+        if (!same_desc || !texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
+                                                       cached.topology_epoch)) {
+            if (same_desc) {
+                desc.view_info =
+                    VideoCore::ImageViewInfo{regs.depth_buffer, regs.depth_view, regs.depth_control};
+            }
+            image_id = texture_cache.FindImage(desc);
+            const auto& image = texture_cache.GetImage(image_id);
+            cached.image_id = image_id;
+            cached.image_uid = image.image_uid;
+            cached.topology_epoch = texture_cache.TopologyEpoch();
+        } else {
+            image_id = cached.image_id;
         }
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::RenderDepthAttachments, 1);
         }
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        bound_images.emplace_back(image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -986,6 +1088,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
     pending_buffer_bindings.clear();
+    stream_buffer_bindings.clear();
     potential_write_images.clear();
 
     bool uses_dma = false;
@@ -1014,8 +1117,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DescriptorBuffers>
                 buffer_duration{telemetry_enabled};
+            const u32 first_binding = static_cast<u32>(pending_buffer_bindings.size());
             PrepareBuffers(*stage, binding);
-            FinalizeBuffers(push_data, false);
+            FinalizeBuffers(push_data, false, first_binding);
         }
         {
             Common::PerformanceTelemetry::SampledDuration<
@@ -1585,6 +1689,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
                         .size = static_cast<u32>(size),
                         .alignment = alignment,
                     });
+                stream_buffer_bindings.push_back(static_cast<u8>(pending_buffer_bindings.size() - 1));
                 continue;
             }
 
@@ -1595,7 +1700,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
             }
 
             const bool cache_hit =
-                cached.valid && cached.sharp == vsharp && cached.size == size &&
+                cached.valid && cached.address == vsharp.base_address && cached.size == size &&
                 cached.topology_epoch == buffer_cache.TopologyEpoch() &&
                 buffer_cache.IsBufferCacheEntryValid(cached.buffer_id, cached.buffer_uid,
                                                      vsharp.base_address, size);
@@ -1612,7 +1717,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
 
             pending.buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             cached.topology_epoch = buffer_cache.TopologyEpoch();
-            cached.sharp = vsharp;
+            cached.address = vsharp.base_address;
             cached.buffer_id = pending.buffer_id;
             cached.buffer_uid = buffer_cache.GetBufferUid(pending.buffer_id);
             cached.size = size;
@@ -1631,6 +1736,7 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
                         .size = static_cast<u32>(pending.size),
                         .alignment = alignment,
                     });
+                stream_buffer_bindings.push_back(static_cast<u8>(pending_buffer_bindings.size() - 1));
             }
             continue;
         }
@@ -1648,22 +1754,17 @@ void Rasterizer::PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bind
                         .alignment = alignment,
                         .deduplicate = false,
                     });
+                stream_buffer_bindings.push_back(static_cast<u8>(pending_buffer_bindings.size() - 1));
             }
         }
     }
 }
 
-void Rasterizer::FinalizeBuffers(Shader::PushData& push_data, bool stream_only) {
+void Rasterizer::FinalizeBuffers(Shader::PushData& push_data, bool stream_only, u32 first_binding) {
     static constexpr u16 NoStreamCopy = std::numeric_limits<u16>::max();
 
-    for (auto& pending : pending_buffer_bindings) {
-        if (pending.finalized) {
-            continue;
-        }
+    const auto finalize = [&](PendingBufferBinding& pending) {
         const bool uses_stream = pending.stream_index != NoStreamCopy;
-        if (uses_stream != stream_only) {
-            continue;
-        }
 
         const auto& desc = *pending.desc;
         const auto& vsharp = pending.sharp;
@@ -1748,11 +1849,37 @@ void Rasterizer::FinalizeBuffers(Shader::PushData& push_data, bool stream_only) 
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
-        pending.finalized = true;
+    };
+    if (stream_only) {
+        for (const u8 index : stream_buffer_bindings) {
+            finalize(pending_buffer_bindings[index]);
+        }
+    } else {
+        for (u32 index = first_binding; index < pending_buffer_bindings.size(); ++index) {
+            auto& pending = pending_buffer_bindings[index];
+            if (pending.stream_index == NoStreamCopy) {
+                finalize(pending);
+            }
+        }
     }
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    using ImageDesc = VideoCore::TextureCache::ImageDesc;
+    using MipFallback = Shader::MipStorageFallbackMode;
+    const auto select_mip = [](ImageDesc& desc, const Shader::ImageResource& resource,
+                               u32 mip_index, u32 num_bindings) {
+        if (resource.mip_fallback_mode == MipFallback::ConstantIndex) {
+            if (num_bindings != 1) [[unlikely]] {
+                ValidateSingleImageBinding(num_bindings);
+            }
+            desc.view_info.range.base.level += resource.constant_mip_index;
+            desc.view_info.range.extent.levels = 1;
+        } else if (resource.mip_fallback_mode == MipFallback::DynamicIndex) {
+            desc.view_info.range.base.level += mip_index;
+            desc.view_info.range.extent.levels = 1;
+        }
+    };
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     const u32 stage_index = static_cast<u32>(stage.l_stage);
@@ -1764,6 +1891,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
         const auto tsharp = GetResolvedImage(stage, image_index);
+        const u8 geometry_key = static_cast<u8>(image_desc.is_depth) |
+                                (static_cast<u8>(image_desc.is_array) << 1) |
+                                (static_cast<u8>(image_desc.is_written) << 2);
+        const u64 resource_key = static_cast<u64>(geometry_key) |
+                                 (static_cast<u64>(image_desc.mip_fallback_mode) << 3) |
+                                 (static_cast<u64>(image_desc.constant_mip_index) << 8);
 #ifdef _DEBUG
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
@@ -1774,7 +1907,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto num_fmt = tsharp.GetNumberFmt();
         const u32 cache_index = image_bindings.size();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            image_bindings.emplace_back(ImageBindingInfo{
+                .source_index = static_cast<u8>(image_index),
+                .is_storage = image_desc.is_written,
+            });
             if (cache_index < Shader::NUM_IMAGES) {
                 auto& cached = cached_image_bindings[stage_index][cache_index];
                 cached.valid = false;
@@ -1791,7 +1927,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            image_bindings.emplace_back(ImageBindingInfo{
+                .source_index = static_cast<u8>(image_index),
+                .is_storage = image_desc.is_written,
+            });
             if (cache_index < Shader::NUM_IMAGES) {
                 auto& cached = cached_image_bindings[stage_index][cache_index];
                 cached.valid = false;
@@ -1801,8 +1940,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
-        const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(tsharp);
+        std::optional<ImageDesc> miss_desc;
+        VideoCore::ImageViewInfo base_view;
 
         for (u32 i = 0; i < num_bindings; ++i) {
             const u32 cache_index = image_bindings.size();
@@ -1816,7 +1956,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 cached.owner = &stage;
             }
 
-            const bool cache_hit = cached.valid &&
+            const bool cache_hit = cached.valid && cached.resource_key == resource_key &&
+                                   cached.source_index == image_index && cached.mip_index == i &&
                                    std::memcmp(&cached.sharp, &tsharp, sizeof(tsharp)) == 0 &&
                                    cached.topology_epoch == texture_cache.TopologyEpoch() &&
                                    texture_cache.TryReuseImage(cached.image_id, cached.image_uid,
@@ -1829,38 +1970,62 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             if (cache_hit) {
-                image_bindings.emplace_back(cached.image_id, cached.resolved_desc);
+                image_bindings.emplace_back(ImageBindingInfo{
+                    .image_id = cached.image_id,
+                    .view_info = cached.view_info,
+                    .source_index = static_cast<u8>(image_index),
+                    .mip_index = static_cast<u8>(i),
+                    .is_storage = image_desc.is_written,
+                });
             } else {
-                auto& [image_id, desc] = image_bindings.emplace_back(
-                    std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
-                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                    if (num_bindings != 1) [[unlikely]] {
-                        ValidateSingleImageBinding(num_bindings);
+                if (!miss_desc) {
+                    auto& description = cached_image_descriptions[stage_index][image_index];
+                    const bool same_geometry =
+                        description.base_desc && description.owner == &stage &&
+                        description.geometry_key == geometry_key &&
+                        std::memcmp(&description.sharp, &tsharp, sizeof(tsharp)) == 0;
+                    if (!same_geometry) {
+                        if (!description.base_desc) {
+                            description.base_desc = std::make_unique<ImageDesc>(tsharp, image_desc);
+                        } else {
+                            *description.base_desc = ImageDesc{tsharp, image_desc};
+                        }
+                        description.owner = &stage;
+                        description.sharp = tsharp;
+                        description.geometry_key = geometry_key;
                     }
-                    desc.view_info.range.base.level += image_desc.constant_mip_index;
-                    desc.view_info.range.extent.levels = 1;
-                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                    desc.view_info.range.base.level += i;
-                    desc.view_info.range.extent.levels = 1;
+                    miss_desc.emplace(*description.base_desc);
+                    base_view = miss_desc->view_info;
                 }
-                image_id = texture_cache.FindImage(desc);
+                miss_desc->view_info = base_view;
+                select_mip(*miss_desc, image_desc, i, num_bindings);
+                const auto image_id = texture_cache.FindImage(*miss_desc);
+                image_bindings.emplace_back(ImageBindingInfo{
+                    .image_id = image_id,
+                    .view_info = miss_desc->view_info,
+                    .source_index = static_cast<u8>(image_index),
+                    .mip_index = static_cast<u8>(i),
+                    .is_storage = image_desc.is_written,
+                });
             }
 
-            auto& [image_id, desc] = image_bindings.back();
-            const bool cache_needs_update = !cache_hit;
-            auto* image = &texture_cache.GetImage(image_id);
-            if (cache_needs_update) {
+            auto& image_binding = image_bindings.back();
+            auto* image = &texture_cache.GetImage(image_binding.image_id);
+            if (!cache_hit) {
                 cached.sharp = tsharp;
-                cached.image_id = image_id;
+                cached.resource_key = resource_key;
+                cached.source_index = static_cast<u8>(image_index);
+                cached.mip_index = static_cast<u8>(i);
+                cached.image_id = image_binding.image_id;
                 cached.image_uid = image->image_uid;
                 cached.topology_epoch = texture_cache.TopologyEpoch();
-                cached.resolved_desc = desc;
+                cached.view_info = image_binding.view_info;
                 cached.valid = true;
             }
 
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-                image_id = depth_image_id;
-                image = &texture_cache.GetImage(image_id);
+                image_binding.image_id = depth_image_id;
+                image = &texture_cache.GetImage(depth_image_id);
             }
             if (image->binding.is_bound) {
                 image->binding.force_general |= image_desc.is_written;
@@ -1872,9 +2037,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     u32 texture_binding_index = 0;
-    for (auto& [image_id, desc] : image_bindings) {
+    for (auto& image_binding : image_bindings) {
+        auto& image_id = image_binding.image_id;
+        auto& view_info = image_binding.view_info;
         auto& cached_view = cached_texture_views[stage_index][texture_binding_index++];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage = image_binding.is_storage;
         if (!image_id) {
             cached_view.valid = false;
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -1882,7 +2049,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
+                const auto& description =
+                    cached_image_descriptions[stage_index][image_binding.source_index];
+                ASSERT(description.base_desc);
+                ImageDesc desc = *description.base_desc;
+                desc.view_info = view_info;
                 image_id = texture_cache.FindImage(desc);
+                view_info = desc.view_info;
                 cached_view.valid = false;
             }
 
@@ -1896,18 +2069,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (True(image.flags & VideoCore::ImageFlagBits::GpuModified) || image.usage.render_target || image.usage.depth_target) {
                 Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::RenderTargetSampledAsTexture);
             }
-            texture_cache.PrepareTexture(image_id, desc, stage.l_stage == Shader::LogicalStage::Compute);
+            texture_cache.PrepareTexture(
+                image_id, is_storage ? VideoCore::TextureCache::BindingType::Storage
+                                     : VideoCore::TextureCache::BindingType::Texture);
             const u64 topology_epoch = texture_cache.TopologyEpoch();
             const bool view_cache_hit = cached_view.valid && cached_view.image_id == image_id &&
                                         cached_view.image_uid == image.image_uid &&
                                         cached_view.topology_epoch == topology_epoch &&
                                         cached_view.backing_image == image.GetImage() &&
-                                        cached_view.info == desc.view_info;
+                                        cached_view.info == view_info;
             vk::ImageView image_view_handle{};
             if (view_cache_hit) {
                 image_view_handle = cached_view.image_view;
             } else {
-                auto& image_view = image.FindView(desc.view_info);
+                auto& image_view = image.FindView(view_info);
                 image_view_handle = *image_view.image_view;
                 cached_view = {
                     .image_id = image_id,
@@ -1935,12 +2110,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             } else if (is_storage) {
                 image.Transit(vk::ImageLayout::eGeneral,
                               vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                              desc.view_info.range);
+                              view_info.range);
             } else {
                 const auto new_layout = image.info.props.is_depth
                                             ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                             : vk::ImageLayout::eShaderReadOnlyOptimal;
-                image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead, view_info.range);
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
@@ -1953,8 +2128,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage = image_bindings[image_binding_idx].is_storage;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -2016,6 +2190,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             }
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
+            auto& cached = cached_color_targets[cb];
+            cached.image_id = image_id;
+            cached.image_uid = image->image_uid;
+            cached.topology_epoch = texture_cache.TopologyEpoch();
             cached_color_target_views[cb].valid = false;
         }
         texture_cache.UpdateImage(image_id);
@@ -2434,50 +2612,74 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         Common::PerformanceTelemetry::TimerSite::DynamicTotal>
         total_duration{telemetry_enabled};
     const u64 generation = liverpool->GraphicsStateGeneration();
+    const bool registers_changed = dynamic_state_generation != generation;
+    const bool indexed_changed = dynamic_state_indexed != is_indexed;
+    const bool feedback_changed = dynamic_state_feedback_loop != attachment_feedback_loop;
     const u32 reason_mask =
-        static_cast<u32>(dynamic_state_generation != generation) |
+        static_cast<u32>(registers_changed) |
         (static_cast<u32>(dynamic_state_pipeline != pipeline) << 1) |
-        (static_cast<u32>(dynamic_state_indexed != is_indexed) << 2) |
-        (static_cast<u32>(dynamic_state_feedback_loop != attachment_feedback_loop) << 3);
+        (static_cast<u32>(indexed_changed) << 2) |
+        (static_cast<u32>(feedback_changed) << 3);
     if (telemetry_enabled) {
         Common::PerformanceTelemetry::RecordDynamicStateDecisionEnabled(reason_mask);
     }
-    if (reason_mask != 0) [[unlikely]] {
-        {
+    auto& inputs = *dynamic_state_inputs;
+    const bool first_draw = !inputs.valid;
+    bool primitive_changed = first_draw || indexed_changed;
+    if (registers_changed || first_draw) {
+        const auto viewport = CaptureViewportInputs(liverpool->regs);
+        if (first_draw || viewport != inputs.viewport) {
+            inputs.viewport = viewport;
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DynamicViewport>
                 duration{telemetry_enabled};
             UpdateViewportScissorState();
         }
-        {
+
+        const auto depth_stencil = CaptureDepthStencilInputs(liverpool->regs);
+        if (first_draw || depth_stencil != inputs.depth_stencil) {
+            inputs.depth_stencil = depth_stencil;
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DynamicDepthStencil>
                 duration{telemetry_enabled};
             UpdateDepthStencilState();
         }
-        {
-            Common::PerformanceTelemetry::SampledDuration<
-                Common::PerformanceTelemetry::TimerSite::DynamicPrimitive>
-                duration{telemetry_enabled};
-            UpdatePrimitiveState(is_indexed);
+
+        const auto primitive = CapturePrimitiveInputs(liverpool->regs);
+        if (first_draw || primitive != inputs.primitive) {
+            inputs.primitive = primitive;
+            primitive_changed = true;
         }
-        {
+
+        const auto rasterization = CaptureRasterizationInputs(liverpool->regs);
+        if (first_draw || rasterization != inputs.rasterization) {
+            inputs.rasterization = rasterization;
             Common::PerformanceTelemetry::SampledDuration<
                 Common::PerformanceTelemetry::TimerSite::DynamicRasterization>
                 duration{telemetry_enabled};
             UpdateRasterizationState();
         }
-        {
-            Common::PerformanceTelemetry::SampledDuration<
-                Common::PerformanceTelemetry::TimerSite::DynamicBlend>
-                duration{telemetry_enabled};
-            UpdateColorBlendingState(pipeline);
-        }
-        dynamic_state_generation = generation;
-        dynamic_state_pipeline = pipeline;
-        dynamic_state_indexed = is_indexed;
-        dynamic_state_feedback_loop = attachment_feedback_loop;
+        inputs.valid = true;
     }
+    if (primitive_changed) {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DynamicPrimitive>
+            duration{telemetry_enabled};
+        UpdatePrimitiveState(is_indexed);
+    }
+
+    const auto blend = CaptureBlendInputs(liverpool->regs, *pipeline);
+    if (first_draw || blend != inputs.blend || feedback_changed) {
+        inputs.blend = blend;
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::DynamicBlend>
+            duration{telemetry_enabled};
+        UpdateColorBlendingState(pipeline);
+    }
+    dynamic_state_generation = generation;
+    dynamic_state_pipeline = pipeline;
+    dynamic_state_indexed = is_indexed;
+    dynamic_state_feedback_loop = attachment_feedback_loop;
 
     auto& dynamic_state = scheduler.GetDynamicState();
     if (dynamic_state.dirty_bits == 0) {

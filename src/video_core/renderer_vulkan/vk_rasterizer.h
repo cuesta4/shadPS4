@@ -4,6 +4,7 @@
 #pragma once
 
 #include <limits>
+#include <memory>
 
 #include "common/performance_telemetry.h"
 #include "common/recursive_lock.h"
@@ -133,7 +134,7 @@ private:
     bool FilterDraw();
 
     void PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
-    void FinalizeBuffers(Shader::PushData& push_data, bool stream_only);
+    void FinalizeBuffers(Shader::PushData& push_data, bool stream_only, u32 first_binding = 0);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
     void SynchronizeDmaBuffers();
@@ -170,6 +171,24 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    struct CachedColorTarget {
+        AmdGpu::ColorBuffer buffer{};
+        u32 hint{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+    };
+    std::array<CachedColorTarget, AmdGpu::NUM_COLOR_BUFFERS> cached_color_targets{};
+    struct CachedDepthTarget {
+        AmdGpu::DepthBuffer buffer{};
+        AmdGpu::DepthView view{};
+        AmdGpu::DepthControl control{};
+        VAddr htile_address{};
+        u32 hint{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+    } cached_depth_target{};
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
@@ -193,16 +212,22 @@ private:
         u32 set_write_index{};
         u16 stream_index{std::numeric_limits<u16>::max()};
         VideoCore::BufferCache::StreamCopySource stream_source{};
-        bool finalized{};
     };
     boost::container::static_vector<PendingBufferBinding, Shader::NUM_BUFFERS>
         pending_buffer_bindings;
-    using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
+    boost::container::static_vector<u8, Shader::NUM_BUFFERS> stream_buffer_bindings;
+    struct ImageBindingInfo {
+        VideoCore::ImageId image_id{};
+        VideoCore::ImageViewInfo view_info{};
+        u8 source_index{};
+        u8 mip_index{};
+        bool is_storage{};
+    };
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
 
     struct CachedBufferBinding {
         const Shader::Info* owner{};
-        AmdGpu::Buffer sharp{};
+        VAddr address{};
         VideoCore::BufferId buffer_id{};
         u64 buffer_uid{};
         u64 topology_epoch{};
@@ -215,14 +240,26 @@ private:
     struct CachedImageBinding {
         const Shader::Info* owner{};
         AmdGpu::Image sharp{};
+        u64 resource_key{};
+        u8 source_index{};
+        u8 mip_index{};
         VideoCore::ImageId image_id{};
         u64 image_uid{};
         u64 topology_epoch{};
-        VideoCore::TextureCache::ImageDesc resolved_desc{};
+        VideoCore::ImageViewInfo view_info{};
         bool valid{};
     };
     std::array<std::array<CachedImageBinding, Shader::NUM_IMAGES>, MaxShaderStages>
         cached_image_bindings{};
+
+    struct CachedImageDescription {
+        const Shader::Info* owner{};
+        AmdGpu::Image sharp{};
+        u8 geometry_key{};
+        std::unique_ptr<VideoCore::TextureCache::ImageDesc> base_desc;
+    };
+    std::array<std::array<CachedImageDescription, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_image_descriptions{};
 
     struct CachedImageView {
         VideoCore::ImageId image_id{};
@@ -263,6 +300,8 @@ private:
         bool valid{};
     } descriptor_state;
 
+    struct DynamicStateInputCache;
+    mutable std::unique_ptr<DynamicStateInputCache> dynamic_state_inputs;
     mutable u64 dynamic_state_generation{};
     mutable const GraphicsPipeline* dynamic_state_pipeline{};
     mutable bool dynamic_state_indexed{};

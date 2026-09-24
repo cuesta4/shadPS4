@@ -120,10 +120,19 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    HANDLE timer = ::CreateWaitableTimerExW(
+        nullptr, nullptr,
+        CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = ::CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }
+    const DWORD ret = timer && ::SetWaitableTimer(timer, &interval, 0, nullptr, nullptr, FALSE)
+                          ? ::WaitForSingleObjectEx(timer, INFINITE, interruptible)
+                          : WAIT_FAILED;
+    if (timer) {
+        ::CloseHandle(timer);
+    }
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();
