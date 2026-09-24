@@ -180,6 +180,12 @@ public:
     [[nodiscard]] u64 GetCurrentLabelGeneration(VAddr label_addr) const;
 
     void RegisterAuthority(const GpuAuthorityEntry& entry);
+
+    /// Materializes authorities whose shadow completed a while ago and that nothing superseded
+    /// or read since. Nothing waits for the GPU. Keeps the tracker, its read watches and the
+    /// pinned shadows small once GPU consumers stop materializing authorities by accident.
+    /// Command processor thread, no cache lock held.
+    void RetireStaleAuthorities();
     void RegisterVirtualFence(const VirtualGpuFence& fence);
 
     [[nodiscard]] std::vector<std::shared_ptr<GpuAuthorityEntry>> FindOverlaps(VAddr addr, size_t size) const;

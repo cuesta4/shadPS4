@@ -45,6 +45,7 @@ GROUPS = [
                       "guest_copy_queue_depth_max", "guest_copy_gpu_served_ops",
                       "guest_copy_gpu_served_bytes", "guest_copy_backing_bytes"]),
     ("GPU authority", ["authority_materializations", "authority_materialize_ns",
+                       "authority_retirements", "authority_retired_bytes", "authority_live_max",
                        "pending_op_poll_skips"]),
     ("Resource churn", ["texture_uploads", "texture_upload_bytes", "texture_upload_ns",
                         "texture_hash_bytes", "texture_hash_ns", "buffer_creates",

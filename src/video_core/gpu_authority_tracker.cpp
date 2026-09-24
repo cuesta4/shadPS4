@@ -34,6 +34,15 @@ constexpr bool HasGpuAuthority(GpuAuthorityState state) noexcept {
 /// copied again for every consumer.
 constexpr u32 MaxGpuServesAfterReady = 16;
 
+/// Ticks after its shadow completed before an authority nothing superseded counts as stale.
+/// A frame submits a dozen command buffers, and a render target produced again next frame
+/// supersedes its old authority well before this.
+constexpr u64 RetireAfterTicks = 48;
+/// Above this many live authorities the oldest completed ones are retired regardless of age.
+constexpr size_t MaxLiveAuthorities = 64;
+/// Bytes materialized per retirement pass beyond the first authority.
+constexpr u64 RetireBudgetBytes = 4ULL << 20;
+
 } // namespace
 
 GpuAuthorityTracker& GpuAuthorityTracker::Instance() noexcept {
@@ -129,6 +138,63 @@ void GpuAuthorityTracker::RegisterAuthority(const GpuAuthorityEntry& entry) {
     }
 }
 
+void GpuAuthorityTracker::RetireStaleAuthorities() {
+    if (!IsGow3FastpathActive() || rasterizer == nullptr) {
+        return;
+    }
+    const u64 known_tick = rasterizer->KnownGpuTick();
+    const u64 current_tick = rasterizer->CurrentTick();
+    boost::container::small_vector<std::pair<VAddr, u32>, 8> stale;
+    {
+        std::scoped_lock lock{tracker_mutex};
+        const bool crowded = authorities.size() > MaxLiveAuthorities;
+        if (Common::PerformanceTelemetry::Enabled()) {
+            Common::PerformanceTelemetry::ObserveMaxEnabled(
+                Common::PerformanceTelemetry::Counter::AuthorityLiveMax, authorities.size());
+        }
+        u64 bytes = 0;
+        // Oldest first.
+        for (const auto& entry : authorities) {
+            std::scoped_lock entry_lock{*entry->entry_mutex};
+            if (entry->state != GpuAuthorityState::GpuAuthoritative || !entry->shadow) {
+                continue;
+            }
+            const u64 ready_tick = entry->shadow->ReadyTick();
+            if (known_tick < ready_tick ||
+                (!crowded && current_tick < ready_tick + RetireAfterTicks)) {
+                continue;
+            }
+            if (!stale.empty() && bytes + entry->download_size > RetireBudgetBytes) {
+                break;
+            }
+            bytes += entry->download_size;
+            stale.emplace_back(entry->guest_begin, entry->download_size);
+        }
+    }
+    for (const auto [addr, size] : stale) {
+        // Materializing a range also materializes authorities overlapping it; skip ranges where
+        // one of them still waits for the GPU.
+        const auto overlaps = FindOverlaps(addr, size);
+        const bool all_ready = std::ranges::all_of(overlaps, [&](const auto& entry) {
+            std::scoped_lock entry_lock{*entry->entry_mutex};
+            return entry->state == GpuAuthorityState::GpuAuthoritative && entry->shadow &&
+                   known_tick >= entry->shadow->ReadyTick();
+        });
+        if (overlaps.empty() || !all_ready) {
+            continue;
+        }
+        ResolveForRamRead(addr, size,
+                          Common::PerformanceTelemetry::GuestSourceConsumePath::BufferUpload,
+                          Common::PerformanceTelemetry::ResourceType::Buffer, 0);
+        if (Common::PerformanceTelemetry::Enabled()) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::AuthorityRetirements, 1);
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::AuthorityRetiredBytes, size);
+        }
+    }
+}
+
 void GpuAuthorityTracker::RegisterVirtualFence(const VirtualGpuFence& fence) {
     if (!IsGow3FastpathActive()) {
         return;
@@ -176,11 +242,12 @@ std::vector<std::shared_ptr<GpuAuthorityEntry>> GpuAuthorityTracker::FindOverlap
     const VAddr query_end = addr + size;
     std::scoped_lock lock{tracker_mutex};
     for (const auto& entry : authorities) {
-        std::scoped_lock entry_lock{*entry->entry_mutex};
-        if (!HasGpuAuthority(entry->state)) {
+        // The range of an entry never changes after registration.
+        if (std::max(entry->guest_begin, addr) >= std::min(entry->guest_end, query_end)) {
             continue;
         }
-        if (std::max(entry->guest_begin, addr) < std::min(entry->guest_end, query_end)) {
+        std::scoped_lock entry_lock{*entry->entry_mutex};
+        if (HasGpuAuthority(entry->state)) {
             result.push_back(entry);
         }
     }
@@ -212,9 +279,12 @@ std::shared_ptr<GpuAuthorityEntry> GpuAuthorityTracker::GetAuthorityForRange(
     std::scoped_lock lock{tracker_mutex};
     for (auto it = authorities.rbegin(); it != authorities.rend(); ++it) {
         const auto& entry = *it;
+        if (addr < entry->guest_begin || size > entry->download_size ||
+            addr - entry->guest_begin > entry->download_size - size) {
+            continue;
+        }
         std::scoped_lock entry_lock{*entry->entry_mutex};
-        if (entry->state != GpuAuthorityState::GpuAuthoritative || addr < entry->guest_begin ||
-            size > entry->download_size || addr - entry->guest_begin > entry->download_size - size) {
+        if (entry->state != GpuAuthorityState::GpuAuthoritative) {
             continue;
         }
         return entry;
@@ -249,9 +319,11 @@ bool GpuAuthorityTracker::CollectGpuShadowPieces(VAddr addr, size_t size, GpuSha
     const VAddr end = addr + size;
     std::scoped_lock lock{tracker_mutex};
     for (const auto& entry : authorities) {
+        if (std::max(entry->guest_begin, addr) >= std::min(entry->guest_end, end)) {
+            continue;
+        }
         std::scoped_lock entry_lock{*entry->entry_mutex};
-        if (!HasGpuAuthority(entry->state) ||
-            std::max(entry->guest_begin, addr) >= std::min(entry->guest_end, end)) {
+        if (!HasGpuAuthority(entry->state)) {
             continue;
         }
         if (!IsGpuServableLocked(*entry)) {
@@ -306,9 +378,11 @@ std::shared_ptr<GpuAuthorityShadow> GpuAuthorityTracker::AcquireGpuShadowForImag
     std::scoped_lock lock{tracker_mutex};
     for (auto it = authorities.rbegin(); it != authorities.rend(); ++it) {
         const auto& entry = *it;
+        if (entry->guest_begin != addr || entry->download_size != size) {
+            continue;
+        }
         std::scoped_lock entry_lock{*entry->entry_mutex};
-        if (entry->state != GpuAuthorityState::GpuAuthoritative || entry->guest_begin != addr ||
-            entry->download_size != size || !entry->shadow) {
+        if (entry->state != GpuAuthorityState::GpuAuthoritative || !entry->shadow) {
             continue;
         }
         std::scoped_lock shadow_lock{entry->shadow->data_mutex};

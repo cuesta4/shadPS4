@@ -643,6 +643,9 @@ constexpr std::array FrameCounters{
     Counter::AuthorityMaterializations,
     Counter::AuthorityMaterializeNs,
     Counter::PendingOpPollSkips,
+    Counter::AuthorityRetirements,
+    Counter::AuthorityRetiredBytes,
+    Counter::AuthorityLiveMax,
     Counter::TextureUploads,
     Counter::TextureUploadBytes,
     Counter::TextureUploadNs,
@@ -1072,6 +1075,9 @@ constexpr std::array CounterNames{
     "authority_materializations",
     "authority_materialize_ns",
     "pending_op_poll_skips",
+    "authority_retirements",
+    "authority_retired_bytes",
+    "authority_live_max",
     "texture_uploads",
     "texture_upload_bytes",
     "texture_upload_ns",
@@ -2406,7 +2412,7 @@ void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
 [[nodiscard]] bool IsMaxCounter(Counter counter) noexcept {
     return counter == Counter::IbDepthMax || counter == Counter::SubmitQueueDepthMax ||
            counter == Counter::ShaderModuleQueueDepthMax ||
-           counter == Counter::GuestCopyQueueDepthMax;
+           counter == Counter::GuestCopyQueueDepthMax || counter == Counter::AuthorityLiveMax;
 }
 
 [[nodiscard]] std::string CsvSafe(std::string value) {

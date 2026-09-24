@@ -1481,6 +1481,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
                 .wait_consumed = false,
             };
 
+            authority_tracker.RetireStaleAuthorities();
             authority_tracker.RegisterAuthority(auth_entry);
             authority_tracker.RegisterVirtualFence(virt_fence);
 
