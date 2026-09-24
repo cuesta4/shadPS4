@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <memory>
 #include <span>
 #include <thread>
@@ -47,7 +48,27 @@ public:
         u8* destination{};
         u64 size{};
         OpKind kind{OpKind::Guest};
+        /// Optional GPU identity of the destination: the VkBuffer handle holding destination and
+        /// the offset of destination inside it. Zero when unknown. Lets the protected copy
+        /// resolver write the destination with GPU commands.
+        u64 dst_buffer{};
+        u64 dst_offset{};
     };
+
+    /// Remainder operations a protected copy resolver may leave to the CPU.
+    static constexpr u32 MaxResolverRemainder = 16;
+
+    /// Packs a Vulkan handle (vk::Buffer) into Op::dst_buffer.
+    template <typename Handle>
+    [[nodiscard]] static u64 BufferId(Handle handle) noexcept {
+        return std::bit_cast<u64>(static_cast<typename Handle::NativeType>(handle));
+    }
+
+    /// Unpacks Op::dst_buffer.
+    template <typename Handle>
+    [[nodiscard]] static Handle ToHandle(u64 id) noexcept {
+        return Handle{std::bit_cast<typename Handle::NativeType>(id)};
+    }
 
     struct Stats {
         u64 jobs{};
@@ -61,10 +82,20 @@ public:
         u64 overlap_waits{};
         u64 slot_full_waits{};
         u64 protected_inline_ops{};
+        u64 gpu_served_ops{};
+        u64 gpu_served_bytes{};
     };
 
     /// Returns true when any page of the range currently denies reads.
     using ReadProtectionProbe = bool (*)(const void* context, VAddr addr, u64 size);
+
+    /// Serves a guest copy whose source denies reads without touching the protected pages, for
+    /// example by recording GPU commands that write the same bytes into op.dst_buffer. On
+    /// success stores the parts left for the CPU in remainder, sets remainder_count and returns
+    /// the bytes served. Returns zero when the copy cannot be served that way.
+    using ProtectedCopyResolver = u64 (*)(void* context, const Op& op,
+                                          std::span<Op, MaxResolverRemainder> remainder,
+                                          u32& remainder_count);
 
     static GuestCopyEngine& Instance();
 
@@ -90,6 +121,13 @@ public:
     /// Brackets revoking read access to guest memory (arming read watchers). Begin waits for the
     /// pending copies of the range; copies enqueued until End observe the revocation and run inline.
     void BeginReadProtect(VAddr addr, u64 size);
+
+    /// Installs the resolver tried before running a read-protected copy inline. Called on the
+    /// producer thread only.
+    void SetProtectedCopyResolver(ProtectedCopyResolver resolver, void* context) noexcept {
+        protected_resolver_context = context;
+        protected_resolver.store(resolver, std::memory_order_release);
+    }
     void EndReadProtect(VAddr addr, u64 size) noexcept;
 
     /// Returns true when the calling thread may defer copies through Enqueue.
@@ -175,6 +213,8 @@ private:
     void PublishJob(u32 num_ops, u64 bytes);
     void WaitForSlot();
     void WaitForGuestWriteSlow(VAddr addr, u64 size);
+    void EnqueueOp(const Op& op, bool allow_resolve);
+    [[nodiscard]] bool TryResolveProtected(const Op& op);
     void ExecuteInline(std::span<const Op> ops);
     void ExecuteOps(std::span<const Op> ops, bool telemetry_enabled);
     void MarkPending(const Op& op, bool add) noexcept;
@@ -196,6 +236,8 @@ private:
     std::unique_ptr<std::array<std::atomic<u32>, PendingTableSize>> read_protect_intents;
     std::atomic<ReadProtectionProbe> read_probe{nullptr};
     const void* read_probe_context{};
+    std::atomic<ProtectedCopyResolver> protected_resolver{nullptr};
+    void* protected_resolver_context{};
 
     alignas(64) std::atomic<u64> submitted{0};
     alignas(64) std::atomic<u64> claimed{0};
@@ -227,6 +269,8 @@ private:
         std::atomic<u64> overlap_waits{};
         std::atomic<u64> slot_full_waits{};
         std::atomic<u64> protected_inline_ops{};
+        std::atomic<u64> gpu_served_ops{};
+        std::atomic<u64> gpu_served_bytes{};
     };
     AtomicStats stats;
 

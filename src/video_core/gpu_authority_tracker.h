@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -36,7 +38,7 @@ enum class GpuAuthorityState : u8 {
 struct GpuAuthorityShadow final : StreamBufferPin {
     GpuAuthorityShadow(u8* data_, VAddr guest_addr_, u64 buffer_offset_, u32 size_, u64 tick_)
         : data{data_}, guest_addr{guest_addr_}, buffer_offset{buffer_offset_}, size{size_},
-          tick{tick_} {}
+          ready_tick{tick_}, tick{tick_} {}
 
     ~GpuAuthorityShadow() override {
         Release();
@@ -69,8 +71,15 @@ struct GpuAuthorityShadow final : StreamBufferPin {
         }
     }
 
+    /// Tick until which the download buffer region must stay reserved. GPU consumers of the
+    /// shadow extend it.
     [[nodiscard]] u64 Tick() const noexcept {
         return tick.load(std::memory_order_acquire);
+    }
+
+    /// Tick after which the shadow bytes are valid.
+    [[nodiscard]] u64 ReadyTick() const noexcept {
+        return ready_tick;
     }
 
     [[nodiscard]] u64 RequiredTick(u64 allocation_tick) const noexcept override {
@@ -82,6 +91,7 @@ struct GpuAuthorityShadow final : StreamBufferPin {
     VAddr guest_addr{};
     u64 buffer_offset{};
     u32 size{};
+    const u64 ready_tick{};
     std::atomic<u64> tick{};
     std::unique_ptr<u8[]> owned_data;
 };
@@ -111,6 +121,9 @@ struct GpuAuthorityEntry {
     bool gpu_complete{false};
     bool host_current{false};
     bool gpu_consumed{false};
+    /// Command buffers that read the shadow instead of materialized guest RAM.
+    u32 gpu_serves{0};
+    u64 last_gpu_serve_tick{0};
     std::shared_ptr<GpuAuthorityShadow> shadow;
     std::shared_ptr<std::mutex> entry_mutex{std::make_shared<std::mutex>()};
     std::shared_ptr<std::condition_variable> cv{std::make_shared<std::condition_variable>()};
@@ -136,6 +149,18 @@ struct VirtualGpuFence {
     bool host_label_written{false};
     bool wait_consumed{false};
 };
+
+/// Part of a guest range whose current bytes live in an authority shadow on the GPU.
+struct GpuShadowPiece {
+    VAddr addr{};
+    u64 size{};
+    /// Offset of the bytes at addr inside the download buffer.
+    u64 buffer_offset{};
+    std::shared_ptr<GpuAuthorityEntry> entry;
+    std::shared_ptr<GpuAuthorityShadow> shadow;
+};
+
+using GpuShadowPieces = boost::container::small_vector<GpuShadowPiece, 4>;
 
 struct GpuAuthorityIds {
     u64 authority_seq{};
@@ -177,11 +202,25 @@ public:
     void EnsureAllVirtualFencesComplete(
         Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason);
 
+    /// Makes guest RAM current for a read of [addr, addr + size), materializing GPU
+    /// authoritative ranges. With keep_gpu_servable, authorities whose shadow a GPU consumer can
+    /// read directly (see CollectGpuShadowPieces) are left alone: the caller must then serve
+    /// those bytes from the shadow instead of reading guest RAM.
     bool ResolveForRamRead(VAddr addr, size_t size,
-                          Common::PerformanceTelemetry::GuestSourceConsumePath path,
-                          Common::PerformanceTelemetry::ResourceType dest_kind =
-                              Common::PerformanceTelemetry::ResourceType::Buffer,
-                          u64 dest_res_id = 0);
+                           Common::PerformanceTelemetry::GuestSourceConsumePath path,
+                           Common::PerformanceTelemetry::ResourceType dest_kind =
+                               Common::PerformanceTelemetry::ResourceType::Buffer,
+                           u64 dest_res_id = 0, bool keep_gpu_servable = false);
+
+    /// Collects the parts of [addr, addr + size) covered by GPU authoritative ranges whose shadow
+    /// the GPU can copy from, so a GPU consumer gets the bytes without the command processor
+    /// waiting for the producer. Returns false when an overlapping authority cannot be served
+    /// that way (no live shadow, being materialized, overlapping another authority). The pieces
+    /// are sorted and disjoint. Nothing changes until CommitGpuShadowPieces.
+    [[nodiscard]] bool CollectGpuShadowPieces(VAddr addr, size_t size, GpuShadowPieces& pieces);
+
+    /// Keeps the shadows of the pieces alive until consumer_tick completes.
+    void CommitGpuShadowPieces(const GpuShadowPieces& pieces, u64 consumer_tick);
 
     bool HandleCpuRead(VAddr fault_addr, size_t size);
     void HandleCpuWrite(VAddr addr, size_t size);
@@ -195,6 +234,8 @@ public:
 
 private:
     void RetireVirtualFenceLocked(const std::shared_ptr<VirtualGpuFence>& fence);
+    /// Entry mutex held.
+    [[nodiscard]] bool IsGpuServableLocked(const GpuAuthorityEntry& entry) const;
     void RefreshAuthorityReadWatches(VAddr addr, size_t size);
 
     mutable std::recursive_mutex tracker_mutex;

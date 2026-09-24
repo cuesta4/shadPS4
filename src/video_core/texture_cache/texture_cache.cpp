@@ -2294,7 +2294,8 @@ void TextureCache::WaitGpuAuthorityShadow(
         return;
     }
     auto* master_semaphore = scheduler.GetMasterSemaphore();
-    const u64 tick = shadow->Tick();
+    // GPU consumers extend the reservation of the shadow, not the point its bytes become valid.
+    const u64 tick = shadow->ReadyTick();
     if (!master_semaphore->IsFree(tick) && liverpool->IsGpuThread() &&
         tick >= scheduler.CurrentTick()) {
         scheduler.Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
@@ -2310,7 +2311,7 @@ bool TextureCache::MaterializeGpuAuthority(
         *out_validation_bytes_equal = -1;
     }
     if (!shadow || shadow->guest_addr != required_addr || shadow->size != required_size ||
-        !scheduler.GetMasterSemaphore()->IsFree(shadow->Tick())) {
+        !scheduler.GetMasterSemaphore()->IsFree(shadow->ReadyTick())) {
         return false;
     }
     std::scoped_lock shadow_lock{shadow->data_mutex};

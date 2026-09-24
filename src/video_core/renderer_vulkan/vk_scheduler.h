@@ -602,6 +602,8 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
+    /// Earliest time PopPendingOperations may query the driver for the GPU tick again.
+    u64 next_pending_ops_poll_ns{};
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

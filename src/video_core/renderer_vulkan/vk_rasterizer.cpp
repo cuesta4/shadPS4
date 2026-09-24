@@ -492,6 +492,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                                                                                             size);
             },
             &page_manager);
+        copy_engine.SetProtectedCopyResolver(
+            [](void* context, const VideoCore::GuestCopyEngine::Op& op,
+               std::span<VideoCore::GuestCopyEngine::Op,
+                         VideoCore::GuestCopyEngine::MaxResolverRemainder>
+                   remainder,
+               u32& remainder_count) -> u64 {
+                auto& rasterizer = *static_cast<Rasterizer*>(context);
+                return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
+                    op, remainder, remainder_count, rasterizer.page_manager);
+            },
+            this);
         copy_engine.Start(GuestCopyWorkerCount());
     }
     memory->SetRasterizer(this);
@@ -501,6 +512,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
 Rasterizer::~Rasterizer() {
     VideoCore::GuestCopyEngine::Instance().Stop();
     VideoCore::GuestCopyEngine::Instance().SetReadProtectionProbe(nullptr, nullptr);
+    VideoCore::GuestCopyEngine::Instance().SetProtectedCopyResolver(nullptr, nullptr);
     VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(nullptr);
 }
 

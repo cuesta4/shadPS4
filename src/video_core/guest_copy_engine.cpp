@@ -103,55 +103,97 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
         return SubmittedSeq();
     }
     for (const Op& op : ops) {
-        if (op.size == 0) {
+        // Copies spanning several pieces are resolved whole so the resolver records one GPU
+        // copy per shadow instead of one per piece.
+        if (op.size > SplitBytes && op.kind != OpKind::Zero && op.dst_buffer != 0 &&
+            IsReadProtected(op.source, op.size) && TryResolveProtected(op)) {
             continue;
         }
-        u64 offset = 0;
-        while (offset < op.size) {
-            const u64 piece = std::min<u64>(op.size - offset, SplitBytes);
-            Op piece_op = op;
-            if (op.kind != OpKind::Zero) {
-                piece_op.source += offset;
-            }
-            piece_op.destination += offset;
-            piece_op.size = piece;
-            offset += piece;
-
-            // Publish the pending read before checking for read protection; BeginReadProtect
-            // publishes its intent before checking for pending reads. One side always sees the
-            // other, so a worker never reads a page after its read access is revoked.
-            MarkPending(piece_op, true);
-            if (piece_op.kind != OpKind::Zero) {
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (IsReadProtected(piece_op.source, piece_op.size)) {
-                    // Faults on this range must be handled on the command processor thread.
-                    MarkPending(piece_op, false);
-                    stats.protected_inline_ops.fetch_add(1, std::memory_order_relaxed);
-                    if (Common::PerformanceTelemetry::Enabled()) {
-                        Common::PerformanceTelemetry::AddEnabled(
-                            Common::PerformanceTelemetry::Counter::GuestCopyProtectedInlineOps, 1);
-                    }
-                    ExecuteInline(std::span{&piece_op, 1});
-                    continue;
-                }
-            }
-
-            if (building_ops == MaxOpsPerJob ||
-                (building_ops != 0 && building_bytes + piece > SplitBytes)) {
-                PublishJob(building_ops, building_bytes);
-            }
-            if (building_ops == 0) {
-                WaitForSlot();
-            }
-            Slot& slot = (*slots)[(submitted.load(std::memory_order_relaxed) + 1) & SlotMask];
-            slot.ops[building_ops++] = piece_op;
-            building_bytes += piece;
-        }
+        EnqueueOp(op, true);
     }
     if (building_ops != 0) {
         PublishJob(building_ops, building_bytes);
     }
     return submitted.load(std::memory_order_relaxed);
+}
+
+bool GuestCopyEngine::TryResolveProtected(const Op& op) {
+    const auto resolver = protected_resolver.load(std::memory_order_acquire);
+    if (resolver == nullptr) {
+        return false;
+    }
+    std::array<Op, MaxResolverRemainder> remainder{};
+    u32 remainder_count = 0;
+    const u64 served = resolver(protected_resolver_context, op, remainder, remainder_count);
+    if (served == 0) {
+        return false;
+    }
+    stats.gpu_served_ops.fetch_add(1, std::memory_order_relaxed);
+    stats.gpu_served_bytes.fetch_add(served, std::memory_order_relaxed);
+    if (Common::PerformanceTelemetry::Enabled()) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyGpuServedOps, 1);
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyGpuServedBytes, served);
+    }
+    for (u32 i = 0; i < remainder_count; ++i) {
+        EnqueueOp(remainder[i], false);
+    }
+    return true;
+}
+
+void GuestCopyEngine::EnqueueOp(const Op& op, bool allow_resolve) {
+    if (op.size == 0) {
+        return;
+    }
+    u64 offset = 0;
+    while (offset < op.size) {
+        const u64 piece = std::min<u64>(op.size - offset, SplitBytes);
+        Op piece_op = op;
+        if (op.kind != OpKind::Zero) {
+            piece_op.source += offset;
+        }
+        piece_op.destination += offset;
+        piece_op.dst_offset += offset;
+        piece_op.size = piece;
+        offset += piece;
+
+        // Publish the pending read before checking for read protection; BeginReadProtect
+        // publishes its intent before checking for pending reads. One side always sees the
+        // other, so a worker never reads a page after its read access is revoked.
+        MarkPending(piece_op, true);
+        if (piece_op.kind != OpKind::Zero) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (IsReadProtected(piece_op.source, piece_op.size)) {
+                MarkPending(piece_op, false);
+                // Reading the range here would run the fault handlers, which may wait for the
+                // GPU. The resolver serves what it can without touching the protected pages and
+                // hands back the rest, which goes through this protocol again.
+                if (allow_resolve && piece_op.dst_buffer != 0 && TryResolveProtected(piece_op)) {
+                    continue;
+                }
+                // Faults on this range must be handled on the command processor thread.
+                stats.protected_inline_ops.fetch_add(1, std::memory_order_relaxed);
+                if (Common::PerformanceTelemetry::Enabled()) {
+                    Common::PerformanceTelemetry::AddEnabled(
+                        Common::PerformanceTelemetry::Counter::GuestCopyProtectedInlineOps, 1);
+                }
+                ExecuteInline(std::span{&piece_op, 1});
+                continue;
+            }
+        }
+
+        if (building_ops == MaxOpsPerJob ||
+            (building_ops != 0 && building_bytes + piece > SplitBytes)) {
+            PublishJob(building_ops, building_bytes);
+        }
+        if (building_ops == 0) {
+            WaitForSlot();
+        }
+        Slot& slot = (*slots)[(submitted.load(std::memory_order_relaxed) + 1) & SlotMask];
+        slot.ops[building_ops++] = piece_op;
+        building_bytes += piece;
+    }
 }
 
 void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
@@ -195,7 +237,8 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
             LOG_INFO(Render_Vulkan,
                      "Guest copies (last 10s): {} jobs, {:.1f} MiB deferred, {:.1f} MiB inline, "
                      "workers {:.1f} ms, waiters helped {:.1f} ms, producer blocked {} times "
-                     "({:.1f} ms), overlap waits {}, ring-full waits {}, protected inline ops {}",
+                     "({:.1f} ms), overlap waits {}, ring-full waits {}, protected inline ops {}, "
+                     "GPU-served ops {} ({:.1f} MiB)",
                      current.jobs - last_logged.jobs,
                      static_cast<double>(current.bytes - last_logged.bytes) / MiB,
                      static_cast<double>(current.inline_bytes - last_logged.inline_bytes) / MiB,
@@ -205,7 +248,10 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
                      static_cast<double>(current.wait_ns - last_logged.wait_ns) / 1e6,
                      current.overlap_waits - last_logged.overlap_waits,
                      current.slot_full_waits - last_logged.slot_full_waits,
-                     current.protected_inline_ops - last_logged.protected_inline_ops);
+                     current.protected_inline_ops - last_logged.protected_inline_ops,
+                     current.gpu_served_ops - last_logged.gpu_served_ops,
+                     static_cast<double>(current.gpu_served_bytes - last_logged.gpu_served_bytes) /
+                         MiB);
             last_logged = current;
         }
     }
@@ -557,6 +603,8 @@ GuestCopyEngine::Stats GuestCopyEngine::GetStats() const noexcept {
         .overlap_waits = stats.overlap_waits.load(std::memory_order_relaxed),
         .slot_full_waits = stats.slot_full_waits.load(std::memory_order_relaxed),
         .protected_inline_ops = stats.protected_inline_ops.load(std::memory_order_relaxed),
+        .gpu_served_ops = stats.gpu_served_ops.load(std::memory_order_relaxed),
+        .gpu_served_bytes = stats.gpu_served_bytes.load(std::memory_order_relaxed),
     };
 }
 
@@ -611,6 +659,31 @@ bool GuestCopyEngine::RunSelfTest() {
     self_test_base = reinterpret_cast<VAddr>(source.data());
     self_test_violations.store(0, std::memory_order_relaxed);
     const u64 inline_before = stats.protected_inline_ops.load(std::memory_order_relaxed);
+    const u64 served_before = stats.gpu_served_ops.load(std::memory_order_relaxed);
+
+    // Stands in for the GPU: serves the first half of a protected copy directly and leaves the
+    // second half to the regular protocol, which must still keep workers off protected ranges.
+    const auto saved_resolver = protected_resolver.load(std::memory_order_acquire);
+    void* const saved_resolver_context = protected_resolver_context;
+    SetProtectedCopyResolver(
+        [](void*, const Op& op, std::span<Op, MaxResolverRemainder> remainder,
+           u32& remainder_count) -> u64 {
+            const u64 served = std::max<u64>(op.size / 2, 1);
+            std::memcpy(op.destination, reinterpret_cast<const u8*>(op.source), served);
+            remainder_count = 0;
+            if (served < op.size) {
+                remainder[remainder_count++] = Op{
+                    .source = op.source + served,
+                    .destination = op.destination + served,
+                    .size = op.size - served,
+                    .kind = op.kind,
+                    .dst_buffer = op.dst_buffer,
+                    .dst_offset = op.dst_offset + served,
+                };
+            }
+            return served;
+        },
+        nullptr);
 
     std::thread producer([&] {
         is_producer_thread = true;
@@ -698,11 +771,14 @@ bool GuestCopyEngine::RunSelfTest() {
                     }
                     const bool zero = rng.Next() % 16 == 0;
                     const u64 source_offset = rng.Range(0, SourceSize - size);
+                    const bool resolvable = !zero && rng.Next() % 2 == 0;
                     ops[count] = Op{
                         .source = zero ? 0 : reinterpret_cast<VAddr>(source.data() + source_offset),
                         .destination = destination.data() + destination_cursor,
                         .size = size,
                         .kind = zero ? OpKind::Zero : OpKind::Host,
+                        .dst_buffer = resolvable ? 1ULL : 0ULL,
+                        .dst_offset = destination_cursor,
                     };
                     expected[count] = Expectation{
                         .source_offset = source_offset,
@@ -760,6 +836,7 @@ bool GuestCopyEngine::RunSelfTest() {
         is_producer_thread = false;
     });
     producer.join();
+    SetProtectedCopyResolver(saved_resolver, saved_resolver_context);
 
     if (failure.empty() && waiter_failed.load(std::memory_order_relaxed)) {
         failure = "a waiter returned before its target sequence completed";
@@ -775,11 +852,12 @@ bool GuestCopyEngine::RunSelfTest() {
     }
     LOG_INFO(Render_Vulkan,
              "Guest copy self-test passed: {} workers, {} ops, {:.1f} MiB, {} overlap checks, "
-             "{} concurrent waits, {} protect cycles, {} ops rerouted inline",
+             "{} concurrent waits, {} protect cycles, {} ops rerouted inline, {} ops resolved",
              workers.size(), total_ops, static_cast<double>(total_bytes) / (1024.0 * 1024.0),
              overlap_checks, waiter_checks.load(std::memory_order_relaxed),
              protect_cycles.load(std::memory_order_relaxed),
-             stats.protected_inline_ops.load(std::memory_order_relaxed) - inline_before);
+             stats.protected_inline_ops.load(std::memory_order_relaxed) - inline_before,
+             stats.gpu_served_ops.load(std::memory_order_relaxed) - served_before);
     return true;
 }
 

@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/gpu_authority_tracker.h"
 #include "video_core/guest_copy_engine.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -608,6 +609,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                     .source = request.guest_address,
                     .destination = destination,
                     .size = request.size,
+                    .dst_buffer = GuestCopyEngine::BufferId(transient_read_buffer.Handle()),
+                    .dst_offset = offset,
                 };
                 copy_engine.Enqueue(std::span{&op, 1});
             } else {
@@ -976,6 +979,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
                             .source = source.key.address,
                             .destination = copy_destination,
                             .size = size,
+                            .dst_buffer = GuestCopyEngine::BufferId(transient_read_buffer.Handle()),
+                            .dst_offset = base_offset + placement.relative_offset,
                         };
                         if (telemetry_staging_sampled) {
                             ++batch_sample.guest_copies;
@@ -1788,17 +1793,21 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     {
         Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
             Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+        auto& copy_engine = GuestCopyEngine::Instance();
+        const bool defer_copy = copy_engine.CanDefer() && staging_buffer.is_coherent;
+        // A deferred copy serves bytes the GPU still owns from their shadow on the GPU, which
+        // spares the wait for the producer that materializing guest RAM needs.
         const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
-            gpu_addr, size,
-            Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy,
-            Common::PerformanceTelemetry::ResourceType::Image, 0);
+            gpu_addr, size, Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy,
+            Common::PerformanceTelemetry::ResourceType::Image, 0, defer_copy);
         if (resolved) {
-            auto& copy_engine = GuestCopyEngine::Instance();
-            if (copy_engine.CanDefer() && staging_buffer.is_coherent) {
+            if (defer_copy) {
                 const GuestCopyEngine::Op op{
                     .source = gpu_addr,
                     .destination = data,
                     .size = size,
+                    .dst_buffer = GuestCopyEngine::BufferId(staging_buffer.Handle()),
+                    .dst_offset = offset,
                 };
                 copy_engine.Enqueue(std::span{&op, 1});
             } else {
@@ -1808,6 +1817,96 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     }
     staging_buffer.Commit();
     return {&staging_buffer, offset};
+}
+
+u64 BufferCache::ServeGuestCopyFromGpuShadows(
+    const GuestCopyEngine::Op& op,
+    std::span<GuestCopyEngine::Op, GuestCopyEngine::MaxResolverRemainder> remainder,
+    u32& remainder_count, const PageManager& page_manager) {
+    if (op.kind != GuestCopyEngine::OpKind::Guest) {
+        return 0;
+    }
+    auto& authority_tracker = GpuAuthorityTracker::Instance();
+    GpuShadowPieces pieces;
+    if (!authority_tracker.CollectGpuShadowPieces(op.source, op.size, pieces)) {
+        return 0;
+    }
+
+    // The bytes around the shadows still come from guest RAM, so their pages must be readable.
+    remainder_count = 0;
+    const auto add_remainder = [&](VAddr begin, VAddr end) {
+        if (begin >= end) {
+            return true;
+        }
+        if (remainder_count == remainder.size() ||
+            page_manager.HasReadWatchers(begin, end - begin)) {
+            return false;
+        }
+        const u64 delta = begin - op.source;
+        remainder[remainder_count++] = GuestCopyEngine::Op{
+            .source = begin,
+            .destination = op.destination + delta,
+            .size = end - begin,
+            .kind = GuestCopyEngine::OpKind::Guest,
+            .dst_buffer = op.dst_buffer,
+            .dst_offset = op.dst_offset + delta,
+        };
+        return true;
+    };
+    VAddr cursor = op.source;
+    for (const auto& piece : pieces) {
+        if (!add_remainder(cursor, piece.addr)) {
+            return 0;
+        }
+        cursor = piece.addr + piece.size;
+    }
+    if (!add_remainder(cursor, op.source + op.size)) {
+        return 0;
+    }
+
+    authority_tracker.CommitGpuShadowPieces(pieces, scheduler.CurrentTick());
+    boost::container::small_vector<vk::BufferCopy, 4> copies;
+    u64 served = 0;
+    for (const auto& piece : pieces) {
+        copies.push_back(vk::BufferCopy{
+            .srcOffset = piece.buffer_offset,
+            .dstOffset = op.dst_offset + (piece.addr - op.source),
+            .size = piece.size,
+        });
+        served += piece.size;
+    }
+
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // Orders the copy after the transfer that wrote the shadow and after earlier readers of the
+    // destination, and the consumers recorded next after the copy.
+    const vk::MemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    };
+    const vk::MemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(download_buffer.Handle(),
+                      GuestCopyEngine::ToHandle<vk::Buffer>(op.dst_buffer), copies);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &post_barrier,
+    });
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes, served);
+    return served;
 }
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
@@ -2215,6 +2314,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                             .source = device_addr,
                             .destination = src_pointer,
                             .size = copy.size,
+                            .dst_buffer = GuestCopyEngine::BufferId(staging_buffer.Handle()),
+                            .dst_offset = offset + copy.srcOffset,
                         });
                     } else {
                         memory->CopySparseMemory(device_addr, src_pointer, copy.size);

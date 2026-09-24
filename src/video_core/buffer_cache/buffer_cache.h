@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/multi_level_page_table.h"
 
 namespace AmdGpu {
@@ -162,6 +163,16 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
+
+    /// Protected copy resolver of the guest copy engine. Writes the parts of op that GPU
+    /// authority shadows hold into op.dst_buffer with GPU copies, so the command processor
+    /// never reads (and faults on) guest RAM that the GPU still owns. The bytes are the ones
+    /// materializing guest RAM would produce. Returns the bytes served, or zero when the copy
+    /// has to take the regular path.
+    u64 ServeGuestCopyFromGpuShadows(
+        const GuestCopyEngine::Op& op,
+        std::span<GuestCopyEngine::Op, GuestCopyEngine::MaxResolverRemainder> remainder,
+        u32& remainder_count, const PageManager& page_manager);
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);

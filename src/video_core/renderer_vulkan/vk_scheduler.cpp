@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/hash.h"
@@ -33,6 +35,16 @@ u64 RenderStateHash(const RenderState& state) {
         hash_attachment(state.depth_stencil_attachment);
     }
     return hash;
+}
+
+/// Minimum interval between driver queries for the GPU tick made on behalf of deferred
+/// operations. Draws come every few microseconds; a query per draw costs more than the draw.
+constexpr u64 PendingOpsPollIntervalNs = 50'000;
+
+[[nodiscard]] u64 SteadyNowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
 }
 
 } // namespace
@@ -335,34 +347,32 @@ void Scheduler::PopPendingOperations() {
         return;
     }
 
-    bool refreshed = false;
     if (master_semaphore.IsFree(pending_ops.front().gpu_tick)) [[likely]] {
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::PendingOpKnownTickHits, 1);
         }
     } else {
+        // Waits, submits and the priority operation thread keep the known tick fresh. Asking the
+        // driver on every draw while an operation waits for the GPU cost more than the draw.
+        const u64 now = SteadyNowNs();
+        if (now < next_pending_ops_poll_ns) {
+            if (telemetry_enabled) {
+                Common::PerformanceTelemetry::AddEnabled(
+                    Common::PerformanceTelemetry::Counter::PendingOpPollSkips, 1);
+            }
+            return;
+        }
+        next_pending_ops_poll_ns = now + PendingOpsPollIntervalNs;
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
         }
         master_semaphore.Refresh();
-        refreshed = true;
     }
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
-    }
-    if (!pending_ops.empty() && !refreshed) {
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
-        }
-        master_semaphore.Refresh();
-        while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-            pending_ops.front().callback();
-            pending_ops.pop();
-        }
     }
 }
 
