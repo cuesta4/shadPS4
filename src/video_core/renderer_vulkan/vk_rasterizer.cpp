@@ -472,6 +472,13 @@ private:
     return std::clamp(hardware_threads / 2, 2u, 8u);
 }
 
+/// SHADPS4_GPU_SHADOW_SERVE=0 makes uploads of GPU-owned guest ranges materialize guest RAM
+/// again instead of copying the authority shadow on the GPU.
+[[nodiscard]] bool GpuShadowServeEnabled() {
+    const char* env = std::getenv("SHADPS4_GPU_SHADOW_SERVE");
+    return env == nullptr || env[0] != '0';
+}
+
 } // Anonymous namespace
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
@@ -492,17 +499,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                                                                                             size);
             },
             &page_manager);
-        copy_engine.SetProtectedCopyResolver(
-            [](void* context, const VideoCore::GuestCopyEngine::Op& op,
-               std::span<VideoCore::GuestCopyEngine::Op,
-                         VideoCore::GuestCopyEngine::MaxResolverRemainder>
-                   remainder,
-               u32& remainder_count) -> u64 {
-                auto& rasterizer = *static_cast<Rasterizer*>(context);
-                return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
-                    op, remainder, remainder_count, rasterizer.page_manager);
-            },
-            this);
+        if (GpuShadowServeEnabled()) {
+            copy_engine.SetProtectedCopyResolver(
+                [](void* context, const VideoCore::GuestCopyEngine::Op& op,
+                   std::span<VideoCore::GuestCopyEngine::Op,
+                             VideoCore::GuestCopyEngine::MaxResolverRemainder>
+                       remainder,
+                   u32& remainder_count) -> u64 {
+                    auto& rasterizer = *static_cast<Rasterizer*>(context);
+                    return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
+                        op, remainder, remainder_count, rasterizer.page_manager);
+                },
+                this);
+        } else {
+            LOG_INFO(Render_Vulkan, "GPU shadow serving disabled by SHADPS4_GPU_SHADOW_SERVE");
+        }
         copy_engine.Start(GuestCopyWorkerCount());
     }
     memory->SetRasterizer(this);

@@ -128,6 +128,10 @@ public:
         protected_resolver_context = context;
         protected_resolver.store(resolver, std::memory_order_release);
     }
+
+    [[nodiscard]] bool HasProtectedCopyResolver() const noexcept {
+        return protected_resolver.load(std::memory_order_acquire) != nullptr;
+    }
     void EndReadProtect(VAddr addr, u64 size) noexcept;
 
     /// Returns true when the calling thread may defer copies through Enqueue.

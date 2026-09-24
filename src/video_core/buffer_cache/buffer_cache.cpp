@@ -1799,7 +1799,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
         // spares the wait for the producer that materializing guest RAM needs.
         const bool resolved = VideoCore::GpuAuthorityTracker::Instance().ResolveForRamRead(
             gpu_addr, size, Common::PerformanceTelemetry::GuestSourceConsumePath::StagingBufferCopy,
-            Common::PerformanceTelemetry::ResourceType::Image, 0, defer_copy);
+            Common::PerformanceTelemetry::ResourceType::Image, 0,
+            defer_copy && copy_engine.HasProtectedCopyResolver());
         if (resolved) {
             if (defer_copy) {
                 const GuestCopyEngine::Op op{
