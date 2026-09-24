@@ -9,7 +9,6 @@
 #include <limits>
 #include <optional>
 #include <span>
-#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -423,17 +422,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
         scheduler.GateSubmitsOnGuestCopies();
         auto& copy_engine = VideoCore::GuestCopyEngine::Instance();
+        copy_engine.SetReadProtectionProbe(
+            [](const void* context, VAddr addr, u64 size) {
+                return static_cast<const VideoCore::PageManager*>(context)->HasReadWatchers(addr,
+                                                                                            size);
+            },
+            &page_manager);
         copy_engine.Start(GuestCopyWorkerCount());
-        // SHADPS4_GUEST_COPY_SELFTEST=1 stress-tests the copy engine before any guest work;
-        // "exit" terminates with status 0 (passed) or 3 (failed) afterwards.
-        if (const char* env = std::getenv("SHADPS4_GUEST_COPY_SELFTEST");
-            env != nullptr && env[0] != ' ' && env[0] != '0') {
-            const bool passed = copy_engine.RunSelfTest();
-            if (std::string_view{env} == "exit") {
-                Common::Log::Flush();
-                std::quick_exit(passed ? 0 : 3);
-            }
-        }
     }
     memory->SetRasterizer(this);
     VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(this);
@@ -441,6 +436,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
 
 Rasterizer::~Rasterizer() {
     VideoCore::GuestCopyEngine::Instance().Stop();
+    VideoCore::GuestCopyEngine::Instance().SetReadProtectionProbe(nullptr, nullptr);
     VideoCore::GpuAuthorityTracker::Instance().SetRasterizer(nullptr);
 }
 
@@ -2672,7 +2668,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     // Workers must not read a range after its guest mapping is torn down.
-    VideoCore::GuestCopyEngine::Instance().Drain();
+    VideoCore::GuestCopyEngine::Instance().WaitForGuestWrite(addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     page_manager.OnGpuUnmap(addr, size);

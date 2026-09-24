@@ -60,7 +60,11 @@ public:
         u64 wait_ns{};
         u64 overlap_waits{};
         u64 slot_full_waits{};
+        u64 protected_inline_ops{};
     };
+
+    /// Returns true when any page of the range currently denies reads.
+    using ReadProtectionProbe = bool (*)(const void* context, VAddr addr, u64 size);
 
     static GuestCopyEngine& Instance();
 
@@ -75,6 +79,18 @@ public:
 
     /// Marks the calling thread as the single producer allowed to defer copies.
     void SetProducerThread() noexcept;
+
+    /// Installs the query used to keep read-protected guest ranges off the workers. A worker
+    /// touching such a range would run the emulator fault handlers outside the command processor.
+    void SetReadProtectionProbe(ReadProtectionProbe probe, const void* context) noexcept {
+        read_probe_context = context;
+        read_probe.store(probe, std::memory_order_release);
+    }
+
+    /// Brackets revoking read access to guest memory (arming read watchers). Begin waits for the
+    /// pending copies of the range; copies enqueued until End observe the revocation and run inline.
+    void BeginReadProtect(VAddr addr, u64 size);
+    void EndReadProtect(VAddr addr, u64 size) noexcept;
 
     /// Returns true when the calling thread may defer copies through Enqueue.
     [[nodiscard]] bool CanDefer() const noexcept {
@@ -114,7 +130,8 @@ public:
         }
     }
 
-    /// Must be called before the emulator writes [addr, addr + size) of guest memory.
+    /// Must be called before the emulator writes or unmaps [addr, addr + size) of guest memory.
+    /// Returns once no queued job reads the range.
     void WaitForGuestWrite(VAddr addr, u64 size) {
         if (HasPending()) [[unlikely]] {
             WaitForGuestWriteSlow(addr, size);
@@ -162,6 +179,9 @@ private:
     void ExecuteOps(std::span<const Op> ops, bool telemetry_enabled);
     void MarkPending(const Op& op, bool add) noexcept;
     [[nodiscard]] bool OverlapsPending(VAddr addr, u64 size) const noexcept;
+    [[nodiscard]] bool IsReadProtected(VAddr addr, u64 size) const noexcept;
+    void AddReadIntent(VAddr addr, u64 size, bool add) noexcept;
+    void DrainRange(VAddr addr, u64 size);
 
     [[nodiscard]] static u64 PendingIndex(u64 granule) noexcept {
         u64 value = granule * 0x9E3779B97F4A7C15ULL;
@@ -173,6 +193,9 @@ private:
 
     std::unique_ptr<std::array<Slot, SlotCount>> slots;
     std::unique_ptr<std::array<std::atomic<u32>, PendingTableSize>> pending_reads;
+    std::unique_ptr<std::array<std::atomic<u32>, PendingTableSize>> read_protect_intents;
+    std::atomic<ReadProtectionProbe> read_probe{nullptr};
+    const void* read_probe_context{};
 
     alignas(64) std::atomic<u64> submitted{0};
     alignas(64) std::atomic<u64> claimed{0};
@@ -181,6 +204,12 @@ private:
     std::atomic<u32> parked_workers{0};
     std::atomic<u32> completion_waiters{0};
     std::atomic<bool> active{false};
+
+    // Self-test only: a range, packed as (offset << 32 | size) relative to self_test_base, that
+    // queued jobs must not read. Zero when unused.
+    std::atomic<u64> self_test_forbidden{0};
+    VAddr self_test_base{};
+    std::atomic<u64> self_test_violations{0};
 
     // Producer-side staging for the job being built.
     u32 building_ops{};
@@ -197,6 +226,7 @@ private:
         std::atomic<u64> wait_ns{};
         std::atomic<u64> overlap_waits{};
         std::atomic<u64> slot_full_waits{};
+        std::atomic<u64> protected_inline_ops{};
     };
     AtomicStats stats;
 

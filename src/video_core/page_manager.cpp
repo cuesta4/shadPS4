@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <mutex>
 
 #include <boost/container/small_vector.hpp>
@@ -13,10 +14,12 @@
 #include "common/div_ceil.h"
 #include "common/performance_telemetry.h"
 #include "common/range_lock.h"
+#include "common/scope_exit.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/gpu_authority_tracker.h"
+#include "video_core/guest_copy_engine.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -307,6 +310,21 @@ struct PageManager::Impl {
     void UpdatePageWatchers(VAddr addr, u64 size) {
         RENDERER_TRACE;
 
+        if constexpr (track && is_read) {
+            // Copy workers must never touch a page after its read access is revoked.
+            auto& copy_engine = GuestCopyEngine::Instance();
+            copy_engine.BeginReadProtect(addr, size);
+            SCOPE_EXIT {
+                copy_engine.EndReadProtect(addr, size);
+            };
+            UpdatePageWatchersImpl<track, is_read>(addr, size);
+        } else {
+            UpdatePageWatchersImpl<track, is_read>(addr, size);
+        }
+    }
+
+    template <bool track, bool is_read>
+    void UpdatePageWatchersImpl(VAddr addr, u64 size) {
         size_t page = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -376,11 +394,31 @@ struct PageManager::Impl {
         auto start_range = mask.FirstRange();
         auto end_range = mask.LastRange();
 
+        if constexpr (track && is_read) {
+            const VAddr begin = base_addr + (start_range.first << PM_PAGE_BITS);
+            const u64 size = (end_range.second - start_range.first) << PM_PAGE_BITS;
+            auto& copy_engine = GuestCopyEngine::Instance();
+            copy_engine.BeginReadProtect(begin, size);
+            SCOPE_EXIT {
+                copy_engine.EndReadProtect(begin, size);
+            };
+            UpdatePageWatchersForRegionImpl<track, is_read>(base_addr, mask, start_range,
+                                                            end_range);
+        } else {
+            UpdatePageWatchersForRegionImpl<track, is_read>(base_addr, mask, start_range,
+                                                            end_range);
+        }
+    }
+
+    template <bool track, bool is_read, typename Range>
+    void UpdatePageWatchersForRegionImpl(VAddr base_addr, RegionBits& mask, Range start_range,
+                                         Range end_range) {
+
         if (start_range.second == end_range.second) {
             // if all pages are contiguous, use the regular UpdatePageWatchers
             const VAddr start_addr = base_addr + (start_range.first << PM_PAGE_BITS);
             const u64 size = (start_range.second - start_range.first) << PM_PAGE_BITS;
-            return UpdatePageWatchers<track, is_read>(start_addr, size);
+            return UpdatePageWatchersImpl<track, is_read>(start_addr, size);
         }
 
         size_t base_page = (base_addr >> PM_PAGE_BITS);
@@ -671,6 +709,22 @@ struct PageManager::Impl {
         UNREACHABLE();
     }
 
+    bool HasReadWatchers(VAddr address, u64 size) const noexcept {
+        const size_t first = address >> PM_PAGE_BITS;
+        const size_t last = std::min<size_t>((address + size - 1) >> PM_PAGE_BITS,
+                                             cached_pages.size() - 1);
+        for (size_t page = first; page <= last; ++page) {
+            // Racy by design: callers order this read against arming through the copy engine.
+            const u8 raw = std::atomic_ref<u8>{const_cast<u8&>(
+                               reinterpret_cast<const u8&>(cached_pages[page]))}
+                               .load(std::memory_order_relaxed);
+            if (std::bit_cast<PageState>(raw).num_read_watchers != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool HasReadWatcher(VAddr address) const {
         const size_t page = address >> PM_PAGE_BITS;
         if (page >= cached_pages.size()) return false;
@@ -740,6 +794,10 @@ void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
 
 bool PageManager::HasReadWatcher(VAddr address) const {
     return impl->HasReadWatcher(address);
+}
+
+bool PageManager::HasReadWatchers(VAddr address, u64 size) const noexcept {
+    return impl->HasReadWatchers(address, size);
 }
 
 void PageManager::TemporarilyUnprotect(VAddr address, u64 size) const {

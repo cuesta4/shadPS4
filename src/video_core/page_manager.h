@@ -80,6 +80,9 @@ public:
     /// Returns true if the page containing address has active read watchers.
     [[nodiscard]] bool HasReadWatcher(VAddr address) const;
 
+    /// Lock-free variant over a range, for the guest copy engine.
+    [[nodiscard]] bool HasReadWatchers(VAddr address, u64 size) const noexcept;
+
     /// Temporarily unprotects the page (e.g. for single-stepping after a fault).
     void TemporarilyUnprotect(VAddr address, u64 size) const;
 

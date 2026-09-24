@@ -53,8 +53,12 @@ GuestCopyEngine& GuestCopyEngine::Instance() {
 
 GuestCopyEngine::GuestCopyEngine()
     : slots{std::make_unique<std::array<Slot, SlotCount>>()},
-      pending_reads{std::make_unique<std::array<std::atomic<u32>, PendingTableSize>>()} {
+      pending_reads{std::make_unique<std::array<std::atomic<u32>, PendingTableSize>>()},
+      read_protect_intents{std::make_unique<std::array<std::atomic<u32>, PendingTableSize>>()} {
     for (auto& counter : *pending_reads) {
+        counter.store(0, std::memory_order_relaxed);
+    }
+    for (auto& counter : *read_protect_intents) {
         counter.store(0, std::memory_order_relaxed);
     }
 }
@@ -105,6 +109,29 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
         u64 offset = 0;
         while (offset < op.size) {
             const u64 piece = std::min<u64>(op.size - offset, SplitBytes);
+            Op piece_op = op;
+            if (op.kind != OpKind::Zero) {
+                piece_op.source += offset;
+            }
+            piece_op.destination += offset;
+            piece_op.size = piece;
+            offset += piece;
+
+            // Publish the pending read before checking for read protection; BeginReadProtect
+            // publishes its intent before checking for pending reads. One side always sees the
+            // other, so a worker never reads a page after its read access is revoked.
+            MarkPending(piece_op, true);
+            if (piece_op.kind != OpKind::Zero) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (IsReadProtected(piece_op.source, piece_op.size)) {
+                    // Faults on this range must be handled on the command processor thread.
+                    MarkPending(piece_op, false);
+                    stats.protected_inline_ops.fetch_add(1, std::memory_order_relaxed);
+                    ExecuteInline(std::span{&piece_op, 1});
+                    continue;
+                }
+            }
+
             if (building_ops == MaxOpsPerJob ||
                 (building_ops != 0 && building_bytes + piece > SplitBytes)) {
                 PublishJob(building_ops, building_bytes);
@@ -113,16 +140,8 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
                 WaitForSlot();
             }
             Slot& slot = (*slots)[(submitted.load(std::memory_order_relaxed) + 1) & SlotMask];
-            Op piece_op = op;
-            if (op.kind != OpKind::Zero) {
-                piece_op.source += offset;
-            }
-            piece_op.destination += offset;
-            piece_op.size = piece;
             slot.ops[building_ops++] = piece_op;
             building_bytes += piece;
-            MarkPending(piece_op, true);
-            offset += piece;
         }
     }
     if (building_ops != 0) {
@@ -169,7 +188,7 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
             LOG_INFO(Render_Vulkan,
                      "Guest copies (last 10s): {} jobs, {:.1f} MiB deferred, {:.1f} MiB inline, "
                      "workers {:.1f} ms, waiters helped {:.1f} ms, producer blocked {} times "
-                     "({:.1f} ms), overlap waits {}, ring-full waits {}",
+                     "({:.1f} ms), overlap waits {}, ring-full waits {}, protected inline ops {}",
                      current.jobs - last_logged.jobs,
                      static_cast<double>(current.bytes - last_logged.bytes) / MiB,
                      static_cast<double>(current.inline_bytes - last_logged.inline_bytes) / MiB,
@@ -178,7 +197,8 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
                      current.wait_calls - last_logged.wait_calls,
                      static_cast<double>(current.wait_ns - last_logged.wait_ns) / 1e6,
                      current.overlap_waits - last_logged.overlap_waits,
-                     current.slot_full_waits - last_logged.slot_full_waits);
+                     current.slot_full_waits - last_logged.slot_full_waits,
+                     current.protected_inline_ops - last_logged.protected_inline_ops);
             last_logged = current;
         }
     }
@@ -217,6 +237,16 @@ void GuestCopyEngine::RunJob(u64 seq, bool from_worker) {
     const u64 start = NowNs();
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     const std::span<const Op> ops{slot.ops.data(), slot.num_ops};
+    if (const u64 forbidden = self_test_forbidden.load(std::memory_order_acquire);
+        forbidden != 0) [[unlikely]] {
+        const VAddr begin = self_test_base + (forbidden >> 32);
+        const VAddr end = begin + (forbidden & 0xFFFFFFFFULL);
+        for (const Op& op : ops) {
+            if (op.kind != OpKind::Zero && op.source < end && begin < op.source + op.size) {
+                self_test_violations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     ExecuteOps(ops, telemetry_enabled);
     for (const Op& op : ops) {
         MarkPending(op, false);
@@ -295,6 +325,82 @@ void GuestCopyEngine::WaitCompleted(u64 seq) {
     }
 }
 
+void GuestCopyEngine::AddReadIntent(VAddr addr, u64 size, bool add) noexcept {
+    const u64 first = addr >> GranuleBits;
+    const u64 last = (addr + size - 1) >> GranuleBits;
+    for (u64 granule = first; granule <= last; ++granule) {
+        auto& counter = (*read_protect_intents)[PendingIndex(granule)];
+        if (add) {
+            counter.fetch_add(1, std::memory_order_seq_cst);
+        } else {
+            counter.fetch_sub(1, std::memory_order_release);
+        }
+    }
+    if (add) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+}
+
+void GuestCopyEngine::DrainRange(VAddr addr, u64 size) {
+    // Pending marks cover jobs the producer is still building, which a sequence number does not.
+    // With the read intent published, new reads of the range run inline on the producer, so the
+    // marks can only drain.
+    const u64 start = NowNs();
+    stats.wait_calls.fetch_add(1, std::memory_order_relaxed);
+    u64 spin_start = start;
+    while (OverlapsPending(addr, size)) {
+        if (TryRunOne(false)) {
+            spin_start = NowNs();
+            continue;
+        }
+        if (NowNs() - spin_start < WaiterSpinNs) {
+            for (u32 i = 0; i < 32; ++i) {
+                GUEST_COPY_PAUSE();
+            }
+            continue;
+        }
+        std::this_thread::yield();
+    }
+    const u64 elapsed = NowNs() - start;
+    stats.wait_ns.fetch_add(elapsed, std::memory_order_relaxed);
+    if (Common::PerformanceTelemetry::Enabled()) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyWaitCalls, 1);
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyWaitNs, elapsed);
+    }
+}
+
+void GuestCopyEngine::BeginReadProtect(VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    AddReadIntent(addr, size, true);
+    if (OverlapsPending(addr, size)) {
+        stats.overlap_waits.fetch_add(1, std::memory_order_relaxed);
+        DrainRange(addr, size);
+    }
+}
+
+void GuestCopyEngine::EndReadProtect(VAddr addr, u64 size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    AddReadIntent(addr, size, false);
+}
+
+bool GuestCopyEngine::IsReadProtected(VAddr addr, u64 size) const noexcept {
+    const u64 first = addr >> GranuleBits;
+    const u64 last = (addr + size - 1) >> GranuleBits;
+    for (u64 granule = first; granule <= last; ++granule) {
+        if ((*read_protect_intents)[PendingIndex(granule)].load(std::memory_order_acquire) != 0) {
+            return true;
+        }
+    }
+    const ReadProtectionProbe probe = read_probe.load(std::memory_order_acquire);
+    return probe != nullptr && probe(read_probe_context, addr, size);
+}
+
 void GuestCopyEngine::WaitForGuestWriteSlow(VAddr addr, u64 size) {
     if (size == 0 || !OverlapsPending(addr, size)) {
         return;
@@ -304,7 +410,14 @@ void GuestCopyEngine::WaitForGuestWriteSlow(VAddr addr, u64 size) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyOverlapWaits, 1);
     }
-    WaitCompleted(SubmittedSeq());
+    if (is_producer_thread) {
+        // The producer never holds an unpublished job outside Enqueue.
+        WaitCompleted(SubmittedSeq());
+        return;
+    }
+    AddReadIntent(addr, size, true);
+    DrainRange(addr, size);
+    AddReadIntent(addr, size, false);
 }
 
 void GuestCopyEngine::WorkerLoop(std::stop_token stoken, u32 index) {
@@ -358,7 +471,6 @@ void GuestCopyEngine::ExecuteInline(std::span<const Op> ops) {
 }
 
 void GuestCopyEngine::ExecuteOps(std::span<const Op> ops, bool telemetry_enabled) {
-    auto* memory = Core::Memory::Instance();
     boost::container::static_vector<Core::MemoryManager::SparseCopyRequest, MaxOpsPerJob> batch;
     u64 batch_bytes = 0;
     const auto flush = [&] {
@@ -367,7 +479,7 @@ void GuestCopyEngine::ExecuteOps(std::span<const Op> ops, bool telemetry_enabled
         }
         Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
             Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
-        memory->CopySparseMemoryBatch(
+        Core::Memory::Instance()->CopySparseMemoryBatch(
             std::span<const Core::MemoryManager::SparseCopyRequest>{batch.data(), batch.size()},
             batch_bytes, telemetry_enabled, false);
         batch.clear();
@@ -433,6 +545,7 @@ GuestCopyEngine::Stats GuestCopyEngine::GetStats() const noexcept {
         .wait_ns = stats.wait_ns.load(std::memory_order_relaxed),
         .overlap_waits = stats.overlap_waits.load(std::memory_order_relaxed),
         .slot_full_waits = stats.slot_full_waits.load(std::memory_order_relaxed),
+        .protected_inline_ops = stats.protected_inline_ops.load(std::memory_order_relaxed),
     };
 }
 
@@ -483,6 +596,10 @@ bool GuestCopyEngine::RunSelfTest() {
     std::atomic<bool> stop_waiters{false};
     std::atomic<bool> waiter_failed{false};
     std::atomic<u64> waiter_checks{0};
+    std::atomic<u64> protect_cycles{0};
+    self_test_base = reinterpret_cast<VAddr>(source.data());
+    self_test_violations.store(0, std::memory_order_relaxed);
+    const u64 inline_before = stats.protected_inline_ops.load(std::memory_order_relaxed);
 
     std::thread producer([&] {
         is_producer_thread = true;
@@ -506,6 +623,26 @@ bool GuestCopyEngine::RunSelfTest() {
                 }
             });
         }
+
+        // Revokes "read access" to source ranges the way read watchers do; no queued job may
+        // read a range between BeginReadProtect returning and EndReadProtect.
+        waiters.emplace_back([&] {
+            XorShift rng{0xC0FFEEULL};
+            while (!stop_waiters.load(std::memory_order_acquire)) {
+                const u64 size = rng.Range(4_KB, 64_KB);
+                const u64 offset = rng.Range(0, SourceSize - size);
+                const VAddr begin = self_test_base + offset;
+                BeginReadProtect(begin, size);
+                self_test_forbidden.store((offset << 32) | size, std::memory_order_release);
+                const u64 hold_until = NowNs() + rng.Range(1'000, 50'000);
+                while (NowNs() < hold_until) {
+                    GUEST_COPY_PAUSE();
+                }
+                self_test_forbidden.store(0, std::memory_order_release);
+                EndReadProtect(begin, size);
+                protect_cycles.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
 
         XorShift rng{0x9E3779B97F4A7C15ULL};
         std::vector<Expectation> round_ops;
@@ -616,15 +753,22 @@ bool GuestCopyEngine::RunSelfTest() {
     if (failure.empty() && waiter_failed.load(std::memory_order_relaxed)) {
         failure = "a waiter returned before its target sequence completed";
     }
+    if (const u64 violations = self_test_violations.load(std::memory_order_relaxed);
+        failure.empty() && violations != 0) {
+        failure = std::to_string(violations) + " queued job(s) read a read-protected range";
+    }
+    self_test_base = 0;
     if (!failure.empty()) {
         LOG_ERROR(Render_Vulkan, "Guest copy self-test FAILED: {}", failure);
         return false;
     }
     LOG_INFO(Render_Vulkan,
              "Guest copy self-test passed: {} workers, {} ops, {:.1f} MiB, {} overlap checks, "
-             "{} concurrent waits",
+             "{} concurrent waits, {} protect cycles, {} ops rerouted inline",
              workers.size(), total_ops, static_cast<double>(total_bytes) / (1024.0 * 1024.0),
-             overlap_checks, waiter_checks.load(std::memory_order_relaxed));
+             overlap_checks, waiter_checks.load(std::memory_order_relaxed),
+             protect_cycles.load(std::memory_order_relaxed),
+             stats.protected_inline_ops.load(std::memory_order_relaxed) - inline_before);
     return true;
 }
 

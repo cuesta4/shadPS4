@@ -22,6 +22,7 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
+#include "video_core/guest_copy_engine.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -98,6 +99,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
     app.add_option("--mount", mounts, "Mount source to destination");
     app.add_option("-e,--env", env_vars, "Environment variables to pass to the guest");
+    std::optional<u32> guestCopySelfTest;
+    app.add_option("--guest-copy-selftest", guestCopySelfTest,
+                   "Stress-test the guest copy engine with N workers and exit");
 
     // ---- Capture args after `--` verbatim ----
     app.allow_extras();
@@ -143,6 +147,16 @@ int main(int argc, char* argv[]) {
     Common::Log::Setup("shadps4.log");
 
     LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
+
+    if (guestCopySelfTest) {
+        auto& copy_engine = VideoCore::GuestCopyEngine::Instance();
+        copy_engine.Start(*guestCopySelfTest);
+        const bool passed = copy_engine.RunSelfTest();
+        copy_engine.Stop();
+        std::cout << "guest copy self-test " << (passed ? "passed" : "FAILED") << std::endl;
+        Common::Log::Flush();
+        return passed ? 0 : 3;
+    }
 
     IPC::Instance().Init();
 
