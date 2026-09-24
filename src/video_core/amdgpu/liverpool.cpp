@@ -302,7 +302,7 @@ static SHAD_NO_INLINE void BeginHostMarker(Vulkan::Rasterizer& rasterizer,
 void RecordPendingCompletionHazard(Common::PerformanceTelemetry::CausalTraceToken& trace,
                                    u64 completed_stages, u64 completed_writes,
                                    u64 requirement_bits, u8 confidence) {
-    if (!Common::PerformanceTelemetry::Enabled()) {
+    if (!Common::PerformanceTelemetry::HeavyEnabled()) {
         return;
     }
     if (trace.hazard_id == 0) {
@@ -639,6 +639,8 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+        [[maybe_unused]] const bool telemetry_detail =
+            telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::GcpWakes, 1);
@@ -746,6 +748,8 @@ void Liverpool::Process(std::stop_token stoken) {
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, u32 ib_depth) {
     FIBER_ENTER(ccb_task_name);
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    [[maybe_unused]] const bool telemetry_detail =
+        telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
 
     while (!ccb.empty()) {
         if (num_commands.load(std::memory_order_acquire) != 0) [[unlikely]] {
@@ -770,7 +774,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, u32 ib_dept
         switch (opcode) {
         case PM4ItOpcode::Nop: {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Constant, GfxQueueId,
                     static_cast<u32>(opcode), ib_depth,
@@ -1070,7 +1074,7 @@ SHAD_NO_INLINE void SignalEventWriteEos(const PM4CmdEventWriteEos& packet,
         });
     }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         Common::PerformanceTelemetry::RecordFenceSignal(Common::PerformanceTelemetry::FenceSignalSample{
             .fence_seq = fence_token.fence_seq,
             .generation = fence_token.generation,
@@ -1122,7 +1126,7 @@ SHAD_NO_INLINE void SignalEventWriteEop(const PM4CmdEventWriteEop& packet,
             [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
     }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         Common::PerformanceTelemetry::RecordFenceSignal(Common::PerformanceTelemetry::FenceSignalSample{
             .fence_seq = fence_token.fence_seq,
             .generation = fence_token.generation,
@@ -1183,7 +1187,7 @@ SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& packet,
                                       VideoCore::MemoryWriteSource::CommandProcessor);
     }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         Common::PerformanceTelemetry::RecordFenceSignal(Common::PerformanceTelemetry::FenceSignalSample{
             .fence_seq = fence_token.fence_seq,
             .generation = fence_token.generation,
@@ -1346,7 +1350,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
         Common::PerformanceTelemetry::Enabled(),
         Common::PerformanceTelemetry::Counter::GcpSyncPacketNs};
     Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
         completion_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
         if (packet.Address<VAddr>() != 0) {
@@ -1706,7 +1710,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
 
     Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Common::PerformanceTelemetry::Enabled() && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
+    if (Common::PerformanceTelemetry::HeavyEnabled() && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
         const auto fence_seq = Common::PerformanceTelemetry::NextFenceSeq();
         const auto gen = Common::PerformanceTelemetry::NextFenceGen();
         const auto pkt_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
@@ -1819,7 +1823,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
         Common::PerformanceTelemetry::Enabled(),
         Common::PerformanceTelemetry::Counter::GcpSyncPacketNs};
     Common::PerformanceTelemetry::CausalTraceToken completion_trace{};
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         completion_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
         completion_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
         if (packet.Address<void>() != nullptr) {
@@ -1883,7 +1887,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
     Common::PerformanceTelemetry::ScopedCausalContext completion_context{completion_trace};
     Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Common::PerformanceTelemetry::Enabled()) {
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
         const auto fence_seq = Common::PerformanceTelemetry::NextFenceSeq();
         const auto gen = Common::PerformanceTelemetry::NextFenceGen();
         const auto pkt_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
@@ -1984,6 +1988,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             u32 ib_depth) {
     FIBER_ENTER(dcb_task_name);
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    [[maybe_unused]] const bool telemetry_detail =
+        telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
 
     cblock.Reset();
 
@@ -2044,7 +2050,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth,
@@ -2101,7 +2107,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ContextControl: {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     const auto* context = reinterpret_cast<const PM4CmdContextControl*>(header);
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
@@ -2124,7 +2130,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 [[maybe_unused]] const bool changed =
                     WriteGraphicsRegisters(reg_addr, payload, count - 1);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4RegisterEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics,
                         static_cast<u32>(opcode), set_data->reg_offset, count - 1, changed);
@@ -2151,7 +2157,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     changed = WriteGraphicsRegistersSlow(reg_addr, payload, word_count);
                 }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4RegisterEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics,
                         static_cast<u32>(opcode), set_data->reg_offset, count - 1, changed);
@@ -2202,7 +2208,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                 }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4RegisterEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics,
                         static_cast<u32>(opcode), set_data->reg_offset, count - 1, changed);
@@ -2216,7 +2222,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     Regs::UconfigRegWordOffset + set_data->reg_offset,
                     reinterpret_cast<const u32*>(header + 2), count - 1);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4RegisterEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics,
                         static_cast<u32>(opcode), set_data->reg_offset, count - 1, changed);
@@ -2226,7 +2232,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::SetPredication: {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, count > 0 ? it_body[0] : 0,
@@ -2246,7 +2252,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, index_type->raw, 0);
@@ -2504,7 +2510,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
                 Common::PerformanceTelemetry::CausalTraceToken event_trace{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     event_trace.scope_id = Common::PerformanceTelemetry::NextScopeSeq();
                     event_trace.cause_id = Common::PerformanceTelemetry::NextCauseSeq();
                     const auto packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
@@ -2599,7 +2605,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, event_eos->event_control,
@@ -2616,7 +2622,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, event_eop->event_control,
@@ -2768,7 +2774,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 Common::PerformanceTelemetry::ScopedCausalContext acquire_context{acquire_trace};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                         Common::PerformanceTelemetry::Pm4Engine::Graphics, GfxQueueId,
                         static_cast<u32>(opcode), ib_depth, acquire_mem->cp_coher_cntl,
@@ -2842,7 +2848,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 u64 wait_location{};
                 bool used_vo_sleep{};
                 Common::PerformanceTelemetry::ShadowBasis shadow_basis{Common::PerformanceTelemetry::ShadowBasis::None};
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     wait_seq = Common::PerformanceTelemetry::NextWaitSeq();
                     const VAddr wait_addr = (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory)
                                                 ? reinterpret_cast<VAddr>(wait_reg_mem->Address<const u32*>())
@@ -2943,7 +2949,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         Common::PerformanceTelemetry::Add(
                             Common::PerformanceTelemetry::Counter::VirtualWaitConsumed);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                        if (telemetry_enabled) {
+                        if (telemetry_detail) {
                             const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
                             Common::PerformanceTelemetry::RecordWaitComplete(
                                 Common::PerformanceTelemetry::WaitCompleteSample{
@@ -3044,7 +3050,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                               Common::PerformanceTelemetry::Timestamp() - wait_spin_start);
                         }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                        if (telemetry_enabled) {
+                        if (telemetry_detail) {
                             const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
                             Common::PerformanceTelemetry::RecordCpuToGpuLabelWait(
                                 Common::PerformanceTelemetry::CpuToGpuLabelWaitSample{
@@ -3085,7 +3091,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                 }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                if (telemetry_enabled) {
+                if (telemetry_detail) {
                     u32 val_end = 0;
                     if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
                         Common::PerformanceTelemetry::ScopedSemanticReadOrigin end_origin{
@@ -3205,6 +3211,8 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u32 ib_depth) {
     FIBER_ENTER(acb_task_name[vqid]);
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    [[maybe_unused]] const bool telemetry_detail =
+        telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
@@ -3294,7 +3302,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
         switch (opcode) {
         case PM4ItOpcode::Nop: {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1,
                     static_cast<u32>(opcode), ib_depth,
@@ -3372,7 +3380,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                  (static_cast<u64>(acquire_mem->cp_coher_size_hi) << 32))
                 << 8;
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 Common::PerformanceTelemetry::CausalTraceToken acquire_trace{
                     .candidate_id = last_sync_packet.candidate_id,
                     .scope_id = Common::PerformanceTelemetry::NextScopeSeq(),
@@ -3494,7 +3502,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                                                  payload, word_count);
             }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 Common::PerformanceTelemetry::RecordPm4RegisterEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Compute,
                     static_cast<u32>(opcode), set_data->reg_offset,
@@ -3621,7 +3629,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
             u64 wait_location{};
             Common::PerformanceTelemetry::ShadowBasis shadow_basis{Common::PerformanceTelemetry::ShadowBasis::None};
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 wait_seq = Common::PerformanceTelemetry::NextWaitSeq();
                 const VAddr wait_addr = (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory)
                                             ? reinterpret_cast<VAddr>(wait_reg_mem->Address<const u32*>())
@@ -3719,7 +3727,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 }
             }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 u32 val_end = 0;
                 if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
                     Common::PerformanceTelemetry::ScopedSemanticReadOrigin end_origin{
@@ -3839,7 +3847,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 completion_trace};
             Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 Common::PerformanceTelemetry::RecordPm4ControlEnabled(
                     Common::PerformanceTelemetry::Pm4Engine::Compute, vqid + 1,
                     static_cast<u32>(opcode), ib_depth, release_mem->dw1, release_mem->dw2);
@@ -3959,7 +3967,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
         }
         case PM4ItOpcode::EventWrite: {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-            if (telemetry_enabled) {
+            if (telemetry_detail) {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
                 Common::PerformanceTelemetry::CausalTraceToken event_trace{
                     .scope_id = Common::PerformanceTelemetry::NextScopeSeq(),
@@ -4070,6 +4078,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    [[maybe_unused]] const bool telemetry_detail =
+        telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
     auto task = ProcessGraphics(dcb, ccb);
     task.handle.promise().telemetry_ready_since_ns =
         telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;
@@ -4103,6 +4113,8 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    [[maybe_unused]] const bool telemetry_detail =
+        telemetry_enabled && Common::PerformanceTelemetry::HeavyEnabled();
     const auto& task = ProcessCompute(acb, vqid);
     task.handle.promise().telemetry_ready_since_ns =
         telemetry_enabled ? Common::PerformanceTelemetry::Timestamp() : 0;

@@ -2435,6 +2435,15 @@ TraceCaptureProfile GetCaptureProfileEnabled() noexcept {
     return profile;
 }
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+namespace Detail {
+const bool heavy_telemetry_requested = [] {
+    const char* env = std::getenv("SHADPS4_TELEMETRY_HEAVY");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}();
+} // namespace Detail
+#endif
+
 namespace {
 
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -2532,6 +2541,9 @@ void RecordTimerSampleEnabled(TimerSite site, u64 start_ns, u32 stage) noexcept 
 
 void RecordTimerSampleDurationEnabled(TimerSite site, u64 duration_ns, u32 stage) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2557,6 +2569,9 @@ void RecordTimerSampleDurationEnabled(TimerSite site, u64 duration_ns, u32 stage
 
 void RecordStageUncacheableEnabled(u32 stage, u32 reason_mask) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2577,6 +2592,9 @@ void RecordStageUncacheableEnabled(u32 stage, u32 reason_mask) noexcept {
 
 void RecordStageSlowResultEnabled(bool hit, bool current, u64 comparisons) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2601,6 +2619,9 @@ void RecordStageSlowResultEnabled(bool hit, bool current, u64 comparisons) noexc
 
 void RecordDynamicStateDecisionEnabled(u32 reason_mask) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2624,6 +2645,9 @@ void RecordDynamicStateDecisionEnabled(u32 reason_mask) noexcept {
 
 void RecordDynamicCommitEnabled(u32 pending_groups, u32 emitted_groups) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2653,6 +2677,9 @@ void RecordDynamicCommitEnabled(u32 pending_groups, u32 emitted_groups) noexcept
 
 void RecordDescriptorDecisionEnabled(u32 reason_mask) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2677,6 +2704,9 @@ void RecordDescriptorDecisionEnabled(u32 reason_mask) noexcept {
 
 void RecordImageFindPathEnabled(ImageFindPath path) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2706,6 +2736,9 @@ void RecordStagingAllocationEnabled(StagingSite site, u64 bytes) noexcept {
     }
     if (auto* ring = GetThreadRing()) {
         AddSingleWriter(ring->counters[static_cast<size_t>(Counter::StagingBytes)], bytes);
+        if (!HeavyEnabled()) {
+            return;
+        }
         static thread_local u32 sequence{};
         if (ShouldSample(sequence, StagingDetailSamplePeriod)) {
             auto& detail = ring->staging[site_index];
@@ -2722,6 +2755,9 @@ void RecordStagingAllocationEnabled(StagingSite site, u64 bytes) noexcept {
 
 void RecordStagingSourceEnabled(StagingSite site, StagingSource source, u64 bytes) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2747,6 +2783,9 @@ void RecordStagingSourceEnabled(StagingSite site, StagingSource source, u64 byte
 
 bool ShouldSampleStagingBatchEnabled() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return false;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return false;
     }
@@ -2812,6 +2851,9 @@ void RecordStagingBatchEnabled(const StagingBatchSample& sample, bool sampled) n
 
 void RecordStagingSparseCopyEnabled(const StagingSparseCopySample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2858,6 +2900,9 @@ void RecordStagingSparseCopyEnabled(const StagingSparseCopySample& sample) noexc
 
 void RecordStagingBackendEnabled(StagingBackend backend, u64 bytes) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2911,6 +2956,9 @@ void RecordStagingMemoryTypeEnabled(StagingMemoryKind kind, u32 memory_type, u32
 
 bool ShouldSampleStagingSparsePhaseEnabled() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return false;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return false;
     }
@@ -2932,6 +2980,9 @@ bool ShouldSampleStagingSparsePhaseEnabled() noexcept {
 
 bool ShouldSampleDescriptorCrossPipelineEnabled() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return false;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return false;
     }
@@ -2944,6 +2995,9 @@ bool ShouldSampleDescriptorCrossPipelineEnabled() noexcept {
 
 void RecordDescriptorCrossPipelineEnabled(bool exact_state, bool compatible_layout) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -3303,6 +3357,9 @@ void CountPm4PacketEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth
         AddSingleWriter(ring->opcodes[opcode & 0xff], 1);
         ObserveSingleWriterMax(ring->counters[static_cast<size_t>(Counter::IbDepthMax)], depth + 1);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+        if (!HeavyEnabled()) {
+            return;
+        }
         if (!ring->pm4) {
             ring->pm4 = std::make_unique<Pm4Detail>();
         }
@@ -3327,6 +3384,9 @@ void CountPm4PacketEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
 void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 depth,
                              u32 control0, u32 control1, u32 tag) noexcept {
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -3367,6 +3427,9 @@ void RecordPm4ControlEnabled(Pm4Engine engine, u32 queue_id, u32 opcode, u32 dep
 
 void RecordPm4RegisterEnabled(Pm4Engine engine, u32 opcode, u32 register_offset, u32 words,
                               bool changed) noexcept {
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -3393,6 +3456,9 @@ void RecordPm4RegisterEnabled(Pm4Engine engine, u32 opcode, u32 register_offset,
 void RecordPm4WaitEnabled(Pm4Engine engine, u32 queue_id, u32 depth, u32 control,
                           u64 location, u32 reference, u32 mask, u32 poll_interval,
                           u64 failed_tests, bool vo_sleep) noexcept {
+    if (!HeavyEnabled()) {
+        return;
+    }
     if (g_dumping.load(std::memory_order_relaxed)) {
         return;
     }

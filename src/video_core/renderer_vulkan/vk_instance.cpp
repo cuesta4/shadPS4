@@ -7,6 +7,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/performance_telemetry.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
@@ -346,6 +347,7 @@ bool Instance::CreateDevice() {
 #endif
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     pipeline_executable_properties =
+        Common::PerformanceTelemetry::HeavyEnabled() &&
         add_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (pipeline_executable_properties) {
         pipeline_executable_properties =

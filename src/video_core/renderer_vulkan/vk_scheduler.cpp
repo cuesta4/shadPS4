@@ -41,7 +41,10 @@ Scheduler::Scheduler(const Instance& instance, bool async_submit)
     : instance{instance}, async_submit{async_submit}, master_semaphore{instance},
       command_pool{instance, &master_semaphore} {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    gpu_profiler = std::make_unique<GpuProfiler>(instance, master_semaphore);
+    // GPU timestamps and pipeline statistics serialize GPU work; heavy telemetry only.
+    if (Common::PerformanceTelemetry::HeavyEnabled()) {
+        gpu_profiler = std::make_unique<GpuProfiler>(instance, master_semaphore);
+    }
 #endif
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
@@ -128,7 +131,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     attachment_hash = RenderStateHash(new_state);
     rendering_scope_id = Common::PerformanceTelemetry::NextScopeSeq();
-    gpu_profiler->BeginRendering(attachment_hash);
+    if (gpu_profiler) {
+        gpu_profiler->BeginRendering(attachment_hash);
+    }
 #endif
 }
 
@@ -167,7 +172,9 @@ void Scheduler::EndRendering(Common::PerformanceTelemetry::ScopeBreakReason reas
             .avoidability = avoidability,
             .confidence = 255,
         });
-    gpu_profiler->EndRendering();
+    if (gpu_profiler) {
+        gpu_profiler->EndRendering();
+    }
 #endif
     is_rendering = false;
     current_cmdbuf.endRendering();
@@ -181,7 +188,9 @@ void Scheduler::EndRendering(Common::PerformanceTelemetry::ScopeBreakReason reas
 void Scheduler::ProfileGraphicsDraw(u64 pipeline_hash, u32 command_count) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     current_pipeline_hash = pipeline_hash;
-    gpu_profiler->GraphicsDraw(pipeline_hash, command_count);
+    if (gpu_profiler) {
+        gpu_profiler->GraphicsDraw(pipeline_hash, command_count);
+    }
 #else
     static_cast<void>(pipeline_hash);
     static_cast<void>(command_count);
@@ -191,7 +200,9 @@ void Scheduler::ProfileGraphicsDraw(u64 pipeline_hash, u32 command_count) {
 void Scheduler::ProfileComputeDispatch(u64 pipeline_hash, u32 command_count) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     current_pipeline_hash = pipeline_hash;
-    gpu_profiler->ComputeDispatch(pipeline_hash, command_count);
+    if (gpu_profiler) {
+        gpu_profiler->ComputeDispatch(pipeline_hash, command_count);
+    }
 #else
     static_cast<void>(pipeline_hash);
     static_cast<void>(command_count);
@@ -201,7 +212,7 @@ void Scheduler::ProfileComputeDispatch(u64 pipeline_hash, u32 command_count) {
 u64 Scheduler::BeginGpuInterval(Common::PerformanceTelemetry::GpuIntervalKind kind,
                                 u64 object_hash, u64 bytes) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return gpu_profiler->BeginInterval(kind, object_hash, bytes);
+    return gpu_profiler ? gpu_profiler->BeginInterval(kind, object_hash, bytes) : 0;
 #else
     static_cast<void>(kind);
     static_cast<void>(object_hash);
@@ -212,7 +223,9 @@ u64 Scheduler::BeginGpuInterval(Common::PerformanceTelemetry::GpuIntervalKind ki
 
 void Scheduler::EndGpuInterval(u64 token) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    gpu_profiler->EndInterval(token);
+    if (gpu_profiler) {
+        gpu_profiler->EndInterval(token);
+    }
 #else
     static_cast<void>(token);
 #endif
@@ -362,8 +375,10 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    gpu_profiler->BeginCommandBuffer(current_cmdbuf, current_command_buffer_seq,
-                                     Common::PerformanceTelemetry::CurrentFrameSeq());
+    if (gpu_profiler) {
+        gpu_profiler->BeginCommandBuffer(current_cmdbuf, current_command_buffer_seq,
+                                         Common::PerformanceTelemetry::CurrentFrameSeq());
+    }
 #endif
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
@@ -413,7 +428,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
                                 : Common::PerformanceTelemetry::ScopeBreakReason::RequiredNonGraphicsCommand,
                  Common::PerformanceTelemetry::Avoidability::ProvenRequired);
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    gpu_profiler->EndCommandBuffer(submit_seq, signal_value);
+    if (gpu_profiler) {
+        gpu_profiler->EndCommandBuffer(submit_seq, signal_value);
+    }
 #endif
     Check(current_cmdbuf.end());
 
@@ -475,7 +492,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
         master_semaphore.Refresh();
     }
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    gpu_profiler->Collect();
+    if (gpu_profiler) {
+        gpu_profiler->Collect();
+    }
 #endif
     AllocateWorkerCommandBuffers();
 

@@ -1261,6 +1261,25 @@ inline constexpr u32 InvalidTimerStage = std::numeric_limits<u32>::max();
 #endif
 }
 
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+namespace Detail {
+/// SHADPS4_TELEMETRY_HEAVY=1, read once at startup.
+extern const bool heavy_telemetry_requested;
+} // namespace Detail
+#endif
+
+/// Heavy diagnostics: the GPU profiler, per-packet PM4 detail, causal/fence/readback tracing,
+/// semantic watches, sampled timer sites and staging breakdowns. They distort frame times, so a
+/// telemetry build keeps only per-frame counters unless SHADPS4_TELEMETRY_HEAVY=1 is set. With the
+/// heavy layer off every heavy hook behaves as in a release build.
+[[nodiscard]] inline bool HeavyEnabled() noexcept {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+    return Detail::heavy_telemetry_requested && Enabled();
+#else
+    return false;
+#endif
+}
+
 class Gate {
 public:
     constexpr Gate& operator=(bool value) noexcept {
@@ -2892,7 +2911,7 @@ class ScopedCausalContext {
 public:
     explicit ScopedCausalContext(const CausalTraceToken& token) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-        if (Enabled()) {
+        if (HeavyEnabled()) {
             active = true;
             previous = tl_causal_context;
             tl_causal_context = token;
@@ -2919,7 +2938,7 @@ private:
 
 [[nodiscard]] inline CausalTraceToken CurrentCausalContext() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? tl_causal_context : CausalTraceToken{};
+    return HeavyEnabled() ? tl_causal_context : CausalTraceToken{};
 #else
     return {};
 #endif
@@ -3167,7 +3186,7 @@ QueryFrameSeq NextQueryFrameSeqEnabled() noexcept;
 
 inline EventSeq NextEventSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextEventSeqEnabled() : 0;
+    return HeavyEnabled() ? NextEventSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3175,7 +3194,7 @@ inline EventSeq NextEventSeq() noexcept {
 
 inline PacketSeq NextPacketSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextPacketSeqEnabled() : 0;
+    return HeavyEnabled() ? NextPacketSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3183,7 +3202,7 @@ inline PacketSeq NextPacketSeq() noexcept {
 
 inline ProducerSeq NextProducerSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextProducerSeqEnabled() : 0;
+    return HeavyEnabled() ? NextProducerSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3191,7 +3210,7 @@ inline ProducerSeq NextProducerSeq() noexcept {
 
 inline FenceSeq NextFenceSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextFenceSeqEnabled() : 0;
+    return HeavyEnabled() ? NextFenceSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3199,7 +3218,7 @@ inline FenceSeq NextFenceSeq() noexcept {
 
 inline FenceGen NextFenceGen() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextFenceGenEnabled() : 0;
+    return HeavyEnabled() ? NextFenceGenEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3207,7 +3226,7 @@ inline FenceGen NextFenceGen() noexcept {
 
 inline WaitSeq NextWaitSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextWaitSeqEnabled() : 0;
+    return HeavyEnabled() ? NextWaitSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3215,7 +3234,7 @@ inline WaitSeq NextWaitSeq() noexcept {
 
 inline ResourceSeq NextResourceSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextResourceSeqEnabled() : 0;
+    return HeavyEnabled() ? NextResourceSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3223,7 +3242,7 @@ inline ResourceSeq NextResourceSeq() noexcept {
 
 inline ResourceVersion NextResourceVersion() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextResourceVersionEnabled() : 0;
+    return HeavyEnabled() ? NextResourceVersionEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3231,7 +3250,7 @@ inline ResourceVersion NextResourceVersion() noexcept {
 
 inline SubmitSeq NextSubmitSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextSubmitSeqEnabled() : 0;
+    return HeavyEnabled() ? NextSubmitSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3239,7 +3258,7 @@ inline SubmitSeq NextSubmitSeq() noexcept {
 
 inline CpuAccessSeq NextCpuAccessSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextCpuAccessSeqEnabled() : 0;
+    return HeavyEnabled() ? NextCpuAccessSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3247,7 +3266,7 @@ inline CpuAccessSeq NextCpuAccessSeq() noexcept {
 
 inline ReadbackSeq NextReadbackSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextReadbackSeqEnabled() : 0;
+    return HeavyEnabled() ? NextReadbackSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3255,7 +3274,7 @@ inline ReadbackSeq NextReadbackSeq() noexcept {
 
 inline u64 NextCandidateSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextCandidateSeqEnabled() : 0;
+    return HeavyEnabled() ? NextCandidateSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3263,7 +3282,7 @@ inline u64 NextCandidateSeq() noexcept {
 
 inline u64 NextAuthoritySeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextAuthoritySeqEnabled() : 0;
+    return HeavyEnabled() ? NextAuthoritySeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3271,7 +3290,7 @@ inline u64 NextAuthoritySeq() noexcept {
 
 inline u64 NextVirtualFenceSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextVirtualFenceSeqEnabled() : 0;
+    return HeavyEnabled() ? NextVirtualFenceSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3279,7 +3298,7 @@ inline u64 NextVirtualFenceSeq() noexcept {
 
 inline u64 NextRamDemandSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextRamDemandSeqEnabled() : 0;
+    return HeavyEnabled() ? NextRamDemandSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3287,7 +3306,7 @@ inline u64 NextRamDemandSeq() noexcept {
 
 inline u64 NextRamDemandGroupSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextRamDemandGroupSeqEnabled() : 0;
+    return HeavyEnabled() ? NextRamDemandGroupSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3295,7 +3314,7 @@ inline u64 NextRamDemandGroupSeq() noexcept {
 
 inline u64 NextMaterializeSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextMaterializeSeqEnabled() : 0;
+    return HeavyEnabled() ? NextMaterializeSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3303,7 +3322,7 @@ inline u64 NextMaterializeSeq() noexcept {
 
 inline u64 NextConsumerSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextConsumerSeqEnabled() : 0;
+    return HeavyEnabled() ? NextConsumerSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3311,7 +3330,7 @@ inline u64 NextConsumerSeq() noexcept {
 
 inline ScopeSeq NextScopeSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextScopeSeqEnabled() : 0;
+    return HeavyEnabled() ? NextScopeSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3319,7 +3338,7 @@ inline ScopeSeq NextScopeSeq() noexcept {
 
 inline CauseSeq NextCauseSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextCauseSeqEnabled() : 0;
+    return HeavyEnabled() ? NextCauseSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3327,7 +3346,7 @@ inline CauseSeq NextCauseSeq() noexcept {
 
 inline SignalSeq NextSignalSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextSignalSeqEnabled() : 0;
+    return HeavyEnabled() ? NextSignalSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3335,7 +3354,7 @@ inline SignalSeq NextSignalSeq() noexcept {
 
 inline RepresentationSeq NextRepresentationSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextRepresentationSeqEnabled() : 0;
+    return HeavyEnabled() ? NextRepresentationSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3343,7 +3362,7 @@ inline RepresentationSeq NextRepresentationSeq() noexcept {
 
 inline HazardSeq NextHazardSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextHazardSeqEnabled() : 0;
+    return HeavyEnabled() ? NextHazardSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3351,7 +3370,7 @@ inline HazardSeq NextHazardSeq() noexcept {
 
 inline BarrierSeq NextBarrierSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextBarrierSeqEnabled() : 0;
+    return HeavyEnabled() ? NextBarrierSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3359,7 +3378,7 @@ inline BarrierSeq NextBarrierSeq() noexcept {
 
 inline ScopeBreakSeq NextScopeBreakSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextScopeBreakSeqEnabled() : 0;
+    return HeavyEnabled() ? NextScopeBreakSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3367,7 +3386,7 @@ inline ScopeBreakSeq NextScopeBreakSeq() noexcept {
 
 inline EffectSeq NextEffectSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextEffectSeqEnabled() : 0;
+    return HeavyEnabled() ? NextEffectSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3375,7 +3394,7 @@ inline EffectSeq NextEffectSeq() noexcept {
 
 inline GpuIntervalSeq NextGpuIntervalSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextGpuIntervalSeqEnabled() : 0;
+    return HeavyEnabled() ? NextGpuIntervalSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3383,7 +3402,7 @@ inline GpuIntervalSeq NextGpuIntervalSeq() noexcept {
 
 inline QueryFrameSeq NextQueryFrameSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextQueryFrameSeqEnabled() : 0;
+    return HeavyEnabled() ? NextQueryFrameSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3391,7 +3410,7 @@ inline QueryFrameSeq NextQueryFrameSeq() noexcept {
 
 inline CmdBufferSeq NextCmdBufferSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextCmdBufferSeqEnabled() : 0;
+    return HeavyEnabled() ? NextCmdBufferSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3399,7 +3418,7 @@ inline CmdBufferSeq NextCmdBufferSeq() noexcept {
 
 inline FrameSeq CurrentFrameSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CurrentFrameSeqEnabled() : 0;
+    return HeavyEnabled() ? CurrentFrameSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3407,7 +3426,7 @@ inline FrameSeq CurrentFrameSeq() noexcept {
 
 inline CmdBufferSeq CurrentCmdBufferSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CurrentCmdBufferSeqEnabled() : 0;
+    return HeavyEnabled() ? CurrentCmdBufferSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3415,7 +3434,7 @@ inline CmdBufferSeq CurrentCmdBufferSeq() noexcept {
 
 inline PacketSeq CurrentPacketSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CurrentPacketSeqEnabled() : 0;
+    return HeavyEnabled() ? CurrentPacketSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3423,7 +3442,7 @@ inline PacketSeq CurrentPacketSeq() noexcept {
 
 inline ProducerSeq CurrentProducerSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CurrentProducerSeqEnabled() : 0;
+    return HeavyEnabled() ? CurrentProducerSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3431,7 +3450,7 @@ inline ProducerSeq CurrentProducerSeq() noexcept {
 
 inline void RecordSyncPm4Packet(const SyncPm4PacketSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordSyncPm4PacketEnabled(sample);
     }
 #else
@@ -3441,7 +3460,7 @@ inline void RecordSyncPm4Packet(const SyncPm4PacketSample& sample) noexcept {
 
 inline void RecordProducerBegin(const ProducerBeginSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordProducerBeginEnabled(sample);
     }
 #else
@@ -3451,7 +3470,7 @@ inline void RecordProducerBegin(const ProducerBeginSample& sample) noexcept {
 
 inline void RecordProducerEnd(const ProducerEndSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordProducerEndEnabled(sample);
     }
 #else
@@ -3461,7 +3480,7 @@ inline void RecordProducerEnd(const ProducerEndSample& sample) noexcept {
 
 inline void RecordProducerRecord(const ProducerRecordSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordProducerRecordEnabled(sample);
     }
 #else
@@ -3471,7 +3490,7 @@ inline void RecordProducerRecord(const ProducerRecordSample& sample) noexcept {
 
 inline void RecordResourceWrite(const ResourceWriteSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordResourceWriteEnabled(sample);
     }
 #else
@@ -3481,7 +3500,7 @@ inline void RecordResourceWrite(const ResourceWriteSample& sample) noexcept {
 
 inline void RecordFenceCreate(const FenceCreateSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceCreateEnabled(sample);
     }
 #else
@@ -3491,7 +3510,7 @@ inline void RecordFenceCreate(const FenceCreateSample& sample) noexcept {
 
 inline void RecordFenceEpochLink(const FenceEpochLinkSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceEpochLinkEnabled(sample);
     }
 #else
@@ -3501,7 +3520,7 @@ inline void RecordFenceEpochLink(const FenceEpochLinkSample& sample) noexcept {
 
 inline void RecordFenceMatchAttempt(const FenceMatchAttemptSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceMatchAttemptEnabled(sample);
     }
 #else
@@ -3511,7 +3530,7 @@ inline void RecordFenceMatchAttempt(const FenceMatchAttemptSample& sample) noexc
 
 inline void RecordFenceMatchDiagnostic(const FenceMatchDiagnosticSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceMatchDiagnosticEnabled(sample);
     }
 #else
@@ -3521,7 +3540,7 @@ inline void RecordFenceMatchDiagnostic(const FenceMatchDiagnosticSample& sample)
 
 inline void RecordWaitCreate(const WaitCreateSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordWaitCreateEnabled(sample);
     }
 #else
@@ -3531,7 +3550,7 @@ inline void RecordWaitCreate(const WaitCreateSample& sample) noexcept {
 
 inline void RecordWaitComplete(const WaitCompleteSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordWaitCompleteEnabled(sample);
     }
 #else
@@ -3541,7 +3560,7 @@ inline void RecordWaitComplete(const WaitCompleteSample& sample) noexcept {
 
 inline void RecordFirstConsumer(const FirstConsumerSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFirstConsumerEnabled(sample);
     }
 #else
@@ -3551,7 +3570,7 @@ inline void RecordFirstConsumer(const FirstConsumerSample& sample) noexcept {
 
 inline void RecordFenceClassification(const FenceClassificationSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceClassificationEnabled(sample);
     }
 #else
@@ -3561,7 +3580,7 @@ inline void RecordFenceClassification(const FenceClassificationSample& sample) n
 
 inline void RecordCpuMemoryAccess(const CpuAccessSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordCpuMemoryAccessEnabled(sample);
     }
 #else
@@ -3571,7 +3590,7 @@ inline void RecordCpuMemoryAccess(const CpuAccessSample& sample) noexcept {
 
 inline void RecordCpuLabelAccess(const CpuLabelAccessSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordCpuLabelAccessEnabled(sample);
     }
 #else
@@ -3581,7 +3600,7 @@ inline void RecordCpuLabelAccess(const CpuLabelAccessSample& sample) noexcept {
 
 inline void RecordCpuReadRequiresMaterialization(const CpuMaterializationSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordCpuReadRequiresMaterializationEnabled(sample);
     }
 #else
@@ -3591,7 +3610,7 @@ inline void RecordCpuReadRequiresMaterialization(const CpuMaterializationSample&
 
 inline void RecordStaleGuestSourceAttempt(const StaleGuestAttemptSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordStaleGuestSourceAttemptEnabled(sample);
     }
 #else
@@ -3601,7 +3620,7 @@ inline void RecordStaleGuestSourceAttempt(const StaleGuestAttemptSample& sample)
 
 inline void RecordGpuAliasMaterialize(const GpuAliasMaterializeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordGpuAliasMaterializeEnabled(sample);
     }
 #else
@@ -3611,7 +3630,7 @@ inline void RecordGpuAliasMaterialize(const GpuAliasMaterializeSample& sample) n
 
 inline void RecordResourceEpochPromoted(const ResourceEpochPromotedSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordResourceEpochPromotedEnabled(sample);
     }
 #else
@@ -3621,7 +3640,7 @@ inline void RecordResourceEpochPromoted(const ResourceEpochPromotedSample& sampl
 
 inline void RecordFenceResourceLink(const FenceResourceLinkSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceResourceLinkEnabled(sample);
     }
 #else
@@ -3631,7 +3650,7 @@ inline void RecordFenceResourceLink(const FenceResourceLinkSample& sample) noexc
 
 inline void RecordReadbackSchedule(const ReadbackScheduleSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordReadbackScheduleEnabled(sample);
     }
 #else
@@ -3641,7 +3660,7 @@ inline void RecordReadbackSchedule(const ReadbackScheduleSample& sample) noexcep
 
 inline void RecordReadbackSubmit(const ReadbackSubmitSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordReadbackSubmitEnabled(sample);
     }
 #else
@@ -3651,7 +3670,7 @@ inline void RecordReadbackSubmit(const ReadbackSubmitSample& sample) noexcept {
 
 inline void RecordReadbackReady(const ReadbackReadySample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordReadbackReadyEnabled(sample);
     }
 #else
@@ -3661,7 +3680,7 @@ inline void RecordReadbackReady(const ReadbackReadySample& sample) noexcept {
 
 inline void RecordReadbackCommit(const ReadbackCommitSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordReadbackCommitEnabled(sample);
     }
 #else
@@ -3671,7 +3690,7 @@ inline void RecordReadbackCommit(const ReadbackCommitSample& sample) noexcept {
 
 inline void RecordFenceSignal(const FenceSignalSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFenceSignalEnabled(sample);
     }
 #else
@@ -3681,7 +3700,7 @@ inline void RecordFenceSignal(const FenceSignalSample& sample) noexcept {
 
 inline void RecordHostWait(const HostWaitSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordHostWaitEnabled(sample);
     }
 #else
@@ -3691,7 +3710,7 @@ inline void RecordHostWait(const HostWaitSample& sample) noexcept {
 
 inline void RecordSubmitRecord(const SubmitRecordSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordSubmitRecordEnabled(sample);
     }
 #else
@@ -3701,7 +3720,7 @@ inline void RecordSubmitRecord(const SubmitRecordSample& sample) noexcept {
 
 inline void RecordShadowFencePolicy(const ShadowFencePolicySample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordShadowFencePolicyEnabled(sample);
     }
 #else
@@ -3711,7 +3730,7 @@ inline void RecordShadowFencePolicy(const ShadowFencePolicySample& sample) noexc
 
 inline void RecordTraceGap(const TraceGapSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordTraceGapEnabled(sample);
     }
 #else
@@ -3721,7 +3740,7 @@ inline void RecordTraceGap(const TraceGapSample& sample) noexcept {
 
 inline void RecordRingHealth(const RingHealthSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordRingHealthEnabled(sample);
     }
 #else
@@ -3731,7 +3750,7 @@ inline void RecordRingHealth(const RingHealthSample& sample) noexcept {
 
 inline WatchSeq NextWatchSeq() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? NextWatchSeqEnabled() : 0;
+    return HeavyEnabled() ? NextWatchSeqEnabled() : 0;
 #else
     return 0;
 #endif
@@ -3739,7 +3758,7 @@ inline WatchSeq NextWatchSeq() noexcept {
 
 inline void RecordReadbackSourceTerminal(const ReadbackSourceTerminalSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordReadbackSourceTerminalEnabled(sample);
     }
 #else
@@ -3749,7 +3768,7 @@ inline void RecordReadbackSourceTerminal(const ReadbackSourceTerminalSample& sam
 
 inline void RecordGuestSourceConsume(const GuestSourceConsumeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordGuestSourceConsumeEnabled(sample);
     }
 #else
@@ -3759,7 +3778,7 @@ inline void RecordGuestSourceConsume(const GuestSourceConsumeSample& sample) noe
 
 inline void RecordResourceLineage(const ResourceLineageSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordResourceLineageEnabled(sample);
     }
 #else
@@ -3769,7 +3788,7 @@ inline void RecordResourceLineage(const ResourceLineageSample& sample) noexcept 
 
 inline void RecordCpuReadObservation(const CpuReadObservationSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordCpuReadObservationEnabled(sample);
     }
 #else
@@ -3779,7 +3798,7 @@ inline void RecordCpuReadObservation(const CpuReadObservationSample& sample) noe
 
 inline void RecordSemanticReadFault(const SemanticReadFaultSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordSemanticReadFaultEnabled(sample);
     }
 #else
@@ -3789,7 +3808,7 @@ inline void RecordSemanticReadFault(const SemanticReadFaultSample& sample) noexc
 
 inline void RecordSemanticReadUnknown(const SemanticReadUnknownSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordSemanticReadUnknownEnabled(sample);
     }
 #else
@@ -3799,7 +3818,7 @@ inline void RecordSemanticReadUnknown(const SemanticReadUnknownSample& sample) n
 
 inline void RecordResourceBarrierLink(const ResourceBarrierLinkSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordResourceBarrierLinkEnabled(sample);
     }
 #else
@@ -3809,7 +3828,7 @@ inline void RecordResourceBarrierLink(const ResourceBarrierLinkSample& sample) n
 
 inline void RecordAcquireMem(const AcquireMemSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAcquireMemEnabled(sample);
     }
 #else
@@ -3819,7 +3838,7 @@ inline void RecordAcquireMem(const AcquireMemSample& sample) noexcept {
 
 inline void RecordFastpathCandidate(const FastpathCandidateSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFastpathCandidateEnabled(sample);
     }
 #else
@@ -3829,7 +3848,7 @@ inline void RecordFastpathCandidate(const FastpathCandidateSample& sample) noexc
 
 inline void RecordGpuAuthorityCreate(const GpuAuthorityCreateSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordGpuAuthorityCreateEnabled(sample);
     }
 #else
@@ -3839,7 +3858,7 @@ inline void RecordGpuAuthorityCreate(const GpuAuthorityCreateSample& sample) noe
 
 inline void RecordVirtualFenceCreate(const VirtualFenceCreateSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordVirtualFenceCreateEnabled(sample);
     }
 #else
@@ -3849,7 +3868,7 @@ inline void RecordVirtualFenceCreate(const VirtualFenceCreateSample& sample) noe
 
 inline void RecordVirtualWaitConsume(const VirtualWaitConsumeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordVirtualWaitConsumeEnabled(sample);
     }
 #else
@@ -3859,7 +3878,7 @@ inline void RecordVirtualWaitConsume(const VirtualWaitConsumeSample& sample) noe
 
 inline void RecordAsyncLabelSignal(const AsyncLabelSignalSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAsyncLabelSignalEnabled(sample);
     }
 #else
@@ -3869,7 +3888,7 @@ inline void RecordAsyncLabelSignal(const AsyncLabelSignalSample& sample) noexcep
 
 inline void RecordAuthorityGpuConsume(const AuthorityGpuConsumeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityGpuConsumeEnabled(sample);
     }
 #else
@@ -3879,7 +3898,7 @@ inline void RecordAuthorityGpuConsume(const AuthorityGpuConsumeSample& sample) n
 
 inline void RecordAuthorityBarrierValidation(const AuthorityBarrierValidationSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityBarrierValidationEnabled(sample);
     }
 #else
@@ -3889,7 +3908,7 @@ inline void RecordAuthorityBarrierValidation(const AuthorityBarrierValidationSam
 
 inline void RecordAuthorityRamDemand(const AuthorityRamDemandSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityRamDemandEnabled(sample);
     }
 #else
@@ -3899,7 +3918,7 @@ inline void RecordAuthorityRamDemand(const AuthorityRamDemandSample& sample) noe
 
 inline void RecordLazyMaterializeBegin(const LazyMaterializeBeginSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordLazyMaterializeBeginEnabled(sample);
     }
 #else
@@ -3909,7 +3928,7 @@ inline void RecordLazyMaterializeBegin(const LazyMaterializeBeginSample& sample)
 
 inline void RecordLazyMaterializeEnd(const LazyMaterializeEndSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordLazyMaterializeEndEnabled(sample);
     }
 #else
@@ -3919,7 +3938,7 @@ inline void RecordLazyMaterializeEnd(const LazyMaterializeEndSample& sample) noe
 
 inline void RecordAuthorityRamConsume(const AuthorityRamConsumeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityRamConsumeEnabled(sample);
     }
 #else
@@ -3929,7 +3948,7 @@ inline void RecordAuthorityRamConsume(const AuthorityRamConsumeSample& sample) n
 
 inline void RecordAuthorityCpuRead(const AuthorityCpuReadSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityCpuReadEnabled(sample);
     }
 #else
@@ -3939,7 +3958,7 @@ inline void RecordAuthorityCpuRead(const AuthorityCpuReadSample& sample) noexcep
 
 inline void RecordAuthoritySupersede(const AuthoritySupersedeSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthoritySupersedeEnabled(sample);
     }
 #else
@@ -3949,7 +3968,7 @@ inline void RecordAuthoritySupersede(const AuthoritySupersedeSample& sample) noe
 
 inline void RecordFastpathFallback(const FastpathFallbackSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFastpathFallbackEnabled(sample);
     }
 #else
@@ -3959,7 +3978,7 @@ inline void RecordFastpathFallback(const FastpathFallbackSample& sample) noexcep
 
 inline void RecordConservativeDownloadDecision(const ConservativeDownloadDecisionSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordConservativeDownloadDecisionEnabled(sample);
     }
 #else
@@ -3969,7 +3988,7 @@ inline void RecordConservativeDownloadDecision(const ConservativeDownloadDecisio
 
 inline void RecordAuthorityConservativeReadbackSuppressed(const AuthorityConservativeReadbackSuppressedSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityConservativeReadbackSuppressedEnabled(sample);
     }
 #else
@@ -3979,7 +3998,7 @@ inline void RecordAuthorityConservativeReadbackSuppressed(const AuthorityConserv
 
 inline void RecordAuthorityHostMaterializeRequired(const AuthorityHostMaterializeRequiredSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordAuthorityHostMaterializeRequiredEnabled(sample);
     }
 #else
@@ -3989,7 +4008,7 @@ inline void RecordAuthorityHostMaterializeRequired(const AuthorityHostMaterializ
 
 inline void RecordFastpathWaitDecision(const FastpathWaitDecisionSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordFastpathWaitDecisionEnabled(sample);
     }
 #else
@@ -3999,7 +4018,7 @@ inline void RecordFastpathWaitDecision(const FastpathWaitDecisionSample& sample)
 
 inline void RecordVirtualFenceForcedCompletion(const VirtualFenceForcedCompletionSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordVirtualFenceForcedCompletionEnabled(sample);
     }
 #else
@@ -4009,7 +4028,7 @@ inline void RecordVirtualFenceForcedCompletion(const VirtualFenceForcedCompletio
 
 inline void RecordCpuToGpuLabelWait(const CpuToGpuLabelWaitSample& sample) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordCpuToGpuLabelWaitEnabled(sample);
     }
 #else
@@ -4020,7 +4039,7 @@ inline void RecordCpuToGpuLabelWait(const CpuToGpuLabelWaitSample& sample) noexc
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
 #define SHAD_TELEMETRY_CAUSAL_WRAPPER(Name, Sample)                                               \
     inline void Name(const Sample& sample) noexcept {                                             \
-        if (Enabled()) [[unlikely]] {                                                             \
+        if (HeavyEnabled()) [[unlikely]] {                                                             \
             Name##Enabled(sample);                                                                \
         }                                                                                         \
     }
@@ -4050,7 +4069,7 @@ SHAD_TELEMETRY_CAUSAL_WRAPPER(RecordGpuPipelineExecutable, GpuPipelineExecutable
 
 inline void RecordGuestCpuLabelWrite(VAddr addr, u32 val, u64 timestamp, u64 thread_id) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RecordGuestCpuLabelWriteEnabled(addr, val, timestamp, thread_id);
     }
 #else
@@ -4063,7 +4082,7 @@ inline void RecordGuestCpuLabelWrite(VAddr addr, u32 val, u64 timestamp, u64 thr
 
 inline void ArmReadbackSourceWatch(const ReadbackSourceWatch& watch) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         ArmReadbackSourceWatchEnabled(watch);
     }
 #else
@@ -4078,7 +4097,7 @@ inline void ResolveReadbackSourceWatch(ResourceId res_id, ResourceVersion ver, V
                                       ConsumerAccessPath path = ConsumerAccessPath::Unknown,
                                       CmdBufferSeq cmd_buf = 0, SubmitSeq submit_seq = 0) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         ResolveReadbackSourceWatchEnabled(res_id, ver, addr, size, kind, consumer_prod,
                                           consumer_pkt, consumer_res, consumer_ver, path, cmd_buf,
                                           submit_seq);
@@ -4101,7 +4120,7 @@ inline void ResolveReadbackSourceWatch(ResourceId res_id, ResourceVersion ver, V
 
 inline bool HasActiveReadbackSourceWatch(ResourceId res_id, ResourceVersion ver) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? HasActiveReadbackSourceWatchEnabled(res_id, ver) : false;
+    return HeavyEnabled() ? HasActiveReadbackSourceWatchEnabled(res_id, ver) : false;
 #else
     static_cast<void>(res_id);
     static_cast<void>(ver);
@@ -4111,7 +4130,7 @@ inline bool HasActiveReadbackSourceWatch(ResourceId res_id, ResourceVersion ver)
 
 inline ReadbackSourceWatch GetActiveReadbackSourceWatch(ResourceId res_id, ResourceVersion ver) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? GetActiveReadbackSourceWatchEnabled(res_id, ver) : ReadbackSourceWatch{};
+    return HeavyEnabled() ? GetActiveReadbackSourceWatchEnabled(res_id, ver) : ReadbackSourceWatch{};
 #else
     static_cast<void>(res_id);
     static_cast<void>(ver);
@@ -4122,7 +4141,7 @@ inline ReadbackSourceWatch GetActiveReadbackSourceWatch(ResourceId res_id, Resou
 inline void UpdateHostVersion(VAddr addr, u64 size, ResourceVersion ver, HostVersionOrigin origin,
                              ReadbackSeq readback_seq = 0, ResourceId res_id = 0) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         UpdateHostVersionEnabled(addr, size, ver, origin, readback_seq, res_id);
     }
 #else
@@ -4139,7 +4158,7 @@ inline void CheckGuestSourceConsume(VAddr addr, u64 size, ProducerSeq prod_seq, 
                                    ResourceType dst_kind, ResourceId dst_id,
                                    GuestSourceConsumePath path) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         CheckGuestSourceConsumeEnabled(addr, size, prod_seq, pkt_seq, dst_kind, dst_id, path);
     }
 #else
@@ -4155,7 +4174,7 @@ inline void CheckGuestSourceConsume(VAddr addr, u64 size, ProducerSeq prod_seq, 
 
 inline TraceCaptureProfile GetCaptureProfile() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? GetCaptureProfileEnabled() : TraceCaptureProfile::SyncPerf;
+    return HeavyEnabled() ? GetCaptureProfileEnabled() : TraceCaptureProfile::SyncPerf;
 #else
     return TraceCaptureProfile::SyncPerf;
 #endif
@@ -4163,7 +4182,7 @@ inline TraceCaptureProfile GetCaptureProfile() noexcept {
 
 inline bool IsSyncSemanticProfile() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() && (GetCaptureProfile() == TraceCaptureProfile::SyncSemantic);
+    return HeavyEnabled() && (GetCaptureProfile() == TraceCaptureProfile::SyncSemantic);
 #else
     return false;
 #endif
@@ -4171,7 +4190,7 @@ inline bool IsSyncSemanticProfile() noexcept {
 
 inline bool IsFastpathValidationProfile() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() && (GetCaptureProfile() == TraceCaptureProfile::SyncFastpathValidation ||
+    return HeavyEnabled() && (GetCaptureProfile() == TraceCaptureProfile::SyncFastpathValidation ||
                          GetCaptureProfile() == TraceCaptureProfile::SyncSemantic);
 #else
     return false;
@@ -4180,7 +4199,7 @@ inline bool IsFastpathValidationProfile() noexcept {
 
 inline void ArmReadWatchInterest(const ReadWatchInterest& interest) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         ArmReadWatchInterestEnabled(interest);
     }
 #else
@@ -4192,7 +4211,7 @@ template <typename Func>
 inline void DisarmLabelReadWatch(FenceSeq fence_seq, VAddr guest_addr, u64 size,
                                  SemanticWatchCancelReason reason, Func&& disarm_func) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         auto cb = [](void* ud, VAddr a, u64 s) noexcept {
             (*static_cast<std::remove_reference_t<Func>*>(ud))(a, s);
         };
@@ -4210,7 +4229,7 @@ inline void DisarmLabelReadWatch(FenceSeq fence_seq, VAddr guest_addr, u64 size,
 inline void DisarmLabelReadWatch(FenceSeq fence_seq, VAddr guest_addr, u64 size,
                                  SemanticWatchCancelReason reason = SemanticWatchCancelReason::ExplicitCancel) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         DisarmLabelReadWatchEnabled(fence_seq, guest_addr, size, reason, nullptr, nullptr);
     }
 #else
@@ -4225,7 +4244,7 @@ template <typename Func>
 inline void HandleWriteFaultOnWatchedPage(VAddr addr, u64 size, u32 thread_id, VAddr rip,
                                          Func&& disarm_func) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         auto cb = [](void* ud, VAddr a, u64 s) noexcept {
             (*static_cast<std::remove_reference_t<Func>*>(ud))(a, s);
         };
@@ -4243,7 +4262,7 @@ inline void HandleWriteFaultOnWatchedPage(VAddr addr, u64 size, u32 thread_id, V
 template <typename Func>
 inline bool CheckCpuReadObservation(VAddr addr, u64 size, u32 thread_id, VAddr rip, Func&& disarm_func) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         auto cb = [](void* ud, VAddr a, u64 s) noexcept {
             (*static_cast<std::remove_reference_t<Func>*>(ud))(a, s);
         };
@@ -4266,7 +4285,7 @@ inline bool CheckCpuReadObservation(VAddr addr, u64 size, u32 thread_id, Func&& 
 
 inline bool CheckCpuReadObservation(VAddr addr, u64 size, u32 thread_id, VAddr rip = 0) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CheckCpuReadObservationEnabled(addr, size, thread_id, rip, nullptr, nullptr) : false;
+    return HeavyEnabled() ? CheckCpuReadObservationEnabled(addr, size, thread_id, rip, nullptr, nullptr) : false;
 #else
     static_cast<void>(addr);
     static_cast<void>(size);
@@ -4278,7 +4297,7 @@ inline bool CheckCpuReadObservation(VAddr addr, u64 size, u32 thread_id, VAddr r
 
 inline void RegisterCmdBufferSubmit(CmdBufferSeq cmd_buf, SubmitSeq submit_seq) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RegisterCmdBufferSubmitEnabled(cmd_buf, submit_seq);
     }
 #else
@@ -4289,7 +4308,7 @@ inline void RegisterCmdBufferSubmit(CmdBufferSeq cmd_buf, SubmitSeq submit_seq) 
 
 inline SubmitSeq LookupCmdBufferSubmit(CmdBufferSeq cmd_buf) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? LookupCmdBufferSubmitEnabled(cmd_buf) : 0;
+    return HeavyEnabled() ? LookupCmdBufferSubmitEnabled(cmd_buf) : 0;
 #else
     static_cast<void>(cmd_buf);
     return 0;
@@ -4298,7 +4317,7 @@ inline SubmitSeq LookupCmdBufferSubmit(CmdBufferSeq cmd_buf) noexcept {
 
 inline void RegisterPendingReadbackForSubmit(ReadbackSeq readback_seq, CmdBufferSeq cmd_buf) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RegisterPendingReadbackForSubmitEnabled(readback_seq, cmd_buf);
     }
 #else
@@ -4310,7 +4329,7 @@ inline void RegisterPendingReadbackForSubmit(ReadbackSeq readback_seq, CmdBuffer
 inline void PromotePendingReadbacksOnSubmit(CmdBufferSeq cmd_buf, SubmitSeq submit_seq,
                                           u64 signal_tick) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         PromotePendingReadbacksOnSubmitEnabled(cmd_buf, submit_seq, signal_tick);
     }
 #else
@@ -4324,7 +4343,7 @@ inline FenceSeq MatchFenceForWait(WaitSeq wait_seq, PacketSeq packet_seq, FrameS
                                   u32 queue_id, Pm4Engine engine, VAddr wait_addr, u32 ref,
                                   u32 mask, u32 function, PacketSeq prev_pkt, u32 prev_op) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         return MatchFenceForWaitEnabled(wait_seq, packet_seq, frame_seq, queue_id, engine,
                                         wait_addr, ref, mask, function, prev_pkt, prev_op);
     }
@@ -4347,7 +4366,7 @@ inline FenceSeq MatchFenceForWait(WaitSeq wait_seq, PacketSeq packet_seq, FrameS
 inline void ArmConsumerProbe(FenceSeq fence_seq, WaitSeq wait_seq, PacketSeq wait_pkt,
                              ConsumerProbeKind probe_kind = ConsumerProbeKind::MatchedFence) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         ArmConsumerProbeEnabled(fence_seq, wait_seq, wait_pkt, probe_kind);
     }
 #else
@@ -4364,7 +4383,7 @@ inline void CheckConsumerOverlap(ProducerSeq consumer_prod, PacketSeq pkt, Produ
                                  ConsumerConfidence confidence = ConsumerConfidence::ExactResourceAndVersion,
                                  u64 pipeline_hash = 0, u64 shader_hash = 0) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         CheckConsumerOverlapEnabled(consumer_prod, pkt, consumer_type, addr, size, access_path,
                                     consumer_res_id, consumer_res_ver, confidence, pipeline_hash, shader_hash);
     }
@@ -4392,7 +4411,7 @@ inline void CheckConsumerOverlap(ProducerSeq consumer_prod, PacketSeq pkt, Produ
 
 inline void RegisterSubmitTick(u64 signal_tick, SubmitSeq submit_seq) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         RegisterSubmitTickEnabled(signal_tick, submit_seq);
     }
 #else
@@ -4403,7 +4422,7 @@ inline void RegisterSubmitTick(u64 signal_tick, SubmitSeq submit_seq) noexcept {
 
 inline SubmitSeq LookupSubmitSeq(u64 signal_tick) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? LookupSubmitSeqEnabled(signal_tick) : 0;
+    return HeavyEnabled() ? LookupSubmitSeqEnabled(signal_tick) : 0;
 #else
     static_cast<void>(signal_tick);
     return 0;
@@ -4412,7 +4431,7 @@ inline SubmitSeq LookupSubmitSeq(u64 signal_tick) noexcept {
 
 inline void AdvanceConsumerProbes(PacketSeq current_packet, bool is_present) noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    if (Enabled()) [[unlikely]] {
+    if (HeavyEnabled()) [[unlikely]] {
         AdvanceConsumerProbesEnabled(current_packet, is_present);
     }
 #else
@@ -4423,7 +4442,7 @@ inline void AdvanceConsumerProbes(PacketSeq current_packet, bool is_present) noe
 
 inline GuestMemoryWriteOrigin CurrentMemoryWriteOrigin() noexcept {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-    return Enabled() ? CurrentMemoryWriteOriginEnabled() : GuestMemoryWriteOrigin::GuestCpu;
+    return HeavyEnabled() ? CurrentMemoryWriteOriginEnabled() : GuestMemoryWriteOrigin::GuestCpu;
 #else
     return GuestMemoryWriteOrigin::GuestCpu;
 #endif
@@ -4542,7 +4561,7 @@ public:
                              u32 stage_ = InvalidTimerStage) noexcept
         : stage{stage_} {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-        if (!enabled) {
+        if (!enabled || !HeavyEnabled()) {
             return;
         }
         constexpr u32 period = TimerSamplePeriod(Site);
