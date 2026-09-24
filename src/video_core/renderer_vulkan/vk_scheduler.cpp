@@ -40,6 +40,8 @@ u64 RenderStateHash(const RenderState& state) {
 /// Minimum interval between driver queries for the GPU tick made on behalf of deferred
 /// operations. Draws come every few microseconds; a query per draw costs more than the draw.
 constexpr u64 PendingOpsPollIntervalNs = 50'000;
+/// Draw-path calls between two checks of the GPU progress while an operation waits for it.
+constexpr u32 PendingOpsCheckPeriod = 8;
 
 [[nodiscard]] u64 SteadyNowNs() noexcept {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -336,44 +338,51 @@ void Scheduler::SubmitThread(std::stop_token stoken) {
     }
 }
 
-void Scheduler::PopPendingOperations() {
-    std::unique_lock lk(pending_ops_mutex);
-    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
-    if (pending_ops.empty()) [[likely]] {
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::PendingOpEmptyHits, 1);
-        }
+void Scheduler::PopPendingOperations(bool force) {
+    const u64 front_tick = pending_ops_front_tick.load(std::memory_order_acquire);
+    if (front_tick == NoPendingOps) [[likely]] {
         return;
     }
+    // A deferred operation waits for the GPU far longer than the few microseconds between draws.
+    static thread_local u32 calls_since_check = 0;
+    if (!force && ++calls_since_check < PendingOpsCheckPeriod) {
+        return;
+    }
+    calls_since_check = 0;
 
-    if (master_semaphore.IsFree(pending_ops.front().gpu_tick)) [[likely]] {
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::AddEnabled(
-                Common::PerformanceTelemetry::Counter::PendingOpKnownTickHits, 1);
-        }
-    } else {
-        // Waits, submits and the priority operation thread keep the known tick fresh. Asking the
-        // driver on every draw while an operation waits for the GPU cost more than the draw.
+    const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
+    if (!master_semaphore.IsFree(front_tick)) {
+        // Waits, submits and the priority operation thread keep the known tick fresh; ask the
+        // driver only at a bounded rate.
         const u64 now = SteadyNowNs();
-        if (now < next_pending_ops_poll_ns) {
+        if (!force && now < next_pending_ops_poll_ns.load(std::memory_order_relaxed)) {
             if (telemetry_enabled) {
                 Common::PerformanceTelemetry::AddEnabled(
                     Common::PerformanceTelemetry::Counter::PendingOpPollSkips, 1);
             }
             return;
         }
-        next_pending_ops_poll_ns = now + PendingOpsPollIntervalNs;
+        next_pending_ops_poll_ns.store(now + PendingOpsPollIntervalNs, std::memory_order_relaxed);
         if (telemetry_enabled) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::PendingOpRefreshes, 1);
         }
         master_semaphore.Refresh();
+        if (!master_semaphore.IsFree(front_tick)) {
+            return;
+        }
+    } else if (telemetry_enabled) {
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::PendingOpKnownTickHits, 1);
     }
+
+    std::unique_lock lk(pending_ops_mutex);
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
     }
+    pending_ops_front_tick.store(pending_ops.empty() ? NoPendingOps : pending_ops.front().gpu_tick,
+                                 std::memory_order_release);
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
@@ -509,7 +518,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info,
     AllocateWorkerCommandBuffers();
 
     // Apply pending operations
-    PopPendingOperations();
+    PopPendingOperations(true);
     if (telemetry_enabled) {
         const u64 post_end = Common::PerformanceTelemetry::Timestamp();
         if (!async_submit) {

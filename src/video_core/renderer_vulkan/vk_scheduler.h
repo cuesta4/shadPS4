@@ -430,7 +430,9 @@ public:
                             Common::PerformanceTelemetry::HostWaitReason::Unknown);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
-    void PopPendingOperations();
+    /// Runs the deferred operations the GPU has caught up with. Draws call this constantly, so
+    /// unless force is set the GPU progress is only checked every few calls.
+    void PopPendingOperations(bool force = false);
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -540,6 +542,9 @@ public:
                         const Common::PerformanceTelemetry::PendingOpTraceToken& trace = {}) {
         std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace(std::move(func), CurrentTick(), trace);
+        if (pending_ops.size() == 1) {
+            pending_ops_front_tick.store(pending_ops.front().gpu_tick, std::memory_order_release);
+        }
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -602,8 +607,12 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
+    static constexpr u64 NoPendingOps = ~0ULL;
+    /// Tick of the oldest deferred operation, NoPendingOps when there is none. Written under
+    /// pending_ops_mutex, read without it.
+    std::atomic<u64> pending_ops_front_tick{NoPendingOps};
     /// Earliest time PopPendingOperations may query the driver for the GPU tick again.
-    u64 next_pending_ops_poll_ns{};
+    std::atomic<u64> next_pending_ops_poll_ns{};
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

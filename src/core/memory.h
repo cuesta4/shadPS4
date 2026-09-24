@@ -261,6 +261,15 @@ public:
     bool TryWriteBacking(void* address, const void* data, u64 size,
                          MemoryWriteOrigin origin = MemoryWriteOrigin::CommandProcessor);
 
+    /// Returns true when every byte of the range lives in physical backing, so ReadBacking can
+    /// read it.
+    [[nodiscard]] bool IsBackedRange(VAddr source, u64 size);
+
+    /// Reads guest memory through the backing view, which ignores the page protection of the
+    /// guest mapping and so never faults. Returns false, copying nothing meaningful, when part of
+    /// the range has no physical backing.
+    bool ReadBacking(VAddr source, u8* destination, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -336,6 +345,9 @@ private:
     PhysHandle FindFmemArea(PAddr target) {
         return std::prev(fmem_map.upper_bound(target));
     }
+
+    template <bool copy>
+    bool WalkBackingLocked(VAddr source, u8* destination, u64 size);
 
     bool HasPhysicalBacking(VirtualMemoryArea vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||

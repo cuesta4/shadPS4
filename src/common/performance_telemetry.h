@@ -764,6 +764,7 @@ enum class Counter : u16 {
     GuestCopyQueueDepthMax,
     GuestCopyGpuServedOps,
     GuestCopyGpuServedBytes,
+    GuestCopyBackingBytes,
     AuthorityMaterializations,
     AuthorityMaterializeNs,
     PendingOpPollSkips,

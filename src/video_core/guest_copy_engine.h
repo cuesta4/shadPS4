@@ -41,6 +41,9 @@ public:
         Zero,
         /// Copies from a host pointer that stays valid until the job completes.
         Host,
+        /// Copies from guest memory through the backing view, which ignores page protection.
+        /// Only for bytes whose guest RAM is current although their page denies reads.
+        Backing,
     };
 
     struct Op {
@@ -84,18 +87,20 @@ public:
         u64 protected_inline_ops{};
         u64 gpu_served_ops{};
         u64 gpu_served_bytes{};
+        u64 backing_bytes{};
     };
 
     /// Returns true when any page of the range currently denies reads.
     using ReadProtectionProbe = bool (*)(const void* context, VAddr addr, u64 size);
 
     /// Serves a guest copy whose source denies reads without touching the protected pages, for
-    /// example by recording GPU commands that write the same bytes into op.dst_buffer. On
-    /// success stores the parts left for the CPU in remainder, sets remainder_count and returns
-    /// the bytes served. Returns zero when the copy cannot be served that way.
-    using ProtectedCopyResolver = u64 (*)(void* context, const Op& op,
-                                          std::span<Op, MaxResolverRemainder> remainder,
-                                          u32& remainder_count);
+    /// example by recording GPU commands that write some of the bytes into op.dst_buffer. On
+    /// success stores the parts left for the CPU in remainder (Backing operations for bytes
+    /// that must bypass the protection), sets remainder_count and gpu_bytes and returns true.
+    /// Returns false when the copy has to run inline.
+    using ProtectedCopyResolver = bool (*)(void* context, const Op& op,
+                                           std::span<Op, MaxResolverRemainder> remainder,
+                                           u32& remainder_count, u64& gpu_bytes);
 
     static GuestCopyEngine& Instance();
 
@@ -275,6 +280,7 @@ private:
         std::atomic<u64> protected_inline_ops{};
         std::atomic<u64> gpu_served_ops{};
         std::atomic<u64> gpu_served_bytes{};
+        std::atomic<u64> backing_bytes{};
     };
     AtomicStats stats;
 

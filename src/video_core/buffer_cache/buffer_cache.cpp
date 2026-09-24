@@ -1820,35 +1820,44 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
     return {&staging_buffer, offset};
 }
 
-u64 BufferCache::ServeGuestCopyFromGpuShadows(
+bool BufferCache::ServeGuestCopyFromGpuShadows(
     const GuestCopyEngine::Op& op,
     std::span<GuestCopyEngine::Op, GuestCopyEngine::MaxResolverRemainder> remainder,
-    u32& remainder_count, const PageManager& page_manager) {
+    u32& remainder_count, u64& gpu_bytes, const PageManager& page_manager) {
     if (op.kind != GuestCopyEngine::OpKind::Guest) {
-        return 0;
+        return false;
     }
     auto& authority_tracker = GpuAuthorityTracker::Instance();
     GpuShadowPieces pieces;
     if (!authority_tracker.CollectGpuShadowPieces(op.source, op.size, pieces)) {
-        return 0;
+        return false;
     }
 
-    // The bytes around the shadows still come from guest RAM, so their pages must be readable.
+    // Every other byte of the range is current in guest RAM. Authorities start and end in the
+    // middle of pages, so those bytes can still sit on a page that denies reads for a neighbour;
+    // reading them there would fault and materialize the neighbour. Such runs are read through
+    // the backing view instead.
     remainder_count = 0;
     const auto add_remainder = [&](VAddr begin, VAddr end) {
         if (begin >= end) {
             return true;
         }
-        if (remainder_count == remainder.size() ||
-            page_manager.HasReadWatchers(begin, end - begin)) {
+        if (remainder_count == remainder.size()) {
             return false;
+        }
+        auto kind = GuestCopyEngine::OpKind::Guest;
+        if (page_manager.HasReadWatchers(begin, end - begin)) {
+            if (!memory->IsBackedRange(begin, end - begin)) {
+                return false;
+            }
+            kind = GuestCopyEngine::OpKind::Backing;
         }
         const u64 delta = begin - op.source;
         remainder[remainder_count++] = GuestCopyEngine::Op{
             .source = begin,
             .destination = op.destination + delta,
             .size = end - begin,
-            .kind = GuestCopyEngine::OpKind::Guest,
+            .kind = kind,
             .dst_buffer = op.dst_buffer,
             .dst_offset = op.dst_offset + delta,
         };
@@ -1857,24 +1866,27 @@ u64 BufferCache::ServeGuestCopyFromGpuShadows(
     VAddr cursor = op.source;
     for (const auto& piece : pieces) {
         if (!add_remainder(cursor, piece.addr)) {
-            return 0;
+            return false;
         }
         cursor = piece.addr + piece.size;
     }
     if (!add_remainder(cursor, op.source + op.size)) {
-        return 0;
+        return false;
+    }
+    gpu_bytes = 0;
+    if (pieces.empty()) {
+        return true;
     }
 
     authority_tracker.CommitGpuShadowPieces(pieces, scheduler.CurrentTick());
     boost::container::small_vector<vk::BufferCopy, 4> copies;
-    u64 served = 0;
     for (const auto& piece : pieces) {
         copies.push_back(vk::BufferCopy{
             .srcOffset = piece.buffer_offset,
             .dstOffset = op.dst_offset + (piece.addr - op.source),
             .size = piece.size,
         });
-        served += piece.size;
+        gpu_bytes += piece.size;
     }
 
     scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
@@ -1906,8 +1918,8 @@ u64 BufferCache::ServeGuestCopyFromGpuShadows(
     });
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes, served);
-    return served;
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes, gpu_bytes);
+    return true;
 }
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {

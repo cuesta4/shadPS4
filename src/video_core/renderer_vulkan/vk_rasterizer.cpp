@@ -505,10 +505,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                    std::span<VideoCore::GuestCopyEngine::Op,
                              VideoCore::GuestCopyEngine::MaxResolverRemainder>
                        remainder,
-                   u32& remainder_count) -> u64 {
+                   u32& remainder_count, u64& gpu_bytes) -> bool {
                     auto& rasterizer = *static_cast<Rasterizer*>(context);
                     return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
-                        op, remainder, remainder_count, rasterizer.page_manager);
+                        op, remainder, remainder_count, gpu_bytes, rasterizer.page_manager);
                 },
                 this);
         } else {

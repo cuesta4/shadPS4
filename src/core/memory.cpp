@@ -654,6 +654,49 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     return true;
 }
 
+template <bool copy>
+bool MemoryManager::WalkBackingLocked(VAddr source, u8* destination, u64 size) {
+    while (size != 0) {
+        const auto upper = vma_map.upper_bound(source);
+        if (upper == vma_map.begin()) {
+            return false;
+        }
+        const auto& vma = std::prev(upper)->second;
+        if (!vma.Contains(source, 1) || !HasPhysicalBacking(vma)) {
+            return false;
+        }
+        const u64 offset_in_vma = source - vma.base;
+        const auto phys_upper = vma.phys_areas.upper_bound(offset_in_vma);
+        if (phys_upper == vma.phys_areas.begin()) {
+            return false;
+        }
+        const auto phys = std::prev(phys_upper);
+        const u64 offset_in_phys = offset_in_vma - phys->first;
+        if (offset_in_phys >= phys->second.size) {
+            return false;
+        }
+        const u64 run =
+            std::min<u64>({size, phys->second.size - offset_in_phys, vma.base + vma.size - source});
+        if constexpr (copy) {
+            std::memcpy(destination, impl.BackingBase() + phys->second.base + offset_in_phys, run);
+            destination += run;
+        }
+        source += run;
+        size -= run;
+    }
+    return true;
+}
+
+bool MemoryManager::IsBackedRange(VAddr source, u64 size) {
+    std::shared_lock lk{mutex};
+    return WalkBackingLocked<false>(source, nullptr, size);
+}
+
+bool MemoryManager::ReadBacking(VAddr source, u8* destination, u64 size) {
+    std::shared_lock lk{mutex};
+    return WalkBackingLocked<true>(source, destination, size);
+}
+
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 64_KB;

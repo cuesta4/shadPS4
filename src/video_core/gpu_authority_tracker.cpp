@@ -274,9 +274,6 @@ bool GpuAuthorityTracker::CollectGpuShadowPieces(VAddr addr, size_t size, GpuSha
             .shadow = shadow,
         });
     }
-    if (pieces.empty()) {
-        return false;
-    }
     std::ranges::sort(pieces, {}, &GpuShadowPiece::addr);
     for (size_t i = 1; i < pieces.size(); ++i) {
         // Overlapping authorities materialize in registration order; keep that path for them.
@@ -644,6 +641,13 @@ bool GpuAuthorityTracker::ResolveForRamRead(
         }
 
         std::unique_lock entry_lk{*entry->entry_mutex};
+
+        // Materializing writes only the downloaded bytes. A read of the rest of the entry range
+        // (row padding past the download) finds guest RAM current already.
+        if (std::max<VAddr>(entry->guest_begin, addr) >=
+            std::min<VAddr>(entry->guest_begin + entry->download_size, addr + size)) {
+            continue;
+        }
 
         if (IsCurrentThreadMaterializing(entry->authority_seq)) {
             // Internal access from this authority's own materializer: bypass self-wait

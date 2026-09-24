@@ -124,17 +124,26 @@ bool GuestCopyEngine::TryResolveProtected(const Op& op) {
     }
     std::array<Op, MaxResolverRemainder> remainder{};
     u32 remainder_count = 0;
-    const u64 served = resolver(protected_resolver_context, op, remainder, remainder_count);
-    if (served == 0) {
+    u64 gpu_bytes = 0;
+    if (!resolver(protected_resolver_context, op, remainder, remainder_count, gpu_bytes)) {
         return false;
     }
+    u64 backing_bytes = 0;
+    for (u32 i = 0; i < remainder_count; ++i) {
+        if (remainder[i].kind == OpKind::Backing) {
+            backing_bytes += remainder[i].size;
+        }
+    }
     stats.gpu_served_ops.fetch_add(1, std::memory_order_relaxed);
-    stats.gpu_served_bytes.fetch_add(served, std::memory_order_relaxed);
+    stats.gpu_served_bytes.fetch_add(gpu_bytes, std::memory_order_relaxed);
+    stats.backing_bytes.fetch_add(backing_bytes, std::memory_order_relaxed);
     if (Common::PerformanceTelemetry::Enabled()) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyGpuServedOps, 1);
         Common::PerformanceTelemetry::AddEnabled(
-            Common::PerformanceTelemetry::Counter::GuestCopyGpuServedBytes, served);
+            Common::PerformanceTelemetry::Counter::GuestCopyGpuServedBytes, gpu_bytes);
+        Common::PerformanceTelemetry::AddEnabled(
+            Common::PerformanceTelemetry::Counter::GuestCopyBackingBytes, backing_bytes);
     }
     for (u32 i = 0; i < remainder_count; ++i) {
         EnqueueOp(remainder[i], false);
@@ -162,7 +171,8 @@ void GuestCopyEngine::EnqueueOp(const Op& op, bool allow_resolve) {
         // publishes its intent before checking for pending reads. One side always sees the
         // other, so a worker never reads a page after its read access is revoked.
         MarkPending(piece_op, true);
-        if (piece_op.kind != OpKind::Zero) {
+        // Backing reads cannot fault; they only need the pending mark that orders guest writes.
+        if (piece_op.kind != OpKind::Zero && piece_op.kind != OpKind::Backing) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             if (IsReadProtected(piece_op.source, piece_op.size)) {
                 MarkPending(piece_op, false);
@@ -238,7 +248,7 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
                      "Guest copies (last 10s): {} jobs, {:.1f} MiB deferred, {:.1f} MiB inline, "
                      "workers {:.1f} ms, waiters helped {:.1f} ms, producer blocked {} times "
                      "({:.1f} ms), overlap waits {}, ring-full waits {}, protected inline ops {}, "
-                     "GPU-served ops {} ({:.1f} MiB)",
+                     "GPU-served ops {} ({:.1f} MiB on the GPU, {:.1f} MiB unprotected reads)",
                      current.jobs - last_logged.jobs,
                      static_cast<double>(current.bytes - last_logged.bytes) / MiB,
                      static_cast<double>(current.inline_bytes - last_logged.inline_bytes) / MiB,
@@ -251,7 +261,8 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
                      current.protected_inline_ops - last_logged.protected_inline_ops,
                      current.gpu_served_ops - last_logged.gpu_served_ops,
                      static_cast<double>(current.gpu_served_bytes - last_logged.gpu_served_bytes) /
-                         MiB);
+                         MiB,
+                     static_cast<double>(current.backing_bytes - last_logged.backing_bytes) / MiB);
             last_logged = current;
         }
     }
@@ -554,6 +565,16 @@ void GuestCopyEngine::ExecuteOps(std::span<const Op> ops, bool telemetry_enabled
             std::memcpy(op.destination, reinterpret_cast<const void*>(op.source), op.size);
             continue;
         }
+        if (op.kind == OpKind::Backing) {
+            if (!Core::Memory::Instance()->ReadBacking(op.source, op.destination, op.size))
+                [[unlikely]] {
+                // The resolver checked the backing, and unmapping drains pending copies first.
+                LOG_ERROR(Render_Vulkan, "Backing read of {:#x}:{:#x} lost its backing", op.source,
+                          op.size);
+                std::memset(op.destination, 0, op.size);
+            }
+            continue;
+        }
         if (batch.size() == batch.capacity()) {
             flush();
         }
@@ -605,6 +626,7 @@ GuestCopyEngine::Stats GuestCopyEngine::GetStats() const noexcept {
         .protected_inline_ops = stats.protected_inline_ops.load(std::memory_order_relaxed),
         .gpu_served_ops = stats.gpu_served_ops.load(std::memory_order_relaxed),
         .gpu_served_bytes = stats.gpu_served_bytes.load(std::memory_order_relaxed),
+        .backing_bytes = stats.backing_bytes.load(std::memory_order_relaxed),
     };
 }
 
@@ -666,8 +688,8 @@ bool GuestCopyEngine::RunSelfTest() {
     const auto saved_resolver = protected_resolver.load(std::memory_order_acquire);
     void* const saved_resolver_context = protected_resolver_context;
     SetProtectedCopyResolver(
-        [](void*, const Op& op, std::span<Op, MaxResolverRemainder> remainder,
-           u32& remainder_count) -> u64 {
+        [](void*, const Op& op, std::span<Op, MaxResolverRemainder> remainder, u32& remainder_count,
+           u64& gpu_bytes) -> bool {
             const u64 served = std::max<u64>(op.size / 2, 1);
             std::memcpy(op.destination, reinterpret_cast<const u8*>(op.source), served);
             remainder_count = 0;
@@ -681,7 +703,8 @@ bool GuestCopyEngine::RunSelfTest() {
                     .dst_offset = op.dst_offset + served,
                 };
             }
-            return served;
+            gpu_bytes = served;
+            return true;
         },
         nullptr);
 

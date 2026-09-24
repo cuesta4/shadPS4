@@ -166,13 +166,13 @@ public:
 
     /// Protected copy resolver of the guest copy engine. Writes the parts of op that GPU
     /// authority shadows hold into op.dst_buffer with GPU copies, so the command processor
-    /// never reads (and faults on) guest RAM that the GPU still owns. The bytes are the ones
-    /// materializing guest RAM would produce. Returns the bytes served, or zero when the copy
-    /// has to take the regular path.
-    u64 ServeGuestCopyFromGpuShadows(
+    /// never reads (and faults on) guest RAM that the GPU still owns, and reads the other bytes
+    /// of protected pages through the backing view. The bytes are the ones materializing guest
+    /// RAM would produce. Returns false when the copy has to take the regular path.
+    bool ServeGuestCopyFromGpuShadows(
         const GuestCopyEngine::Op& op,
         std::span<GuestCopyEngine::Op, GuestCopyEngine::MaxResolverRemainder> remainder,
-        u32& remainder_count, const PageManager& page_manager);
+        u32& remainder_count, u64& gpu_bytes, const PageManager& page_manager);
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);

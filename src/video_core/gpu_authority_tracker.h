@@ -216,7 +216,8 @@ public:
     /// the GPU can copy from, so a GPU consumer gets the bytes without the command processor
     /// waiting for the producer. Returns false when an overlapping authority cannot be served
     /// that way (no live shadow, being materialized, overlapping another authority). The pieces
-    /// are sorted and disjoint. Nothing changes until CommitGpuShadowPieces.
+    /// are sorted and disjoint, and empty when no downloaded bytes are in the range. Nothing
+    /// changes until CommitGpuShadowPieces.
     [[nodiscard]] bool CollectGpuShadowPieces(VAddr addr, size_t size, GpuShadowPieces& pieces);
 
     /// Keeps the shadows of the pieces alive until consumer_tick completes.

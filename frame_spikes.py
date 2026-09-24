@@ -43,7 +43,7 @@ GROUPS = [
                       "guest_copy_help_ns", "guest_copy_wait_ns", "guest_copy_overlap_waits",
                       "guest_copy_inline_bytes", "guest_copy_protected_inline_ops",
                       "guest_copy_queue_depth_max", "guest_copy_gpu_served_ops",
-                      "guest_copy_gpu_served_bytes"]),
+                      "guest_copy_gpu_served_bytes", "guest_copy_backing_bytes"]),
     ("GPU authority", ["authority_materializations", "authority_materialize_ns",
                        "pending_op_poll_skips"]),
     ("Resource churn", ["texture_uploads", "texture_upload_bytes", "texture_upload_ns",
