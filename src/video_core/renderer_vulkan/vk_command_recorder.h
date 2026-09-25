@@ -35,7 +35,8 @@ public:
                             u32 first_set, vk::ArrayProxy<const vk::DescriptorSet> const& sets,
                             vk::ArrayProxy<const u32> const& dynamic_offsets) const;
     void pushDescriptorSetKHR(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout, u32 set,
-                              vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes) const;
+                              vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes,
+                              u32 num_descriptors = ~u32{0}) const;
     void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset, u32 size,
                        const void* values) const;
     void bindVertexBuffers(u32 first_binding, u32 binding_count, const vk::Buffer* buffers,

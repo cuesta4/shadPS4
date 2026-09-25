@@ -71,7 +71,8 @@ public:
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
-                       const Shader::PushData& push_data) const;
+                       const Shader::PushData& push_data,
+                       u32 num_descriptors = ~u32{0}) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

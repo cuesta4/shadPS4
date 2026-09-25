@@ -42,7 +42,7 @@ void Pipeline::SetDescriptorLayoutSignature(
 #endif
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
-                             const Shader::PushData& push_data) const {
+                             const Shader::PushData& push_data, u32 num_descriptors) const {
     Common::PerformanceTelemetry::SampledDuration<
         Common::PerformanceTelemetry::TimerSite::DescriptorEmit>
         emit_duration{Common::PerformanceTelemetry::Enabled()};
@@ -76,7 +76,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     if (uses_push_descriptors) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes, num_descriptors);
         if (bind_point == vk::PipelineBindPoint::eGraphics) {
             scheduler.NotifyGraphicsPushDescriptorSet();
         }

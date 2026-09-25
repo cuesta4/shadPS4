@@ -234,7 +234,7 @@ void CommandRecorder::bindDescriptorSets(vk::PipelineBindPoint bind_point,
 
 void CommandRecorder::pushDescriptorSetKHR(
     vk::PipelineBindPoint bind_point, vk::PipelineLayout layout, u32 set,
-    vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes) const {
+    vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes, u32 num_descriptors) const {
     if (!scheduler->HasRecordingThread()) {
         scheduler->RawCommandBuffer().pushDescriptorSetKHR(bind_point, layout, set, writes);
         return;
@@ -242,9 +242,11 @@ void CommandRecorder::pushDescriptorSetKHR(
     // Draws push descriptors all the time, so the recorded form is compact and the Vulkan
     // structures are rebuilt on the recording thread.
     const u32 num_writes = writes.size();
-    u32 num_descriptors = 0;
-    for (const auto& write : writes) {
-        num_descriptors += write.descriptorCount;
+    if (num_descriptors == ~u32{0}) {
+        num_descriptors = 0;
+        for (const auto& write : writes) {
+            num_descriptors += write.descriptorCount;
+        }
     }
     const size_t slots_offset = num_writes * sizeof(PackedWrite);
     std::byte* const payload = scheduler->RecordWithPayload(

@@ -1622,6 +1622,7 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
 #endif
     partial_set_writes.clear();
     u32 cached_write_index = 0;
+    u32 partial_descriptor_count = 0;
     {
         Common::PerformanceTelemetry::SampledDuration<
             Common::PerformanceTelemetry::TimerSite::DescriptorCompare>
@@ -1670,6 +1671,7 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
             }
             if (!unchanged) {
                 partial_set_writes.push_back(write);
+                partial_descriptor_count += write.descriptorCount;
             }
             if (telemetry_enabled) {
                 Common::PerformanceTelemetry::RecordDescriptorDecisionEnabled(unchanged ? 0
@@ -1690,7 +1692,8 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
             Common::PerformanceTelemetry::AddEnabled(
                 Common::PerformanceTelemetry::Counter::DescriptorMisses, 1);
         }
-        pipeline->BindResources(partial_set_writes, buffer_barriers, push_data);
+        pipeline->BindResources(partial_set_writes, buffer_barriers, push_data,
+                                partial_descriptor_count);
     }
     if (!can_reuse || !partial_set_writes.empty() || cached_write_index != cached.writes.size()) {
         if (can_update_cached) {
