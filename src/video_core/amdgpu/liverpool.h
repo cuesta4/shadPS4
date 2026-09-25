@@ -34,6 +34,8 @@ namespace AmdGpu {
 
 struct PM4CmdEventWriteEop;
 struct PM4CmdEventWriteEos;
+struct PM4CmdReleaseMem;
+union PM4Header;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -210,8 +212,15 @@ private:
     bool WriteGraphicsRegisters8(u32 first_register, const u32* payload);
     bool WriteGraphicsRegistersSlow(u32 first_register, const u32* payload, u32 word_count);
     void HandleContextRegisterHint(u32 register_address, u32 packet_count, const u32* payload);
+    bool TryPromoteGoW3Eos(const PM4CmdEventWriteEos& packet,
+                           const Common::PerformanceTelemetry::CausalTraceToken& completion_trace);
+    void ProcessGraphicsEventWrite(const PM4Header* header, u32 count, u32 ib_depth,
+                                   bool telemetry_enabled, bool telemetry_detail);
     void ProcessEventWriteEop(const PM4CmdEventWriteEop& packet);
     void ProcessEventWriteEos(const PM4CmdEventWriteEos& packet);
+    void ProcessComputeReleaseMem(const PM4CmdReleaseMem& packet, u32 vqid,
+                                  const u32* queue_pipe_id, u32 ib_depth, bool telemetry_enabled,
+                                  bool telemetry_detail);
 
     bool TrackDeferredGpuCompletion(u32 queue_id, VAddr address = 0, u64 value = 0,
                                     u32 num_bytes = 0);
