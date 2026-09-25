@@ -42,6 +42,11 @@ constexpr u64 WaiterSpinNs = 20'000;
 /// Interval between summary log lines.
 constexpr u64 StatsLogIntervalNs = 10'000'000'000ULL;
 
+/// Adds to a counter only the producer thread writes, without a locked read-modify-write.
+void AddProducerStat(std::atomic<u64>& counter, u64 value) noexcept {
+    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
+}
+
 } // Anonymous namespace
 
 thread_local bool GuestCopyEngine::is_producer_thread = false;
@@ -102,6 +107,8 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
         ExecuteInline(ops);
         return SubmittedSeq();
     }
+    // Local rather than a member: a fault handler run by an inline copy may enqueue again.
+    boost::container::static_vector<Op, MarkBatchSize> marked;
     for (const Op& op : ops) {
         // Copies spanning several pieces are resolved whole so the resolver records one GPU
         // copy per shadow instead of one per piece.
@@ -109,8 +116,18 @@ u64 GuestCopyEngine::Enqueue(std::span<const Op> ops) {
             IsReadProtected(op.source, op.size) && TryResolveProtected(op)) {
             continue;
         }
-        EnqueueOp(op, true);
+        for (u64 offset = 0; offset < op.size;) {
+            if (marked.size() == marked.capacity()) {
+                AppendMarkedPieces(std::span<const Op>{marked.data(), marked.size()}, true);
+                marked.clear();
+            }
+            marked.push_back(MakePiece(op, offset));
+            const Op& piece = marked.back();
+            offset += piece.size;
+            MarkPending(piece, true);
+        }
     }
+    AppendMarkedPieces(std::span<const Op>{marked.data(), marked.size()}, true);
     if (building_ops != 0) {
         PublishJob(building_ops, building_bytes);
     }
@@ -134,9 +151,9 @@ bool GuestCopyEngine::TryResolveProtected(const Op& op) {
             backing_bytes += remainder[i].size;
         }
     }
-    stats.gpu_served_ops.fetch_add(1, std::memory_order_relaxed);
-    stats.gpu_served_bytes.fetch_add(gpu_bytes, std::memory_order_relaxed);
-    stats.backing_bytes.fetch_add(backing_bytes, std::memory_order_relaxed);
+    AddProducerStat(producer_stats.gpu_served_ops, 1);
+    AddProducerStat(producer_stats.gpu_served_bytes, gpu_bytes);
+    AddProducerStat(producer_stats.backing_bytes, backing_bytes);
     if (Common::PerformanceTelemetry::Enabled()) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyGpuServedOps, 1);
@@ -151,59 +168,70 @@ bool GuestCopyEngine::TryResolveProtected(const Op& op) {
     return true;
 }
 
+GuestCopyEngine::Op GuestCopyEngine::MakePiece(const Op& op, u64 offset) noexcept {
+    Op piece = op;
+    if (op.kind != OpKind::Zero) {
+        piece.source += offset;
+    }
+    piece.destination += offset;
+    piece.dst_offset += offset;
+    piece.size = std::min<u64>(op.size - offset, SplitBytes);
+    return piece;
+}
+
 void GuestCopyEngine::EnqueueOp(const Op& op, bool allow_resolve) {
-    if (op.size == 0) {
+    for (u64 offset = 0; offset < op.size;) {
+        const Op piece = MakePiece(op, offset);
+        offset += piece.size;
+        MarkPending(piece, true);
+        AppendMarkedPieces(std::span<const Op>{&piece, 1}, allow_resolve);
+    }
+}
+
+void GuestCopyEngine::AppendMarkedPieces(std::span<const Op> pieces, bool allow_resolve) {
+    if (pieces.empty()) {
         return;
     }
-    u64 offset = 0;
-    while (offset < op.size) {
-        const u64 piece = std::min<u64>(op.size - offset, SplitBytes);
-        Op piece_op = op;
-        if (op.kind != OpKind::Zero) {
-            piece_op.source += offset;
-        }
-        piece_op.destination += offset;
-        piece_op.dst_offset += offset;
-        piece_op.size = piece;
-        offset += piece;
-
-        // Publish the pending read before checking for read protection; BeginReadProtect
-        // publishes its intent before checking for pending reads. One side always sees the
-        // other, so a worker never reads a page after its read access is revoked.
-        MarkPending(piece_op, true);
-        // Backing reads cannot fault; they only need the pending mark that orders guest writes.
-        if (piece_op.kind != OpKind::Zero && piece_op.kind != OpKind::Backing) {
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (IsReadProtected(piece_op.source, piece_op.size)) {
-                MarkPending(piece_op, false);
-                // Reading the range here would run the fault handlers, which may wait for the
-                // GPU. The resolver serves what it can without touching the protected pages and
-                // hands back the rest, which goes through this protocol again.
-                if (allow_resolve && piece_op.dst_buffer != 0 && TryResolveProtected(piece_op)) {
-                    continue;
-                }
-                // Faults on this range must be handled on the command processor thread.
-                stats.protected_inline_ops.fetch_add(1, std::memory_order_relaxed);
-                if (Common::PerformanceTelemetry::Enabled()) {
-                    Common::PerformanceTelemetry::AddEnabled(
-                        Common::PerformanceTelemetry::Counter::GuestCopyProtectedInlineOps, 1);
-                }
-                ExecuteInline(std::span{&piece_op, 1});
-                continue;
-            }
-        }
-
-        if (building_ops == MaxOpsPerJob ||
-            (building_ops != 0 && building_bytes + piece > SplitBytes)) {
-            PublishJob(building_ops, building_bytes);
-        }
-        if (building_ops == 0) {
-            WaitForSlot();
-        }
-        Slot& slot = (*slots)[(submitted.load(std::memory_order_relaxed) + 1) & SlotMask];
-        slot.ops[building_ops++] = piece_op;
-        building_bytes += piece;
+    // The pending reads of every piece are published before checking for read protection;
+    // BeginReadProtect publishes its intent before checking for pending reads. One side always
+    // sees the other, so a worker never reads a page after its read access is revoked.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for (const Op& piece : pieces) {
+        AppendPiece(piece, allow_resolve);
     }
+}
+
+void GuestCopyEngine::AppendPiece(const Op& piece, bool allow_resolve) {
+    // Backing reads cannot fault; they only need the pending mark that orders guest writes.
+    if (piece.kind != OpKind::Zero && piece.kind != OpKind::Backing &&
+        IsReadProtected(piece.source, piece.size)) [[unlikely]] {
+        MarkPending(piece, false);
+        // Reading the range here would run the fault handlers, which may wait for the GPU. The
+        // resolver serves what it can without touching the protected pages and hands back the
+        // rest, which goes through this protocol again.
+        if (allow_resolve && piece.dst_buffer != 0 && TryResolveProtected(piece)) {
+            return;
+        }
+        // Faults on this range must be handled on the command processor thread.
+        AddProducerStat(producer_stats.protected_inline_ops, 1);
+        if (Common::PerformanceTelemetry::Enabled()) {
+            Common::PerformanceTelemetry::AddEnabled(
+                Common::PerformanceTelemetry::Counter::GuestCopyProtectedInlineOps, 1);
+        }
+        ExecuteInline(std::span{&piece, 1});
+        return;
+    }
+
+    if (building_ops == MaxOpsPerJob ||
+        (building_ops != 0 && building_bytes + piece.size > SplitBytes)) {
+        PublishJob(building_ops, building_bytes);
+    }
+    if (building_ops == 0) {
+        WaitForSlot();
+    }
+    Slot& slot = (*slots)[(submitted.load(std::memory_order_relaxed) + 1) & SlotMask];
+    slot.ops[building_ops++] = piece;
+    building_bytes += piece.size;
 }
 
 void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
@@ -214,9 +242,9 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
     building_ops = 0;
     building_bytes = 0;
 
-    stats.jobs.fetch_add(1, std::memory_order_relaxed);
-    stats.ops.fetch_add(num_ops, std::memory_order_relaxed);
-    stats.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    AddProducerStat(producer_stats.jobs, 1);
+    AddProducerStat(producer_stats.ops, num_ops);
+    AddProducerStat(producer_stats.bytes, bytes);
     if (Common::PerformanceTelemetry::Enabled()) {
         Common::PerformanceTelemetry::AddEnabled(
             Common::PerformanceTelemetry::Counter::GuestCopyJobs, 1);
@@ -229,7 +257,10 @@ void GuestCopyEngine::PublishJob(u32 num_ops, u64 bytes) {
 
     submitted.store(seq, std::memory_order_seq_cst);
     wake_signal.fetch_add(1, std::memory_order_seq_cst);
-    if (parked_workers.load(std::memory_order_seq_cst) != 0) {
+    // Waking a parked worker is a system call. A spinning worker checks submitted after it
+    // stops counting itself as spinning, so it either takes this job or is counted here.
+    if (spinning_workers.load(std::memory_order_seq_cst) == 0 &&
+        parked_workers.load(std::memory_order_seq_cst) != 0) {
         wake_signal.notify_one();
     }
 
@@ -277,7 +308,7 @@ void GuestCopyEngine::WaitForSlot() {
     if (completed.load(std::memory_order_acquire) >= previous) {
         return;
     }
-    stats.slot_full_waits.fetch_add(1, std::memory_order_relaxed);
+    AddProducerStat(producer_stats.slot_full_waits, 1);
     WaitCompleted(previous);
 }
 
@@ -496,6 +527,9 @@ void GuestCopyEngine::WorkerLoop(std::stop_token stoken, u32 index) {
         if (TryRunOne(true)) {
             continue;
         }
+        // While counted as spinning, this worker is responsible for noticing new jobs, so the
+        // producer does not wake anyone.
+        spinning_workers.fetch_add(1, std::memory_order_seq_cst);
         const u64 spin_start = NowNs();
         bool found = false;
         while (NowNs() - spin_start < WorkerSpinNs) {
@@ -508,13 +542,18 @@ void GuestCopyEngine::WorkerLoop(std::stop_token stoken, u32 index) {
                 break;
             }
             if (stoken.stop_requested()) {
+                spinning_workers.fetch_sub(1, std::memory_order_seq_cst);
                 return;
             }
         }
         if (found) {
+            spinning_workers.fetch_sub(1, std::memory_order_seq_cst);
             continue;
         }
+        // Count as parked before leaving the spinners, then check for jobs published while
+        // the producer still counted this worker as spinning.
         parked_workers.fetch_add(1, std::memory_order_seq_cst);
+        spinning_workers.fetch_sub(1, std::memory_order_seq_cst);
         const u64 observed = wake_signal.load(std::memory_order_seq_cst);
         if (claimed.load(std::memory_order_seq_cst) >= submitted.load(std::memory_order_seq_cst) &&
             !stoken.stop_requested()) {
@@ -613,20 +652,20 @@ bool GuestCopyEngine::OverlapsPending(VAddr addr, u64 size) const noexcept {
 
 GuestCopyEngine::Stats GuestCopyEngine::GetStats() const noexcept {
     return Stats{
-        .jobs = stats.jobs.load(std::memory_order_relaxed),
-        .ops = stats.ops.load(std::memory_order_relaxed),
-        .bytes = stats.bytes.load(std::memory_order_relaxed),
+        .jobs = producer_stats.jobs.load(std::memory_order_relaxed),
+        .ops = producer_stats.ops.load(std::memory_order_relaxed),
+        .bytes = producer_stats.bytes.load(std::memory_order_relaxed),
         .inline_bytes = stats.inline_bytes.load(std::memory_order_relaxed),
         .worker_ns = stats.worker_ns.load(std::memory_order_relaxed),
         .help_ns = stats.help_ns.load(std::memory_order_relaxed),
         .wait_calls = stats.wait_calls.load(std::memory_order_relaxed),
         .wait_ns = stats.wait_ns.load(std::memory_order_relaxed),
         .overlap_waits = stats.overlap_waits.load(std::memory_order_relaxed),
-        .slot_full_waits = stats.slot_full_waits.load(std::memory_order_relaxed),
-        .protected_inline_ops = stats.protected_inline_ops.load(std::memory_order_relaxed),
-        .gpu_served_ops = stats.gpu_served_ops.load(std::memory_order_relaxed),
-        .gpu_served_bytes = stats.gpu_served_bytes.load(std::memory_order_relaxed),
-        .backing_bytes = stats.backing_bytes.load(std::memory_order_relaxed),
+        .slot_full_waits = producer_stats.slot_full_waits.load(std::memory_order_relaxed),
+        .protected_inline_ops = producer_stats.protected_inline_ops.load(std::memory_order_relaxed),
+        .gpu_served_ops = producer_stats.gpu_served_ops.load(std::memory_order_relaxed),
+        .gpu_served_bytes = producer_stats.gpu_served_bytes.load(std::memory_order_relaxed),
+        .backing_bytes = producer_stats.backing_bytes.load(std::memory_order_relaxed),
     };
 }
 
@@ -680,8 +719,8 @@ bool GuestCopyEngine::RunSelfTest() {
     std::atomic<u64> protect_cycles{0};
     self_test_base = reinterpret_cast<VAddr>(source.data());
     self_test_violations.store(0, std::memory_order_relaxed);
-    const u64 inline_before = stats.protected_inline_ops.load(std::memory_order_relaxed);
-    const u64 served_before = stats.gpu_served_ops.load(std::memory_order_relaxed);
+    const u64 inline_before = producer_stats.protected_inline_ops.load(std::memory_order_relaxed);
+    const u64 served_before = producer_stats.gpu_served_ops.load(std::memory_order_relaxed);
 
     // Stands in for the GPU: serves the first half of a protected copy directly and leaves the
     // second half to the regular protocol, which must still keep workers off protected ranges.
@@ -879,8 +918,8 @@ bool GuestCopyEngine::RunSelfTest() {
              workers.size(), total_ops, static_cast<double>(total_bytes) / (1024.0 * 1024.0),
              overlap_checks, waiter_checks.load(std::memory_order_relaxed),
              protect_cycles.load(std::memory_order_relaxed),
-             stats.protected_inline_ops.load(std::memory_order_relaxed) - inline_before,
-             stats.gpu_served_ops.load(std::memory_order_relaxed) - served_before);
+             producer_stats.protected_inline_ops.load(std::memory_order_relaxed) - inline_before,
+             producer_stats.gpu_served_ops.load(std::memory_order_relaxed) - served_before);
     return true;
 }
 

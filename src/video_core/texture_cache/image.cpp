@@ -239,22 +239,20 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
         // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, image.info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, image.info.resources.layers);
+        const u32 first_mip = needs_partial_transition ? subres_range->base.level : 0;
+        const u32 last_mip = first_mip + (needs_partial_transition ? subres_range->extent.levels
+                                                                  : image.info.resources.levels);
+        const u32 first_layer = needs_partial_transition ? subres_range->base.layer : 0;
+        const u32 last_layer = first_layer + (needs_partial_transition
+                                                  ? subres_range->extent.layers
+                                                  : image.info.resources.layers);
+        const u32 resource_layers = image.info.resources.layers;
 
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
+        for (u32 mip = first_mip; mip < last_mip; ++mip) {
+            u32 subres_idx = mip * resource_layers + first_layer;
+            for (u32 layer = first_layer; layer < last_layer; ++layer, ++subres_idx) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * image.info.resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <limits>
 #include <memory>
 
@@ -253,6 +254,22 @@ private:
     };
     std::array<std::array<CachedImageBinding, Shader::NUM_IMAGES>, MaxShaderStages>
         cached_image_bindings{};
+
+    /// Image lookups by T#, shared by every program. A program switch invalidates the tokens
+    /// above, which belong to a stage slot, but the same T# still resolves to the same image.
+    struct TextureLookupEntry {
+        AmdGpu::Image sharp{};
+        u64 resource_key{};
+        VideoCore::ImageId image_id{};
+        u32 mip_index{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        VideoCore::ImageViewInfo view_info{};
+        bool valid{};
+    };
+    static constexpr size_t TextureLookupSize = 2048;
+    static_assert(std::has_single_bit(TextureLookupSize));
+    std::unique_ptr<std::array<TextureLookupEntry, TextureLookupSize>> texture_lookup;
 
     struct CachedImageDescription {
         const Shader::Info* owner{};

@@ -23,6 +23,7 @@
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
 #include "video_core/guest_copy_engine.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_record_selftest.h"
 
 #ifdef _WIN32
@@ -106,6 +107,9 @@ int main(int argc, char* argv[]) {
     std::optional<u32> vkRecordSelfTest;
     app.add_option("--vk-record-selftest", vkRecordSelfTest,
                    "Check N rounds of Vulkan commands recorded on the recording thread and exit");
+    std::optional<u32> stageShapeSelfTest;
+    app.add_option("--stage-shape-selftest", stageShapeSelfTest,
+                   "Check N rounds of shader specialization shape keys and exit");
 
     // ---- Capture args after `--` verbatim ----
     app.allow_extras();
@@ -167,6 +171,13 @@ int main(int argc, char* argv[]) {
         std::cout << "Vulkan record self-test " << (passed ? "passed" : "FAILED") << std::endl;
         Common::Log::Flush();
         return passed ? 0 : 4;
+    }
+
+    if (stageShapeSelfTest) {
+        const bool passed = Vulkan::RunSpecializationShapeSelfTest(*stageShapeSelfTest);
+        std::cout << "stage shape self-test " << (passed ? "passed" : "FAILED") << std::endl;
+        Common::Log::Flush();
+        return passed ? 0 : 5;
     }
 
     IPC::Instance().Init();

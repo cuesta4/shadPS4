@@ -202,6 +202,8 @@ private:
     static constexpr u64 SplitBytes = 256 * 1024;
     static constexpr u64 GranuleBits = 16;
     static constexpr u64 PendingTableSize = 8192;
+    /// Pieces whose pending marks are published before a single read protection fence.
+    static constexpr u32 MarkBatchSize = 32;
     static_assert((SlotCount & SlotMask) == 0);
     static_assert((PendingTableSize & (PendingTableSize - 1)) == 0);
 
@@ -223,6 +225,10 @@ private:
     void WaitForSlot();
     void WaitForGuestWriteSlow(VAddr addr, u64 size);
     void EnqueueOp(const Op& op, bool allow_resolve);
+    void AppendMarkedPieces(std::span<const Op> pieces, bool allow_resolve);
+    void AppendPiece(const Op& piece, bool allow_resolve);
+    /// Returns the piece of op that starts at offset, at most SplitBytes long.
+    [[nodiscard]] static Op MakePiece(const Op& op, u64 offset) noexcept;
     [[nodiscard]] bool TryResolveProtected(const Op& op);
     void ExecuteInline(std::span<const Op> ops);
     void ExecuteOps(std::span<const Op> ops, bool telemetry_enabled);
@@ -253,6 +259,8 @@ private:
     alignas(64) std::atomic<u64> completed{0};
     alignas(64) std::atomic<u64> wake_signal{0};
     std::atomic<u32> parked_workers{0};
+    /// Workers polling for jobs. One of them picks up the next job without being woken.
+    std::atomic<u32> spinning_workers{0};
     std::atomic<u32> completion_waiters{0};
     std::atomic<bool> active{false};
 
@@ -266,21 +274,28 @@ private:
     u32 building_ops{};
     u64 building_bytes{};
 
-    struct alignas(64) AtomicStats {
+    /// Counters written only by the producer thread. They are read concurrently, so they stay
+    /// atomic, but they are updated with plain loads and stores on a cache line of their own.
+    struct alignas(64) ProducerStats {
         std::atomic<u64> jobs{};
         std::atomic<u64> ops{};
         std::atomic<u64> bytes{};
+        std::atomic<u64> slot_full_waits{};
+        std::atomic<u64> protected_inline_ops{};
+        std::atomic<u64> gpu_served_ops{};
+        std::atomic<u64> gpu_served_bytes{};
+        std::atomic<u64> backing_bytes{};
+    };
+    ProducerStats producer_stats;
+
+    /// Counters any thread may update.
+    struct alignas(64) AtomicStats {
         std::atomic<u64> inline_bytes{};
         std::atomic<u64> worker_ns{};
         std::atomic<u64> help_ns{};
         std::atomic<u64> wait_calls{};
         std::atomic<u64> wait_ns{};
         std::atomic<u64> overlap_waits{};
-        std::atomic<u64> slot_full_waits{};
-        std::atomic<u64> protected_inline_ops{};
-        std::atomic<u64> gpu_served_ops{};
-        std::atomic<u64> gpu_served_bytes{};
-        std::atomic<u64> backing_bytes{};
     };
     AtomicStats stats;
 

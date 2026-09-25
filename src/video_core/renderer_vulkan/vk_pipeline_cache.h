@@ -50,6 +50,9 @@ class Scheduler;
 class ShaderCache;
 struct ShaderCompileResult;
 
+/// Checks that descriptors with equal specialization shape keys specialize identically.
+bool RunSpecializationShapeSelfTest(u32 rounds);
+
 struct ResolvedStageResources {
     boost::container::static_vector<AmdGpu::Buffer, Shader::NUM_BUFFERS> buffers;
     boost::container::static_vector<AmdGpu::Image, Shader::NUM_IMAGES> images;
@@ -83,8 +86,24 @@ struct Program {
         std::future<void> completion;
     };
 
+    /// Inputs of the last exact match of a permutation, keeping only the descriptor fields the
+    /// specialization reads. Equal inputs select the same permutation without comparing it.
+    struct SpecializationShape {
+        using Keys = boost::container::small_vector<u64, 32>;
+
+        size_t permutation{InvalidPermutation};
+        u32 modules_generation{};
+        u64 fetch_shader_revision{};
+        Shader::Backend::Bindings start{};
+        Shader::RuntimeInfo runtime_info{};
+        Keys keys;
+    };
+
     Shader::Info info;
     ModuleList modules{};
+    /// Changes whenever a permutation is added or replaced.
+    u32 modules_generation{};
+    SpecializationShape specialization_shape{};
     ResolvedStageResources resolved_resources{};
     boost::container::small_vector<FetchShaderCacheEntry, MaxFetchShaderCacheEntries>
         fetch_shader_cache;
@@ -102,12 +121,14 @@ struct Program {
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
         modules.emplace_back(module, std::move(spec));
+        ++modules_generation;
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
+        ++modules_generation;
     }
 };
 
@@ -241,6 +262,7 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    Program::SpecializationShape::Keys specialization_shape_keys;
     std::unique_ptr<OptimizationState> optimization;
     bool async_shader_recompiling{};
 

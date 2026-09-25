@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <span>
 #include <type_traits>
@@ -230,6 +233,17 @@ bool BuildSpecializationPlan(Program& program) {
     program.specialization_plan_reasons = static_cast<u8>(reasons);
     program.specialization_plan_cacheable = reasons == 0;
     return program.specialization_plan_cacheable;
+}
+
+/// Whether the specialization of a program is a function of its freshly resolved resources,
+/// runtime info, fetch shader and bindings, which MatchesCurrentSpecialization compares.
+/// Tessellation stages also fold constants read from guest memory into their runtime info.
+[[nodiscard]] bool IsSpecializationMatchable(const Program& program) noexcept {
+    using Reason = Common::PerformanceTelemetry::StageUncacheableReason;
+    constexpr u32 TessellationReasons = static_cast<u32>(Reason::TessellationControl) |
+                                        static_cast<u32>(Reason::TessellationEvaluation);
+    return program.specialization_plan_ready &&
+           (program.specialization_plan_reasons & TessellationReasons) == 0;
 }
 
 void RefreshDynamicProgramData(
@@ -815,6 +829,124 @@ void AddBindingStart(SpecializationFingerprintBuilder& builder,
         }
     }
     return Program::InvalidPermutation;
+}
+
+// The shape keys below keep exactly the descriptor fields the Make*Specialization functions in
+// shader_recompiler/specialization.h read, plus whether the descriptor binds at all. Addresses,
+// sizes and image dimensions change from draw to draw without changing the shader. A field
+// read by a new specialization member must be added here as well.
+
+/// MakeBufferSpecialization and MakeVsAttribSpecialization read the stride, swizzle, formats and
+/// swizzle element fields. A V# binds when num_records is nonzero.
+[[nodiscard]] u64 BufferShapeKey(const AmdGpu::Buffer& buffer) noexcept {
+    return u64{buffer.stride} | (u64{buffer.swizzle_enable} << 14) |
+           (u64{buffer.dst_sel_x} << 15) | (u64{buffer.dst_sel_y} << 18) |
+           (u64{buffer.dst_sel_z} << 21) | (u64{buffer.dst_sel_w} << 24) |
+           (u64{buffer.num_format} << 27) | (u64{buffer.data_format} << 30) |
+           (u64{buffer.element_size} << 34) | (u64{buffer.index_stride} << 36) |
+           (u64{buffer.num_records != 0} << 38);
+}
+
+/// MakeImageSpecialization reads the type, formats, swizzle and mip range. A T# binds when its
+/// address is nonzero.
+[[nodiscard]] u64 ImageShapeKey(const AmdGpu::Image& image) noexcept {
+    return u64{image.type} | (u64{image.data_format} << 4) | (u64{image.num_format} << 10) |
+           (u64{image.dst_sel_x} << 14) | (u64{image.dst_sel_y} << 17) |
+           (u64{image.dst_sel_z} << 20) | (u64{image.dst_sel_w} << 23) |
+           (u64{image.base_level} << 26) | (u64{image.last_level} << 30) |
+           (u64{image.base_address != 0} << 34);
+}
+
+/// MakeFMaskSpecialization reads the dimensions.
+[[nodiscard]] u64 FMaskShapeKey(const AmdGpu::Image& image) noexcept {
+    return u64{image.width} | (u64{image.height} << 14) | (u64{image.base_address != 0} << 28);
+}
+
+/// MakeSamplerSpecialization reads the unnormalized and degamma bits.
+[[nodiscard]] u64 SamplerShapeKey(const AmdGpu::Sampler& sampler) noexcept {
+    return sampler.force_unnormalized.Value() | (sampler.force_degamma.Value() << 1) |
+           (u64{static_cast<bool>(sampler)} << 2);
+}
+
+/// Collects the shape keys of the resources MatchesCurrentSpecialization compares, in the
+/// same order.
+void BuildSpecializationShapeKeys(const Shader::Info& info,
+                                  const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader,
+                                  Program::SpecializationShape::Keys& keys) {
+    keys.clear();
+    if (info.stage == Stage::Vertex && fetch_shader && fetch_shader->has_value()) {
+        for (const auto& sharp : info.resolved_vertex_buffers) {
+            keys.push_back(BufferShapeKey(sharp));
+        }
+    }
+    for (const auto& sharp : info.resolved_fmasks) {
+        keys.push_back(FMaskShapeKey(sharp));
+    }
+    for (const auto& sharp : info.resolved_buffers) {
+        keys.push_back(BufferShapeKey(sharp));
+    }
+    for (const auto& sharp : info.resolved_images) {
+        keys.push_back(ImageShapeKey(sharp));
+    }
+    for (const auto& sharp : info.resolved_samplers) {
+        keys.push_back(SamplerShapeKey(sharp));
+    }
+}
+
+[[nodiscard]] bool MatchesSpecializationShape(const Program& program, size_t permutation,
+                                              u64 fetch_shader_revision,
+                                              const Shader::Backend::Bindings& start,
+                                              const Shader::RuntimeInfo& runtime_info,
+                                              const Program::SpecializationShape::Keys& keys) {
+    const auto& shape = program.specialization_shape;
+    return shape.permutation == permutation &&
+           shape.modules_generation == program.modules_generation &&
+           shape.fetch_shader_revision == fetch_shader_revision && shape.start == start &&
+           shape.keys.size() == keys.size() &&
+           std::memcmp(shape.keys.data(), keys.data(), keys.size() * sizeof(u64)) == 0 &&
+           shape.runtime_info == runtime_info;
+}
+
+void RecordSpecializationShape(Program& program, size_t permutation, u64 fetch_shader_revision,
+                               const Shader::Backend::Bindings& start,
+                               const Shader::RuntimeInfo& runtime_info,
+                               const Program::SpecializationShape::Keys& keys) {
+    auto& shape = program.specialization_shape;
+    shape.permutation = permutation;
+    shape.modules_generation = program.modules_generation;
+    shape.fetch_shader_revision = fetch_shader_revision;
+    shape.start = start;
+    shape.runtime_info = runtime_info;
+    shape.keys.assign(keys.begin(), keys.end());
+}
+
+/// SHADPS4_VERIFY_STAGE_SHAPE=1 also runs the full comparison on every shape match and logs
+/// any disagreement.
+[[nodiscard]] bool VerifySpecializationShapes() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_VERIFY_STAGE_SHAPE");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Confirms a shape match with the full comparison. A disagreement means a shape key misses a
+/// field the specialization reads.
+[[nodiscard]] SHAD_NO_INLINE bool VerifyShapeMatch(
+    const Shader::StageSpecialization& candidate, const Shader::Info& info,
+    const Shader::RuntimeInfo& runtime_info, const Shader::Backend::Bindings& start,
+    const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader) {
+    if (MatchesCurrentSpecialization(candidate, info, runtime_info, start, fetch_shader)) {
+        return true;
+    }
+    static std::atomic<u32> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_ERROR(Render_Vulkan,
+                  "Specialization shape matched a permutation the full comparison rejects: "
+                  "program {:#x}, stage {}",
+                  info.pgm_hash, static_cast<u32>(info.l_stage));
+    }
+    return false;
 }
 
 struct StageRawDependencyKey {
@@ -2166,9 +2298,21 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
 
     const bool plan_cacheable = BuildSpecializationPlan(program);
     const bool fetch_shader_usable = cached_fetch_shader.IsUsable(info);
-    const bool cacheable = plan_cacheable && fetch_shader_usable;
-    if (cacheable) {
+    if (opt.telemetry_enabled && !(plan_cacheable && fetch_shader_usable)) {
+        using Reason = Common::PerformanceTelemetry::StageUncacheableReason;
+        u32 reasons = program.specialization_plan_reasons;
+        if (!fetch_shader_usable) {
+            reasons |= static_cast<u32>(Reason::FetchShaderUnavailable);
+        }
+        Common::PerformanceTelemetry::RecordStageUncacheableEnabled(stage_index, reasons);
+    }
+    // The resources were just resolved from guest memory, so the current specialization can be
+    // compared even when descriptors come from an SRT walk. Only the graphics dependency key,
+    // which skips resolution, needs a cacheable plan.
+    if (fetch_shader_usable && IsSpecializationMatchable(program)) {
         const size_t current_permutation = program.current_permutation;
+        auto& shape_keys = specialization_shape_keys;
+        BuildSpecializationShapeKeys(info, cached_fetch_shader.parsed, shape_keys);
         if (current_permutation < program.modules.size()) [[likely]] {
             auto& module = program.modules[current_permutation];
             bool current_matches;
@@ -2176,8 +2320,28 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
                 Common::PerformanceTelemetry::SampledDuration<
                     Common::PerformanceTelemetry::TimerSite::StageCurrentMatch>
                     match_duration{opt.telemetry_enabled, stage_index};
-                current_matches = MatchesCurrentSpecialization(
-                    module.spec, info, runtime_info, start, cached_fetch_shader.parsed);
+                current_matches =
+                    MatchesSpecializationShape(program, current_permutation,
+                                               cached_fetch_shader.revision, start, runtime_info,
+                                               shape_keys);
+                if (current_matches) [[likely]] {
+                    if (opt.telemetry_enabled) {
+                        Common::PerformanceTelemetry::AddEnabled(
+                            Common::PerformanceTelemetry::Counter::StageShapeHits, 1);
+                    }
+                    if (VerifySpecializationShapes()) [[unlikely]] {
+                        current_matches = VerifyShapeMatch(module.spec, info, runtime_info, start,
+                                                           cached_fetch_shader.parsed);
+                    }
+                } else {
+                    current_matches = MatchesCurrentSpecialization(
+                        module.spec, info, runtime_info, start, cached_fetch_shader.parsed);
+                    if (current_matches) {
+                        RecordSpecializationShape(program, current_permutation,
+                                                  cached_fetch_shader.revision, start,
+                                                  runtime_info, shape_keys);
+                    }
+                }
             }
             if (current_matches) [[likely]] {
                 info.AddBindings(binding);
@@ -2207,6 +2371,8 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
         if (permutation != Program::InvalidPermutation) {
             auto& module = program.modules[permutation];
             program.current_permutation = permutation;
+            RecordSpecializationShape(program, permutation, cached_fetch_shader.revision, start,
+                                      runtime_info, shape_keys);
             info.AddBindings(binding);
             current_stage = {
                 .program = &program,
@@ -2220,13 +2386,6 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
             return Result{&info, module.module, cached_fetch_shader.parsed,
                           HashCombine(params.hash, permutation)};
         }
-    } else if (opt.telemetry_enabled) {
-        using Reason = Common::PerformanceTelemetry::StageUncacheableReason;
-        u32 reasons = program.specialization_plan_reasons;
-        if (!fetch_shader_usable) {
-            reasons |= static_cast<u32>(Reason::FetchShaderUnavailable);
-        }
-        Common::PerformanceTelemetry::RecordStageUncacheableEnabled(stage_index, reasons);
     }
 
     if (!compilation_ready) {
@@ -2449,5 +2608,151 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     std::vector<u32> code(file.GetSize() / sizeof(u32));
     file.Read(code);
     return code;
+}
+
+bool RunSpecializationShapeSelfTest(u32 rounds) {
+    // Pairs of random descriptors that share only their shape keys must specialize identically;
+    // otherwise a key misses a field the specialization reads.
+    std::mt19937_64 rng{0x5eed5a9e5eed5a9eULL};
+    const auto randomize = [&](auto& value) {
+        std::array<u64, (sizeof(value) + sizeof(u64) - 1) / sizeof(u64)> words;
+        for (auto& word : words) {
+            word = rng();
+        }
+        std::memcpy(&value, words.data(), sizeof(value));
+    };
+    u64 checks = 0;
+    u64 failures = 0;
+    const auto check = [&](bool same, std::string_view what, u32 round) {
+        ++checks;
+        if (!same && failures++ < 16) {
+            LOG_ERROR(Render_Vulkan, "Stage shape self-test: {} differs in round {}", what, round);
+        }
+    };
+    constexpr u64 ImageAddressMask = (1ULL << 38) - 1;
+    // MapNumberConversion only accepts 8, 16 and 32-bit data formats with SnormNz, like the
+    // descriptors games produce.
+    const auto sanitize_formats = [](auto& descriptor) {
+        if (static_cast<AmdGpu::NumberFormat>(descriptor.num_format) ==
+            AmdGpu::NumberFormat::SnormNz) {
+            descriptor.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32);
+        }
+    };
+
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.Initialize(Shader::Stage::Vertex);
+    for (u32 round = 0; round < rounds; ++round) {
+        AmdGpu::Buffer buffer;
+        AmdGpu::Buffer buffer_twin;
+        randomize(buffer);
+        randomize(buffer_twin);
+        if (rng() % 4 == 0) {
+            buffer.num_records = 0;
+        }
+        sanitize_formats(buffer);
+        buffer_twin.stride = buffer.stride;
+        buffer_twin.swizzle_enable = buffer.swizzle_enable;
+        buffer_twin.dst_sel_x = buffer.dst_sel_x;
+        buffer_twin.dst_sel_y = buffer.dst_sel_y;
+        buffer_twin.dst_sel_z = buffer.dst_sel_z;
+        buffer_twin.dst_sel_w = buffer.dst_sel_w;
+        buffer_twin.num_format = buffer.num_format;
+        buffer_twin.data_format = buffer.data_format;
+        buffer_twin.element_size = buffer.element_size;
+        buffer_twin.index_stride = buffer.index_stride;
+        buffer_twin.num_records = buffer.num_records != 0 ? static_cast<u32>(rng()) | 1U : 0U;
+        check(BufferShapeKey(buffer) == BufferShapeKey(buffer_twin), "buffer key", round);
+        check(static_cast<bool>(buffer) == static_cast<bool>(buffer_twin), "buffer binding",
+              round);
+        for (const bool formatted : {false, true}) {
+            Shader::BufferResource resource{};
+            resource.is_formatted = formatted;
+            check(Shader::MakeBufferSpecialization(resource, buffer) ==
+                      Shader::MakeBufferSpecialization(resource, buffer_twin),
+                  "buffer specialization", round);
+        }
+        runtime_info.vs_info.step_rate_0 = static_cast<u32>(rng());
+        runtime_info.vs_info.step_rate_1 = static_cast<u32>(rng());
+        for (u8 step_rate = 0; step_rate < 4; ++step_rate) {
+            Shader::Gcn::VertexAttribute attribute{};
+            attribute.instance_data = step_rate;
+            check(Shader::MakeVsAttribSpecialization(attribute, buffer, runtime_info) ==
+                      Shader::MakeVsAttribSpecialization(attribute, buffer_twin, runtime_info),
+                  "vertex attribute specialization", round);
+        }
+
+        AmdGpu::Image image;
+        AmdGpu::Image image_twin;
+        randomize(image);
+        randomize(image_twin);
+        if (rng() % 4 == 0) {
+            image.base_address = 0;
+        }
+        sanitize_formats(image);
+        image_twin.type = image.type;
+        image_twin.data_format = image.data_format;
+        image_twin.num_format = image.num_format;
+        image_twin.dst_sel_x = image.dst_sel_x;
+        image_twin.dst_sel_y = image.dst_sel_y;
+        image_twin.dst_sel_z = image.dst_sel_z;
+        image_twin.dst_sel_w = image.dst_sel_w;
+        image_twin.base_level = image.base_level;
+        image_twin.last_level = image.last_level;
+        image_twin.base_address = image.base_address != 0 ? (rng() & ImageAddressMask) | 1 : 0;
+        check(ImageShapeKey(image) == ImageShapeKey(image_twin), "image key", round);
+        check(static_cast<bool>(image) == static_cast<bool>(image_twin), "image binding", round);
+        for (u32 variant = 0; variant < 12; ++variant) {
+            Shader::ImageResource resource{};
+            resource.is_array = (variant & 1) != 0;
+            resource.is_written = (variant & 2) != 0;
+            resource.mip_fallback_mode = static_cast<Shader::MipStorageFallbackMode>(variant / 4);
+            check(Shader::MakeImageSpecialization(resource, image) ==
+                      Shader::MakeImageSpecialization(resource, image_twin),
+                  "image specialization", round);
+        }
+
+        AmdGpu::Image fmask;
+        AmdGpu::Image fmask_twin;
+        randomize(fmask);
+        randomize(fmask_twin);
+        if (rng() % 4 == 0) {
+            fmask.base_address = 0;
+        }
+        fmask_twin.width = fmask.width;
+        fmask_twin.height = fmask.height;
+        fmask_twin.base_address = fmask.base_address != 0 ? (rng() & ImageAddressMask) | 1 : 0;
+        check(FMaskShapeKey(fmask) == FMaskShapeKey(fmask_twin), "fmask key", round);
+        check(static_cast<bool>(fmask) == static_cast<bool>(fmask_twin), "fmask binding", round);
+        check(Shader::MakeFMaskSpecialization(fmask) == Shader::MakeFMaskSpecialization(fmask_twin),
+              "fmask specialization", round);
+
+        AmdGpu::Sampler sampler;
+        AmdGpu::Sampler sampler_twin;
+        randomize(sampler);
+        randomize(sampler_twin);
+        if (rng() % 4 == 0) {
+            sampler.raw0 = 0;
+            sampler.raw1 = 0;
+            sampler_twin.raw0 = 0;
+            sampler_twin.raw1 = 0;
+        } else {
+            // Bit 0 of raw1 is the LOD bias, which the specialization does not read.
+            sampler.raw1 |= 1;
+            sampler_twin.raw1 |= 1;
+            sampler_twin.force_unnormalized.Assign(sampler.force_unnormalized.Value());
+            sampler_twin.force_degamma.Assign(sampler.force_degamma.Value());
+        }
+        check(SamplerShapeKey(sampler) == SamplerShapeKey(sampler_twin), "sampler key", round);
+        check(Shader::MakeSamplerSpecialization(sampler) ==
+                  Shader::MakeSamplerSpecialization(sampler_twin),
+              "sampler specialization", round);
+    }
+    if (failures != 0) {
+        LOG_ERROR(Render_Vulkan, "Stage shape self-test FAILED: {} of {} checks", failures,
+                  checks);
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "Stage shape self-test passed: {} rounds, {} checks", rounds, checks);
+    return true;
 }
 } // namespace Vulkan

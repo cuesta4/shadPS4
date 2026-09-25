@@ -483,8 +483,23 @@ private:
     if (const char* env = std::getenv("SHADPS4_COPY_WORKERS"); env != nullptr) {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
-    const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
-    return std::clamp(hardware_threads / 2, 2u, 8u);
+    // A job takes about two microseconds and arrives once per draw, so two workers keep up.
+    // Idle workers spin before parking, and more of them take cores and boost clock from the
+    // command processor and the Vulkan recording thread.
+    return 2;
+}
+
+[[nodiscard]] u64 HashTextureLookup(const AmdGpu::Image& sharp, u64 resource_key,
+                                    u32 mip_index) noexcept {
+    std::array<u64, sizeof(AmdGpu::Image) / sizeof(u64)> words;
+    static_assert(sizeof(words) == sizeof(sharp));
+    std::memcpy(words.data(), &sharp, sizeof(sharp));
+    u64 value = words[0] * 0x9E3779B97F4A7C15ULL;
+    value ^= std::rotl(words[1] * 0xC2B2AE3D27D4EB4FULL, 21);
+    value ^= std::rotl(words[2] * 0x165667B19E3779F9ULL, 42);
+    value ^= words[3] * 0xD6E8FEB86659FD93ULL;
+    value ^= ((resource_key << 5) | mip_index) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 29);
 }
 
 /// SHADPS4_GPU_SHADOW_SERVE=0 makes uploads of GPU-owned guest ranges materialize guest RAM
@@ -504,6 +519,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool} {
     dynamic_state_inputs = std::make_unique<DynamicStateInputCache>();
+    texture_lookup = std::make_unique<std::array<TextureLookupEntry, TextureLookupSize>>();
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
         scheduler.GateSubmitsOnGuestCopies();
@@ -2188,6 +2204,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     1);
             }
 
+            TextureLookupEntry* lookup_fill{};
             if (cache_hit) {
                 image_bindings.emplace_back(ImageBindingInfo{
                     .image_id = cached.image_id,
@@ -2196,7 +2213,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     .mip_index = static_cast<u8>(i),
                     .is_storage = image_desc.is_written,
                 });
+            } else if (auto& lookup = (*texture_lookup)[HashTextureLookup(tsharp, resource_key, i) &
+                                                        (TextureLookupSize - 1)];
+                       lookup.valid && lookup.resource_key == resource_key &&
+                       lookup.mip_index == i &&
+                       std::memcmp(&lookup.sharp, &tsharp, sizeof(tsharp)) == 0 &&
+                       lookup.topology_epoch == texture_cache.TopologyEpoch() &&
+                       texture_cache.TryReuseImage(lookup.image_id, lookup.image_uid,
+                                                   lookup.topology_epoch)) {
+                // The image description and FindImage depend only on the T# and the fields in
+                // resource_key, so another program's lookup of the same T# is valid here.
+                if (telemetry_enabled) {
+                    Common::PerformanceTelemetry::AddEnabled(
+                        Common::PerformanceTelemetry::Counter::ImageLookupHits, 1);
+                }
+                image_bindings.emplace_back(ImageBindingInfo{
+                    .image_id = lookup.image_id,
+                    .view_info = lookup.view_info,
+                    .source_index = static_cast<u8>(image_index),
+                    .mip_index = static_cast<u8>(i),
+                    .is_storage = image_desc.is_written,
+                });
             } else {
+                lookup_fill = &lookup;
                 if (!miss_desc) {
                     auto& description = cached_image_descriptions[stage_index][image_index];
                     const bool same_geometry =
@@ -2231,15 +2270,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image_binding = image_bindings.back();
             auto* image = &texture_cache.GetImage(image_binding.image_id);
             if (!cache_hit) {
+                const u64 topology_epoch = texture_cache.TopologyEpoch();
                 cached.sharp = tsharp;
                 cached.resource_key = resource_key;
                 cached.source_index = static_cast<u8>(image_index);
                 cached.mip_index = static_cast<u8>(i);
                 cached.image_id = image_binding.image_id;
                 cached.image_uid = image->image_uid;
-                cached.topology_epoch = texture_cache.TopologyEpoch();
+                cached.topology_epoch = topology_epoch;
                 cached.view_info = image_binding.view_info;
                 cached.valid = true;
+                if (lookup_fill != nullptr) {
+                    *lookup_fill = TextureLookupEntry{
+                        .sharp = tsharp,
+                        .resource_key = resource_key,
+                        .image_id = image_binding.image_id,
+                        .mip_index = i,
+                        .image_uid = image->image_uid,
+                        .topology_epoch = topology_epoch,
+                        .view_info = image_binding.view_info,
+                        .valid = true,
+                    };
+                }
             }
 
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
@@ -2268,10 +2320,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
-                const auto& description =
-                    cached_image_descriptions[stage_index][image_binding.source_index];
-                ASSERT(description.base_desc);
-                ImageDesc desc = *description.base_desc;
+                // Built from the T# because a lookup hit leaves the cached description of this
+                // slot untouched.
+                const u32 source_index = image_binding.source_index;
+                ImageDesc desc{GetResolvedImage(stage, source_index), stage.images[source_index]};
                 desc.view_info = view_info;
                 image_id = texture_cache.FindImage(desc);
                 view_info = desc.view_info;
@@ -2415,8 +2467,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             cached.topology_epoch = texture_cache.TopologyEpoch();
             cached_color_target_views[cb].valid = false;
         }
-        texture_cache.UpdateImage(image_id);
-        image->SetBackingSamples(key.color_samples[cb]);
+        // PrepareRenderTarget brings the image up to date below. The update here only matters
+        // when SetBackingSamples copies the current backing into one with another sample count.
+        if (image->backing && image->backing->num_samples != key.color_samples[cb]) {
+            texture_cache.UpdateImage(image_id);
+            image->SetBackingSamples(key.color_samples[cb]);
+        }
         texture_cache.PrepareRenderTarget(image_id, desc);
         auto& cached_view = cached_color_target_views[cb];
         const u64 topology_epoch = texture_cache.TopologyEpoch();
