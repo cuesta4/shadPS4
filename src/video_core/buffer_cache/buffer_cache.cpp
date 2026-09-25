@@ -96,9 +96,9 @@ struct BufferCache::StreamCopyScratch {
     static_assert(std::has_single_bit(HashTableSize));
 
     struct SourceKey {
-        StreamCopySource type{};
-        u32 size{};
         u64 address{};
+        u32 size{};
+        StreamCopySource type{};
 
         bool operator==(const SourceKey&) const = default;
     };
@@ -696,9 +696,9 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         for (u16 request_index = 0; request_index < requests.size(); ++request_index) {
             const auto& request = requests[request_index];
             const StreamCopyScratch::SourceKey key{
-                .type = request.source_type,
-                .size = request.size,
                 .address = source_key(request),
+                .size = request.size,
+                .type = request.source_type,
             };
             auto& mapping = scratch.request_map[request_index];
             mapping = {};
