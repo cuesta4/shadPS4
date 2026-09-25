@@ -1313,9 +1313,12 @@ if (ENABLE_LLVM_PGO_CAPTURE)
         message(FATAL_ERROR "LLVM profiling requires Clang")
     endif()
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles")
+    set_property(SOURCE src/emulator.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+        SHADPS4_ULTRA_PROFILE)
     target_compile_options(shadps4 PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate=${CMAKE_CURRENT_BINARY_DIR}/profiles/shadps4-%p.profraw>"
-        "$<$<COMPILE_LANGUAGE:C,CXX>:-fcoverage-mapping>")
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-fcoverage-mapping>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-update=atomic>")
     if (WIN32)
         target_link_libraries(shadps4 PRIVATE clang_rt.profile-x86_64.lib)
     else()
