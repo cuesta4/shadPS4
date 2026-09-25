@@ -1002,22 +1002,62 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
+template <typename Program>
+static void BuildCommonRuntimeInfo(Shader::RuntimeInfo& info, const Program& program) {
+    info.num_user_data = program.settings.num_user_regs;
+    info.num_input_vgprs = program.settings.vgpr_comp_cnt;
+    info.num_allocated_vgprs = program.NumVgprs();
+    info.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
+    info.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
+    info.fp_round_mode32 = program.settings.fp_round_mode32;
+    info.fp_round_mode16_64 = program.settings.fp_round_mode64;
+}
+
+SHAD_NO_INLINE void PipelineCache::BuildGeometryRuntimeInfo(Shader::RuntimeInfo& info) {
+    const auto& regs = liverpool->regs;
+    BuildCommonRuntimeInfo(info, regs.gs_program);
+    auto& gs_info = info.gs_info;
+    gs_info.num_outputs = MapOutputs(gs_info.outputs, regs.vs_output_control);
+    gs_info.output_vertices = regs.vgt_gs_max_vert_out;
+    gs_info.num_invocations =
+        regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
+    if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::LsHsEsGs) {
+        gs_info.in_primitive = [&]() {
+            switch (regs.tess_config.topology) {
+            case AmdGpu::TessellationTopology::Point:
+                return AmdGpu::PrimitiveType::PointList;
+            case AmdGpu::TessellationTopology::Line:
+                return AmdGpu::PrimitiveType::LineList;
+            case AmdGpu::TessellationTopology::TriangleCw:
+            case AmdGpu::TessellationTopology::TriangleCcw:
+                return AmdGpu::PrimitiveType::TriangleList;
+            default:
+                UNREACHABLE();
+            }
+        }();
+    } else {
+        gs_info.in_primitive = regs.primitive_type;
+    }
+    for (u32 stream_id = 0; stream_id < Shader::GsMaxOutputStreams; ++stream_id) {
+        gs_info.out_primitive[stream_id] =
+            regs.vgt_gs_out_prim_type.GetPrimitiveType(stream_id);
+    }
+    gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
+    gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
+    gs_info.mode = regs.vgt_gs_mode.mode;
+    const auto params_vc = AmdGpu::GetParams(regs.vs_program);
+    gs_info.vs_copy = params_vc.code;
+    gs_info.vs_copy_hash = params_vc.hash;
+    DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = liverpool->regs;
-    const auto BuildCommon = [&](const auto& program) {
-        info.num_user_data = program.settings.num_user_regs;
-        info.num_input_vgprs = program.settings.vgpr_comp_cnt;
-        info.num_allocated_vgprs = program.NumVgprs();
-        info.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
-        info.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
-        info.fp_round_mode32 = program.settings.fp_round_mode32;
-        info.fp_round_mode16_64 = program.settings.fp_round_mode64;
-    };
     info.Initialize(stage);
     switch (stage) {
     case Stage::Local: {
-        BuildCommon(regs.ls_program);
+        BuildCommonRuntimeInfo(info, regs.ls_program);
         Shader::TessellationDataConstantBuffer tess_constants{};
         const auto* hull_info = infos[u32(Shader::LogicalStage::TessellationControl)];
         hull_info->ReadTessConstantBuffer(tess_constants);
@@ -1025,7 +1065,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         break;
     }
     case Stage::Hull: {
-        BuildCommon(regs.hs_program);
+        BuildCommonRuntimeInfo(info, regs.hs_program);
         info.hs_info.num_input_control_points = regs.ls_hs_config.hs_input_control_points;
         info.hs_info.num_threads = regs.ls_hs_config.hs_output_control_points;
         info.hs_info.tess_type = regs.tess_config.type;
@@ -1035,7 +1075,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         break;
     }
     case Stage::Export: {
-        BuildCommon(regs.es_program);
+        BuildCommonRuntimeInfo(info, regs.es_program);
         info.es_info.vertex_data_size = regs.vgt_esgs_ring_itemsize;
         if (l_stage == LogicalStage::TessellationEval) {
             info.es_vs_info.tess_type = regs.tess_config.type;
@@ -1045,7 +1085,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         break;
     }
     case Stage::Vertex: {
-        BuildCommon(regs.vs_program);
+        BuildCommonRuntimeInfo(info, regs.vs_program);
         info.vs_info.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
         info.vs_info.step_rate_0 = regs.vgt_instance_step_rate_0;
         info.vs_info.step_rate_1 = regs.vgt_instance_step_rate_1;
@@ -1065,44 +1105,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         break;
     }
     case Stage::Geometry: {
-        BuildCommon(regs.gs_program);
-        auto& gs_info = info.gs_info;
-        gs_info.num_outputs = MapOutputs(gs_info.outputs, regs.vs_output_control);
-        gs_info.output_vertices = regs.vgt_gs_max_vert_out;
-        gs_info.num_invocations =
-            regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
-        if (regs.stage_enable.raw == AmdGpu::ShaderStageEnable::LsHsEsGs) {
-            gs_info.in_primitive = [&]() {
-                switch (regs.tess_config.topology) {
-                case AmdGpu::TessellationTopology::Point:
-                    return AmdGpu::PrimitiveType::PointList;
-                case AmdGpu::TessellationTopology::Line:
-                    return AmdGpu::PrimitiveType::LineList;
-                case AmdGpu::TessellationTopology::TriangleCw:
-                case AmdGpu::TessellationTopology::TriangleCcw:
-                    return AmdGpu::PrimitiveType::TriangleList;
-                default:
-                    UNREACHABLE();
-                }
-            }();
-        } else {
-            gs_info.in_primitive = regs.primitive_type;
-        }
-        for (u32 stream_id = 0; stream_id < Shader::GsMaxOutputStreams; ++stream_id) {
-            gs_info.out_primitive[stream_id] =
-                regs.vgt_gs_out_prim_type.GetPrimitiveType(stream_id);
-        }
-        gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
-        gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
-        gs_info.mode = regs.vgt_gs_mode.mode;
-        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
-        gs_info.vs_copy = params_vc.code;
-        gs_info.vs_copy_hash = params_vc.hash;
-        DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
+        BuildGeometryRuntimeInfo(info);
         break;
     }
     case Stage::Fragment: {
-        BuildCommon(regs.ps_program);
+        BuildCommonRuntimeInfo(info, regs.ps_program);
         info.fs_info.en_flags = regs.ps_input_ena;
         info.fs_info.addr_flags = regs.ps_input_addr;
         info.fs_info.num_inputs = regs.num_interp;

@@ -215,6 +215,7 @@ private:
                                    ShaderCompileResult* async_result = nullptr,
                                    const std::function<void()>& on_guest_data_captured = {});
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    void BuildGeometryRuntimeInfo(Shader::RuntimeInfo& info);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
