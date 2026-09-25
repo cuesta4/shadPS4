@@ -2581,14 +2581,20 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), border_color_base.Address());
 
     std::scoped_lock lock{samplers_mutex};
-    const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
-    if (new_sampler) {
-        samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
-    } else {
-        sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
+    const auto it = samplers.find(hash);
+    if (it != samplers.end()) {
+        auto& entry = it.value();
+        if (entry.lru_tick != gc_tick) {
+            sampler_lru_cache.Touch(entry.lru_id, gc_tick);
+            entry.lru_tick = gc_tick;
+        }
+        return entry.Handle();
     }
 
-    return it->second.Handle();
+    auto& entry = samplers.try_emplace(hash, instance, sampler, border_color_base).first.value();
+    entry.lru_id = sampler_lru_cache.Insert(hash, gc_tick);
+    entry.lru_tick = gc_tick;
+    return entry.Handle();
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
