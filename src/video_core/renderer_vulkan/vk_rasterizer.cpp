@@ -204,6 +204,21 @@ static void AppendDescriptorInfos(Vector& destination, const Info* source, const
     }
 }
 
+template <typename Info>
+static SHAD_NO_INLINE void CopyDescriptorInfosSlow(Info* destination, const Info* source,
+                                                   const u32 count) {
+    std::copy_n(source, count, destination);
+}
+
+template <typename Info>
+static void CopyDescriptorInfos(Info* destination, const Info* source, const u32 count) {
+    if (count == 1) [[likely]] {
+        *destination = *source;
+    } else {
+        CopyDescriptorInfosSlow(destination, source, count);
+    }
+}
+
 static SHAD_NO_INLINE void ReportDescriptorStateOverflow() {
     ASSERT(false);
 }
@@ -1555,7 +1570,7 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         return;
     }
 
-    const auto& cached = descriptor_state;
+    auto& cached = descriptor_state;
     const u64 command_buffer_tick = scheduler.CurrentTick();
     const u32 state_reason =
         static_cast<u32>(!cached.valid) | (static_cast<u32>(cached.pipeline != pipeline) << 1) |
@@ -1565,6 +1580,7 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
     const bool can_reuse = cached.valid && cached.pipeline == pipeline &&
                            cached.command_buffer_tick == command_buffer_tick &&
                            cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch();
+    bool can_update_cached = can_reuse && cached.writes.size() == set_writes.size();
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     if (telemetry_enabled && cached.valid && cached.pipeline != pipeline &&
         cached.command_buffer_tick == command_buffer_tick &&
@@ -1622,23 +1638,34 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
                     (old_write.key1 ^ DescriptorWriteKey1(write)) |
                     static_cast<u64>(old_write.is_buffer != is_buffer);
                 unchanged = metadata_difference == 0;
+                can_update_cached &= unchanged;
                 reason |= static_cast<u32>(metadata_difference != 0) << 6;
                 if (unchanged && is_buffer) {
                     const auto* lhs = cached.buffer_infos.data() + old_write.first_info;
                     unchanged =
                         DescriptorInfosEqual(lhs, write.pBufferInfo, write.descriptorCount);
                     reason |= static_cast<u32>(!unchanged) << 7;
+                    if (!unchanged && can_update_cached) {
+                        CopyDescriptorInfos(cached.buffer_infos.data() + old_write.first_info,
+                                            write.pBufferInfo, write.descriptorCount);
+                    }
                 } else if (unchanged) {
                     const auto* lhs = cached.image_infos.data() + old_write.first_info;
                     unchanged =
                         DescriptorInfosEqual(lhs, write.pImageInfo, write.descriptorCount);
                     reason |= static_cast<u32>(!unchanged) << 8;
+                    if (!unchanged && can_update_cached) {
+                        CopyDescriptorInfos(cached.image_infos.data() + old_write.first_info,
+                                            write.pImageInfo, write.descriptorCount);
+                    }
                 }
                 ++cached_write_index;
             } else if (is_cacheable) {
+                can_update_cached = false;
                 reason |= static_cast<u32>(can_reuse) << 5;
                 ++cached_write_index;
             } else {
+                can_update_cached = false;
                 reason |= 1u << 4;
             }
             if (!unchanged) {
@@ -1666,10 +1693,15 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
         pipeline->BindResources(partial_set_writes, buffer_barriers, push_data);
     }
     if (!can_reuse || !partial_set_writes.empty() || cached_write_index != cached.writes.size()) {
-        Common::PerformanceTelemetry::SampledDuration<
-            Common::PerformanceTelemetry::TimerSite::DescriptorCapture>
-            capture_duration{telemetry_enabled};
-        CaptureDescriptorState(pipeline);
+        if (can_update_cached) {
+            cached.command_buffer_tick = scheduler.CurrentTick();
+            cached.push_descriptor_epoch = scheduler.GraphicsPushDescriptorEpoch();
+        } else {
+            Common::PerformanceTelemetry::SampledDuration<
+                Common::PerformanceTelemetry::TimerSite::DescriptorCapture>
+                capture_duration{telemetry_enabled};
+            CaptureDescriptorState(pipeline);
+        }
     }
 }
 
