@@ -463,6 +463,10 @@ private:
         bool valid{};
     };
 
+    ImageId FindImageSlow(ImageDesc& desc, bool exact_fmt, const ExactImageCacheKey& exact_key,
+                          ExactImageCacheEntry& exact_entry, size_t cache_index,
+                          bool telemetry_enabled);
+
     static constexpr size_t ExactImageCacheSize = 256;
     static_assert(std::has_single_bit(ExactImageCacheSize));
 
@@ -509,6 +513,7 @@ private:
     u64 gc_tick = 0;
     std::atomic<u64> topology_epoch{1};
     std::array<ExactImageCacheEntry, ExactImageCacheSize> exact_image_cache{};
+    std::array<ExactImageCacheEntry, ExactImageCacheSize> exact_image_cache_victim{};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;

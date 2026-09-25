@@ -1901,6 +1901,16 @@ bool TextureCache::TryReuseImage(ImageId image_id, u64 image_uid, u64 expected_t
     return true;
 }
 
+[[nodiscard]] static bool IsPerfectImageMatch(const ImageInfo& cached, const ImageInfo& requested,
+                                              bool exact_fmt) {
+    return cached.guest_address == requested.guest_address &&
+           cached.guest_size == requested.guest_size && cached.size == requested.size &&
+           IsVulkanFormatCompatible(cached.pixel_format, requested.pixel_format) &&
+           (cached.type == requested.type || requested.size == Extent3D{1, 1, 1}) &&
+           (!exact_fmt || cached.pixel_format == requested.pixel_format) &&
+           !(cached.resources < requested.resources);
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     Common::PerformanceTelemetry::SampledDuration<
@@ -1935,16 +1945,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         value ^= value >> 32;
         return static_cast<size_t>(value) & (ExactImageCacheSize - 1);
     };
-    const auto is_perfect_match = [&](const ImageInfo& cached_info) {
-        return cached_info.guest_address == info.guest_address &&
-               cached_info.guest_size == info.guest_size && cached_info.size == info.size &&
-               IsVulkanFormatCompatible(cached_info.pixel_format, info.pixel_format) &&
-               (cached_info.type == info.type || info.size == Extent3D{1, 1, 1}) &&
-               (!exact_fmt || cached_info.pixel_format == info.pixel_format) &&
-               !(cached_info.resources < info.resources);
-    };
-
-    auto& exact_entry = exact_image_cache[hash_key()];
+    const size_t cache_index = hash_key();
+    auto& exact_entry = exact_image_cache[cache_index];
     const u64 current_topology_epoch = topology_epoch.load(std::memory_order_relaxed);
     if (exact_entry.valid &&
         std::memcmp(exact_entry.key.words.data(), exact_key.words.data(),
@@ -1954,7 +1956,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             auto& cached_image = slot_images[exact_entry.image_id];
             if (cached_image.image_uid == exact_entry.image_uid &&
                 True(cached_image.flags & ImageFlagBits::Registered) &&
-                is_perfect_match(cached_image.info)) {
+                IsPerfectImageMatch(cached_image.info, info, exact_fmt)) {
                 cached_image.tick_accessed_last = scheduler.CurrentTick();
                 TouchImage(cached_image);
                 if (telemetry_enabled) {
@@ -1965,6 +1967,37 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             }
         }
         exact_entry.valid = false;
+    }
+
+    return FindImageSlow(desc, exact_fmt, exact_key, exact_entry, cache_index, telemetry_enabled);
+}
+
+SHAD_NO_INLINE ImageId TextureCache::FindImageSlow(ImageDesc& desc, bool exact_fmt,
+                                                   const ExactImageCacheKey& exact_key,
+                                                   ExactImageCacheEntry& exact_entry,
+                                                   size_t cache_index,
+                                                   bool telemetry_enabled) {
+    const auto& info = desc.info;
+    auto& victim = exact_image_cache_victim[cache_index];
+    if (victim.valid &&
+        std::memcmp(victim.key.words.data(), exact_key.words.data(),
+                    sizeof(ExactImageCacheKey)) == 0 &&
+        victim.topology_epoch == topology_epoch.load(std::memory_order_relaxed)) {
+        if (victim.image_id && slot_images.is_allocated(victim.image_id)) {
+            auto& image = slot_images[victim.image_id];
+            if (image.image_uid == victim.image_uid &&
+                True(image.flags & ImageFlagBits::Registered) &&
+                IsPerfectImageMatch(image.info, info, exact_fmt)) {
+                image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(image);
+                if (telemetry_enabled) {
+                    Common::PerformanceTelemetry::RecordImageFindPathEnabled(
+                        Common::PerformanceTelemetry::ImageFindPath::ExactCache);
+                }
+                return victim.image_id;
+            }
+        }
+        victim.valid = false;
     }
 
     ImageIds image_ids;
@@ -2047,12 +2080,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
-    if (view_mip < 0 && view_slice < 0 && is_perfect_match(image.info)) {
+    if (view_mip < 0 && view_slice < 0 && IsPerfectImageMatch(image.info, info, exact_fmt)) {
+        const u64 current_epoch = topology_epoch.load(std::memory_order_relaxed);
+        if (exact_entry.valid && exact_entry.topology_epoch == current_epoch) {
+            victim = exact_entry;
+        }
         exact_entry = {
             .key = exact_key,
             .image_id = image_id,
             .image_uid = image.image_uid,
-            .topology_epoch = topology_epoch.load(std::memory_order_relaxed),
+            .topology_epoch = current_epoch,
             .valid = true,
         };
     }
