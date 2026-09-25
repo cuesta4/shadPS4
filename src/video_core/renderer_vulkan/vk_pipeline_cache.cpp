@@ -1607,13 +1607,14 @@ SHAD_NO_INLINE const GraphicsPipeline* PipelineCache::CreateGraphicsPipeline() {
 }
 
 bool PipelineCache::CanReuseGraphicsPipeline() const {
-    for (const auto* info : infos) {
+    for (u32 index = 0; index < MaxShaderStages; ++index) {
+        const auto* info = infos[index];
         if (!info) {
             continue;
         }
-        const auto program_it = program_cache.find(info->pgm_hash);
-        if (program_it == program_cache.end() || !program_it.value()->specialization_plan_ready ||
-            !program_it.value()->specialization_plan_cacheable) {
+        const auto* program = optimization->current_stages[index].program;
+        if (!program || &program->info != info || !program->specialization_plan_ready ||
+            !program->specialization_plan_cacheable) {
             return false;
         }
     }
