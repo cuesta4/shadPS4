@@ -261,6 +261,9 @@ private:
 
     void ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requests,
                                 std::span<StreamCopyResult> results);
+    void ExecuteStreamCopySingle(const StreamCopyRequest& request, StreamCopyResult& result,
+                                 bool telemetry_enabled, bool telemetry_staging_sampled,
+                                 bool defer_copies);
 
     struct StreamCopyScratch;
     struct StreamSliceReuseState;

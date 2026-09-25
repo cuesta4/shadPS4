@@ -425,6 +425,217 @@ const BufferCache::StreamCopyResult& BufferCache::GetStreamCopyResult(u16 index)
     return stream_copy_results[index];
 }
 
+SHAD_NO_INLINE void BufferCache::ExecuteStreamCopySingle(
+    const StreamCopyRequest& request, StreamCopyResult& result, bool telemetry_enabled,
+    bool telemetry_staging_sampled, bool defer_copies) {
+    auto& reuse = *stream_batch_reuse;
+    auto& copy_engine = GuestCopyEngine::Instance();
+    const auto telemetry_source = [](StreamCopySource source) noexcept {
+        return static_cast<Common::PerformanceTelemetry::StagingSource>(source);
+    };
+    StreamBatchReuseState::Entry* reuse_entry{};
+    bool captured{};
+    {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
+            reuse_duration{telemetry_enabled};
+        if (!defer_copies && request.deduplicate &&
+            request.source_type == StreamCopySource::Guest &&
+            request.size <= CACHING_PAGESIZE) {
+            size_t set_index{};
+            size_t way_index{};
+            auto* entry =
+                reuse.Find(request.guest_address, request.size, set_index, way_index);
+            if (entry != nullptr &&
+                entry->generation == transient_read_buffer.Generation() &&
+                entry->tick == scheduler.CurrentTick() &&
+                entry->offset % request.alignment == 0) {
+                reuse_entry = entry;
+                if (entry->cooldown != 0) {
+                    --entry->cooldown;
+                    if (telemetry_staging_sampled) {
+                        Common::PerformanceTelemetry::AddEnabled(
+                            Common::PerformanceTelemetry::Counter::
+                                StagingReuseCooldownSkips,
+                            1);
+                    }
+                } else {
+                    const Core::MemoryManager::SparseCopyRequest copy{
+                        .source = request.guest_address,
+                        .destination = reuse.capture.get(),
+                        .size = request.size,
+                    };
+                    {
+                        Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                            Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                        memory->CopySparseMemoryBatch(
+                            std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
+                            request.size, telemetry_enabled, telemetry_staging_sampled, false);
+                    }
+                    captured = true;
+                    if (!entry->shadow_valid) {
+                        entry->mismatch_streak = 0;
+                        if (telemetry_staging_sampled) {
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::StagingReuseWarmups,
+                                1);
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::
+                                    StagingReuseWarmupBytes,
+                                request.size);
+                        }
+                    } else {
+                        if (telemetry_staging_sampled) {
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::
+                                    StagingReuseCandidates,
+                                1);
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::
+                                    StagingReuseCandidateBytes,
+                                request.size);
+                        }
+                        if (std::memcmp(reuse.capture.get(),
+                                        reuse.Shadow(set_index, way_index),
+                                        request.size) == 0) {
+                            entry->mismatch_streak = 0;
+                            entry->cooldown = 0;
+                            result = {
+                                .buffer = &transient_read_buffer,
+                                .offset = entry->offset,
+                            };
+                            if (telemetry_enabled) {
+                                Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+                                    Common::PerformanceTelemetry::StagingSite::StreamSingle,
+                                    0);
+                                Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+                                    Common::PerformanceTelemetry::StagingSite::StreamSingle,
+                                    telemetry_source(request.source_type), request.size);
+                                Common::PerformanceTelemetry::RecordStagingBackendEnabled(
+                                    Common::PerformanceTelemetry::StagingBackend::HostDirect,
+                                    0);
+                                if (telemetry_staging_sampled) {
+                                    Common::PerformanceTelemetry::AddEnabled(
+                                        Common::PerformanceTelemetry::Counter::
+                                            StagingReuseHits,
+                                        1);
+                                    Common::PerformanceTelemetry::AddEnabled(
+                                        Common::PerformanceTelemetry::Counter::
+                                            StagingReuseAvoidedBytes,
+                                        request.size);
+                                }
+                            }
+                            return;
+                        }
+                        if (++entry->mismatch_streak >=
+                            StreamBatchReuseState::MismatchThreshold) {
+                            entry->mismatch_streak = 0;
+                            entry->cooldown = StreamBatchReuseState::CooldownLength;
+                        }
+                        if (telemetry_staging_sampled) {
+                            Common::PerformanceTelemetry::AddEnabled(
+                                Common::PerformanceTelemetry::Counter::
+                                    StagingReuseMismatches,
+                                1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const auto [destination, offset] =
+        transient_read_buffer.Map(request.size, request.alignment);
+    if (destination == nullptr) [[unlikely]] {
+        ValidateStreamCopyDestination(destination);
+    }
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
+            Common::PerformanceTelemetry::StagingSite::StreamSingle, request.size);
+        Common::PerformanceTelemetry::RecordStagingSourceEnabled(
+            Common::PerformanceTelemetry::StagingSite::StreamSingle,
+            telemetry_source(request.source_type), request.size);
+    }
+    switch (request.source_type) {
+    case StreamCopySource::Guest:
+        if (captured) {
+            std::memcpy(destination, reuse.capture.get(), request.size);
+        } else if (defer_copies) {
+            const GuestCopyEngine::Op op{
+                .source = request.guest_address,
+                .destination = destination,
+                .size = request.size,
+                .dst_buffer = GuestCopyEngine::BufferId(transient_read_buffer.Handle()),
+                .dst_offset = offset,
+            };
+            copy_engine.Enqueue(std::span{&op, 1});
+        } else {
+            const Core::MemoryManager::SparseCopyRequest copy{
+                .source = request.guest_address,
+                .destination = destination,
+                .size = request.size,
+            };
+            {
+                Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
+                    Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
+                memory->CopySparseMemoryBatch(
+                    std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
+                    request.size, telemetry_enabled, telemetry_staging_sampled);
+            }
+        }
+        break;
+    case StreamCopySource::Host:
+        std::memcpy(destination, request.host_address, request.size);
+        break;
+    case StreamCopySource::Zero:
+        if (defer_copies && request.size >= DeferredZeroFillThreshold) {
+            const GuestCopyEngine::Op op{
+                .destination = destination,
+                .size = request.size,
+                .kind = GuestCopyEngine::OpKind::Zero,
+            };
+            copy_engine.Enqueue(std::span{&op, 1});
+        } else {
+            std::memset(destination, 0, request.size);
+        }
+        break;
+    }
+    transient_read_buffer.Commit();
+    if (!defer_copies && request.deduplicate &&
+        request.source_type == StreamCopySource::Guest &&
+        request.size <= CACHING_PAGESIZE) {
+        if (reuse_entry == nullptr) {
+            reuse_entry = &reuse.Select(request.guest_address, request.size);
+            reuse_entry->mismatch_streak = 0;
+            reuse_entry->cooldown = 0;
+        }
+        const size_t set_index =
+            StreamBatchReuseState::SetIndex(request.guest_address, request.size);
+        const size_t way_index =
+            reuse_entry == &reuse.sets[set_index].ways[0] ? 0 : 1;
+        *reuse_entry = {
+            .address = request.guest_address,
+            .generation = transient_read_buffer.Generation(),
+            .tick = scheduler.CurrentTick(),
+            .size = static_cast<u32>(request.size),
+            .offset = static_cast<u32>(offset),
+            .mismatch_streak = reuse_entry->mismatch_streak,
+            .cooldown = reuse_entry->cooldown,
+            .shadow_valid = captured,
+            .valid = true,
+        };
+        if (captured) {
+            std::memcpy(reuse.Shadow(set_index, way_index), reuse.capture.get(),
+                        request.size);
+        }
+    }
+    result = {.buffer = &transient_read_buffer, .offset = offset};
+    if (telemetry_enabled) {
+        Common::PerformanceTelemetry::RecordStagingBackendEnabled(
+            Common::PerformanceTelemetry::StagingBackend::HostDirect, request.size);
+    }
+    return;
+}
+
 void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requests,
                                          std::span<StreamCopyResult> results) {
     if (requests.size() != results.size() || requests.size() > MaxStreamCopyRequests) [[unlikely]] {
@@ -436,12 +647,8 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
     const bool telemetry_enabled = Common::PerformanceTelemetry::Enabled();
     const bool telemetry_staging_sampled =
         telemetry_enabled && Common::PerformanceTelemetry::ShouldSampleStagingBatchEnabled();
-    const auto telemetry_source = [](StreamCopySource source) noexcept {
-        return static_cast<Common::PerformanceTelemetry::StagingSource>(source);
-    };
 
     auto& scratch = *stream_copy_scratch;
-    auto& reuse = *stream_batch_reuse;
     // Deferred copies make the content-based reuse below impossible: it compares the bytes being
     // uploaded now against a shadow. The copy engine moves the bytes instead of skipping them.
     auto& copy_engine = GuestCopyEngine::Instance();
@@ -453,6 +660,16 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         scratch.hash_generation = 1;
     }
 
+    if (requests.size() == 1) {
+        Common::PerformanceTelemetry::SampledDuration<
+            Common::PerformanceTelemetry::TimerSite::StagingStreamSingle>
+            duration{telemetry_enabled};
+        ExecuteStreamCopySingle(requests.front(), results.front(), telemetry_enabled,
+                                telemetry_staging_sampled, defer_copies);
+        return;
+    }
+
+    auto& reuse = *stream_batch_reuse;
     const auto source_key = [](const StreamCopyRequest& request) noexcept -> u64 {
         switch (request.source_type) {
         case StreamCopySource::Guest:
@@ -473,213 +690,6 @@ void BufferCache::ExecuteStreamCopyBatch(std::span<const StreamCopyRequest> requ
         return static_cast<size_t>(value) & (StreamCopyScratch::HashTableSize - 1);
     };
 
-    if (requests.size() == 1) {
-        Common::PerformanceTelemetry::SampledDuration<
-            Common::PerformanceTelemetry::TimerSite::StagingStreamSingle>
-            duration{telemetry_enabled};
-        const auto& request = requests.front();
-        StreamBatchReuseState::Entry* reuse_entry{};
-        bool captured{};
-        {
-            Common::PerformanceTelemetry::SampledDuration<
-                Common::PerformanceTelemetry::TimerSite::StagingStreamReuse>
-                reuse_duration{telemetry_enabled};
-            if (!defer_copies && request.deduplicate &&
-                request.source_type == StreamCopySource::Guest &&
-                request.size <= CACHING_PAGESIZE) {
-                size_t set_index{};
-                size_t way_index{};
-                auto* entry =
-                    reuse.Find(request.guest_address, request.size, set_index, way_index);
-                if (entry != nullptr &&
-                    entry->generation == transient_read_buffer.Generation() &&
-                    entry->tick == scheduler.CurrentTick() &&
-                    entry->offset % request.alignment == 0) {
-                    reuse_entry = entry;
-                    if (entry->cooldown != 0) {
-                        --entry->cooldown;
-                        if (telemetry_staging_sampled) {
-                            Common::PerformanceTelemetry::AddEnabled(
-                                Common::PerformanceTelemetry::Counter::
-                                    StagingReuseCooldownSkips,
-                                1);
-                        }
-                    } else {
-                        const Core::MemoryManager::SparseCopyRequest copy{
-                            .source = request.guest_address,
-                            .destination = reuse.capture.get(),
-                            .size = request.size,
-                        };
-                        {
-                            Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
-                                Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
-                            memory->CopySparseMemoryBatch(
-                                std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
-                                request.size, telemetry_enabled, telemetry_staging_sampled, false);
-                        }
-                        captured = true;
-                        if (!entry->shadow_valid) {
-                            entry->mismatch_streak = 0;
-                            if (telemetry_staging_sampled) {
-                                Common::PerformanceTelemetry::AddEnabled(
-                                    Common::PerformanceTelemetry::Counter::StagingReuseWarmups,
-                                    1);
-                                Common::PerformanceTelemetry::AddEnabled(
-                                    Common::PerformanceTelemetry::Counter::
-                                        StagingReuseWarmupBytes,
-                                    request.size);
-                            }
-                        } else {
-                            if (telemetry_staging_sampled) {
-                                Common::PerformanceTelemetry::AddEnabled(
-                                    Common::PerformanceTelemetry::Counter::
-                                        StagingReuseCandidates,
-                                    1);
-                                Common::PerformanceTelemetry::AddEnabled(
-                                    Common::PerformanceTelemetry::Counter::
-                                        StagingReuseCandidateBytes,
-                                    request.size);
-                            }
-                            if (std::memcmp(reuse.capture.get(),
-                                            reuse.Shadow(set_index, way_index),
-                                            request.size) == 0) {
-                                entry->mismatch_streak = 0;
-                                entry->cooldown = 0;
-                                results.front() = {
-                                    .buffer = &transient_read_buffer,
-                                    .offset = entry->offset,
-                                };
-                                if (telemetry_enabled) {
-                                    Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
-                                        Common::PerformanceTelemetry::StagingSite::StreamSingle,
-                                        0);
-                                    Common::PerformanceTelemetry::RecordStagingSourceEnabled(
-                                        Common::PerformanceTelemetry::StagingSite::StreamSingle,
-                                        telemetry_source(request.source_type), request.size);
-                                    Common::PerformanceTelemetry::RecordStagingBackendEnabled(
-                                        Common::PerformanceTelemetry::StagingBackend::HostDirect,
-                                        0);
-                                    if (telemetry_staging_sampled) {
-                                        Common::PerformanceTelemetry::AddEnabled(
-                                            Common::PerformanceTelemetry::Counter::
-                                                StagingReuseHits,
-                                            1);
-                                        Common::PerformanceTelemetry::AddEnabled(
-                                            Common::PerformanceTelemetry::Counter::
-                                                StagingReuseAvoidedBytes,
-                                            request.size);
-                                    }
-                                }
-                                return;
-                            }
-                            if (++entry->mismatch_streak >=
-                                StreamBatchReuseState::MismatchThreshold) {
-                                entry->mismatch_streak = 0;
-                                entry->cooldown = StreamBatchReuseState::CooldownLength;
-                            }
-                            if (telemetry_staging_sampled) {
-                                Common::PerformanceTelemetry::AddEnabled(
-                                    Common::PerformanceTelemetry::Counter::
-                                        StagingReuseMismatches,
-                                    1);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        const auto [destination, offset] =
-            transient_read_buffer.Map(request.size, request.alignment);
-        if (destination == nullptr) [[unlikely]] {
-            ValidateStreamCopyDestination(destination);
-        }
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::RecordStagingAllocationEnabled(
-                Common::PerformanceTelemetry::StagingSite::StreamSingle, request.size);
-            Common::PerformanceTelemetry::RecordStagingSourceEnabled(
-                Common::PerformanceTelemetry::StagingSite::StreamSingle,
-                telemetry_source(request.source_type), request.size);
-        }
-        switch (request.source_type) {
-        case StreamCopySource::Guest:
-            if (captured) {
-                std::memcpy(destination, reuse.capture.get(), request.size);
-            } else if (defer_copies) {
-                const GuestCopyEngine::Op op{
-                    .source = request.guest_address,
-                    .destination = destination,
-                    .size = request.size,
-                    .dst_buffer = GuestCopyEngine::BufferId(transient_read_buffer.Handle()),
-                    .dst_offset = offset,
-                };
-                copy_engine.Enqueue(std::span{&op, 1});
-            } else {
-                const Core::MemoryManager::SparseCopyRequest copy{
-                    .source = request.guest_address,
-                    .destination = destination,
-                    .size = request.size,
-                };
-                {
-                    Common::PerformanceTelemetry::ScopedSemanticReadOrigin upload_origin{
-                        Common::PerformanceTelemetry::SemanticReadOrigin::GpuUploadFromGuestRam};
-                    memory->CopySparseMemoryBatch(
-                        std::span<const Core::MemoryManager::SparseCopyRequest>{&copy, 1},
-                        request.size, telemetry_enabled, telemetry_staging_sampled);
-                }
-            }
-            break;
-        case StreamCopySource::Host:
-            std::memcpy(destination, request.host_address, request.size);
-            break;
-        case StreamCopySource::Zero:
-            if (defer_copies && request.size >= DeferredZeroFillThreshold) {
-                const GuestCopyEngine::Op op{
-                    .destination = destination,
-                    .size = request.size,
-                    .kind = GuestCopyEngine::OpKind::Zero,
-                };
-                copy_engine.Enqueue(std::span{&op, 1});
-            } else {
-                std::memset(destination, 0, request.size);
-            }
-            break;
-        }
-        transient_read_buffer.Commit();
-        if (!defer_copies && request.deduplicate &&
-            request.source_type == StreamCopySource::Guest &&
-            request.size <= CACHING_PAGESIZE) {
-            if (reuse_entry == nullptr) {
-                reuse_entry = &reuse.Select(request.guest_address, request.size);
-                reuse_entry->mismatch_streak = 0;
-                reuse_entry->cooldown = 0;
-            }
-            const size_t set_index =
-                StreamBatchReuseState::SetIndex(request.guest_address, request.size);
-            const size_t way_index =
-                reuse_entry == &reuse.sets[set_index].ways[0] ? 0 : 1;
-            *reuse_entry = {
-                .address = request.guest_address,
-                .generation = transient_read_buffer.Generation(),
-                .tick = scheduler.CurrentTick(),
-                .size = static_cast<u32>(request.size),
-                .offset = static_cast<u32>(offset),
-                .mismatch_streak = reuse_entry->mismatch_streak,
-                .cooldown = reuse_entry->cooldown,
-                .shadow_valid = captured,
-                .valid = true,
-            };
-            if (captured) {
-                std::memcpy(reuse.Shadow(set_index, way_index), reuse.capture.get(),
-                            request.size);
-            }
-        }
-        results.front() = {.buffer = &transient_read_buffer, .offset = offset};
-        if (telemetry_enabled) {
-            Common::PerformanceTelemetry::RecordStagingBackendEnabled(
-                Common::PerformanceTelemetry::StagingBackend::HostDirect, request.size);
-        }
-        return;
-    }
     Common::PerformanceTelemetry::SampledDuration<
         Common::PerformanceTelemetry::TimerSite::StagingStreamBatch>
         batch_duration{telemetry_enabled};
