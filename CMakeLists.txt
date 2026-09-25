@@ -1127,8 +1127,15 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_record_audit.cpp
+               src/video_core/renderer_vulkan/vk_record_audit.h
+               src/video_core/renderer_vulkan/vk_record_selftest.cpp
+               src/video_core/renderer_vulkan/vk_record_selftest.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
+               src/video_core/renderer_vulkan/vk_command_chunk.h
+               src/video_core/renderer_vulkan/vk_command_recorder.cpp
+               src/video_core/renderer_vulkan/vk_command_recorder.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
                src/video_core/renderer_vulkan/vk_shader_hle.cpp

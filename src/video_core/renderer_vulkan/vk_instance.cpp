@@ -96,9 +96,16 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
-    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
-                              enable_crash_diagnostic)},
+    : Instance(window.GetWindowInfo().type, physical_device_index, enable_validation,
+               enable_crash_diagnostic) {
+    shutdown_overlay = true;
+}
+
+Instance::Instance(Frontend::WindowSystemType window_type, s32 physical_device_index,
+                   bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
+    : instance{CreateInstance(window_type, enable_validation, enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)} {
+    shutdown_overlay = false;
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
@@ -171,7 +178,9 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
-    ImGui::Core::Shutdown(GetDevice());
+    if (shutdown_overlay) {
+        ImGui::Core::Shutdown(GetDevice());
+    }
     vmaDestroyAllocator(allocator);
 }
 

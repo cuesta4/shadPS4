@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -19,8 +20,9 @@ public:
 
     void Create(vk::Device device, VmaAllocator allocator, u32 num_images);
 
-    vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
-                         vk::Extent2D output_size, Settings settings, bool hdr);
+    vk::ImageView Render(const CommandRecorder& cmdbuf, vk::ImageView input,
+                         vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
+                         bool hdr);
 
 private:
     struct Img {

@@ -47,6 +47,8 @@ GROUPS = [
     ("GPU authority", ["authority_materializations", "authority_materialize_ns",
                        "authority_retirements", "authority_retired_bytes", "authority_live_max",
                        "pending_op_poll_skips"]),
+    ("Recording thread", ["vk_record_commands", "vk_record_chunks", "vk_record_worker_ns",
+                          "vk_record_producer_wait_ns", "vk_record_queue_depth_max"]),
     ("Resource churn", ["texture_uploads", "texture_upload_bytes", "texture_upload_ns",
                         "texture_hash_bytes", "texture_hash_ns", "buffer_creates",
                         "buffer_create_ns", "staging_bytes", "pipeline_misses",

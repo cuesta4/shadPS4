@@ -767,6 +767,10 @@ u64 Rasterizer::KnownGpuTick() const noexcept {
     return scheduler.KnownGpuTick();
 }
 
+bool Rasterizer::IsGpuThread() const noexcept {
+    return liverpool->IsGpuThread();
+}
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
@@ -1338,7 +1342,7 @@ SHAD_NO_INLINE void Rasterizer::SynchronizeDmaBuffers() {
 SHAD_NO_INLINE void Rasterizer::CaptureDescriptorState(const Pipeline* pipeline) {
     auto& state = descriptor_state;
     state.pipeline = pipeline;
-    state.command_buffer = scheduler.CommandBuffer();
+    state.command_buffer_tick = scheduler.CurrentTick();
     state.push_descriptor_epoch = scheduler.GraphicsPushDescriptorEpoch();
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     state.layout_signature = pipeline->DescriptorLayoutSignature();
@@ -1552,19 +1556,18 @@ void Rasterizer::BindPipelineResources(const Pipeline* pipeline) {
     }
 
     const auto& cached = descriptor_state;
+    const u64 command_buffer_tick = scheduler.CurrentTick();
     const u32 state_reason =
-        static_cast<u32>(!cached.valid) |
-        (static_cast<u32>(cached.pipeline != pipeline) << 1) |
-        (static_cast<u32>(cached.command_buffer != scheduler.CommandBuffer()) << 2) |
-        (static_cast<u32>(cached.push_descriptor_epoch !=
-                          scheduler.GraphicsPushDescriptorEpoch())
+        static_cast<u32>(!cached.valid) | (static_cast<u32>(cached.pipeline != pipeline) << 1) |
+        (static_cast<u32>(cached.command_buffer_tick != command_buffer_tick) << 2) |
+        (static_cast<u32>(cached.push_descriptor_epoch != scheduler.GraphicsPushDescriptorEpoch())
          << 3);
     const bool can_reuse = cached.valid && cached.pipeline == pipeline &&
-                           cached.command_buffer == scheduler.CommandBuffer() &&
+                           cached.command_buffer_tick == command_buffer_tick &&
                            cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch();
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     if (telemetry_enabled && cached.valid && cached.pipeline != pipeline &&
-        cached.command_buffer == scheduler.CommandBuffer() &&
+        cached.command_buffer_tick == command_buffer_tick &&
         cached.push_descriptor_epoch == scheduler.GraphicsPushDescriptorEpoch() &&
         Common::PerformanceTelemetry::ShouldSampleDescriptorCrossPipelineEnabled()) {
         const bool exact_state = [&] {
@@ -2870,7 +2873,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             Common::PerformanceTelemetry::Counter::DynamicStateEmptyCommits);
         return;
     }
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler);
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

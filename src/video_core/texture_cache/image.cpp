@@ -340,7 +340,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 }
 
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
+                    std::optional<SubresourceRange> range) {
     // Adjust pipeline stage
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
@@ -353,13 +353,10 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
         return;
     }
 
-    if (!cmdbuf) {
-        // When using external cmdbuf you are responsible for ending rp.
-        scheduler->EndRendering(
-            Common::PerformanceTelemetry::ScopeBreakReason::RequiredLayoutTransition,
-            Common::PerformanceTelemetry::Avoidability::ProvenRequired);
-        cmdbuf = scheduler->CommandBuffer();
-    }
+    scheduler->EndRendering(
+        Common::PerformanceTelemetry::ScopeBreakReason::RequiredLayoutTransition,
+        Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const auto cmdbuf = scheduler->CommandBuffer();
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls,
                                       barriers.size());
     if (True(flags & ImageFlagBits::GpuModified) || usage.render_target || usage.depth_target) {

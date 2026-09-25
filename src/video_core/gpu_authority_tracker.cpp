@@ -592,8 +592,8 @@ void GpuAuthorityTracker::SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_t
 }
 
 void GpuAuthorityTracker::EnsureVirtualFenceComplete(
-    u64 virtual_fence_seq,
-    Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason) {
+    u64 virtual_fence_seq, Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason,
+    VAddr dying_addr, u64 dying_size) {
     if (!IsGow3FastpathActive()) {
         return;
     }
@@ -615,6 +615,16 @@ void GpuAuthorityTracker::EnsureVirtualFenceComplete(
     u8 waited = 0;
     if (rasterizer) {
         const u64 current_tick = rasterizer->CurrentTick();
+        if (fence->producer_tick >= current_tick && !rasterizer->IsGpuThread()) {
+            // Ending the command buffer from here would race with the command processor, and
+            // waiting for it to do so could deadlock: unmaps hold the page manager lock.
+            if (fence->label_addr >= dying_addr && fence->label_addr - dying_addr < dying_size) {
+                std::scoped_lock lock{tracker_mutex};
+                fence->gpu_complete = true;
+                RetireVirtualFenceLocked(fence);
+            }
+            return;
+        }
         if (fence->producer_tick >= current_tick) {
             rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
             was_submitted = 1;
@@ -645,7 +655,8 @@ void GpuAuthorityTracker::EnsureVirtualFenceComplete(
 }
 
 void GpuAuthorityTracker::EnsureAllVirtualFencesComplete(
-    Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason) {
+    Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason, VAddr dying_addr,
+    u64 dying_size) {
     if (!IsGow3FastpathActive()) {
         return;
     }
@@ -659,7 +670,7 @@ void GpuAuthorityTracker::EnsureAllVirtualFencesComplete(
         }
     }
     for (u64 seq : pending_seqs) {
-        EnsureVirtualFenceComplete(seq, reason);
+        EnsureVirtualFenceComplete(seq, reason, dying_addr, dying_size);
     }
 }
 
@@ -1053,7 +1064,8 @@ void GpuAuthorityTracker::HandleUnmap(VAddr addr, size_t size) {
     if (!IsGow3FastpathActive()) {
         return;
     }
-    EnsureAllVirtualFencesComplete(Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason::Unmap);
+    EnsureAllVirtualFencesComplete(
+        Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason::Unmap, addr, size);
     const auto overlaps = FindOverlaps(addr, size > 0 ? size : 4);
     for (const auto& entry : overlaps) {
         std::unique_lock entry_lk{*entry->entry_mutex};

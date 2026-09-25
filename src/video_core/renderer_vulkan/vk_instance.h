@@ -25,6 +25,10 @@ public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
+    /// Creates the device without a window, for self-tests. The overlay renderer is never set
+    /// up on such an instance.
+    explicit Instance(Frontend::WindowSystemType window_type, s32 physical_device_index,
+                      bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
 
     /// Returns a formatted string for the driver version
@@ -521,6 +525,7 @@ private:
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    bool shutdown_overlay{true};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;

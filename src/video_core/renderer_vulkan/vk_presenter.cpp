@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -101,6 +102,17 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
 [[nodiscard]] vk::ImageBlit MakeImageBlitStretch(s32 frame_width, s32 frame_height,
                                                  s32 swapchain_width, s32 swapchain_height) {
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
+}
+
+/// SHADPS4_VK_RECORD_THREAD=0 makes the command processor record its Vulkan commands itself
+/// again instead of handing them to the recording thread.
+static bool DrawRecordingThreadEnabled() {
+    const char* env = std::getenv("SHADPS4_VK_RECORD_THREAD");
+    if (env != nullptr && env[0] == '0') {
+        LOG_INFO(Render_Vulkan, "Vulkan recording thread disabled by SHADPS4_VK_RECORD_THREAD");
+        return false;
+    }
+    return true;
 }
 
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
@@ -267,7 +279,7 @@ static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
     return lut;
 }
 
-static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
+static void CopyImageToReadback(const CommandRecorder& cmdbuf, const vk::Image image,
                                 const vk::ImageLayout layout, ScreenshotReadback& readback) {
     const vk::BufferImageCopy copy_region = {
         .bufferOffset = 0,
@@ -499,7 +511,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance, true}, present_scheduler{instance}, swapchain{instance, window},
+      draw_scheduler{instance, true, DrawRecordingThreadEnabled()}, present_scheduler{instance},
+      swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
@@ -546,8 +559,8 @@ Presenter::~Presenter() {
 
     draw_scheduler.Finish();
     present_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
+    draw_scheduler.ResetCommandBuffer();
+    present_scheduler.ResetCommandBuffer();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -892,15 +905,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         auto& readback = pending_screenshots.back();
 
         // Capture the guest output before any host-side scaling (FSR/PP) is applied.
-        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
-                      cmdbuf);
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
         CopyImageToReadback(cmdbuf, image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                             readback);
     }
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
-    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
-                  cmdbuf);
+    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
@@ -1053,6 +1064,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    // Presentation records on this thread; the overlay renderer needs the command buffer itself.
+    const vk::CommandBuffer raw_cmdbuf = scheduler.RawCommandBuffer();
     const u64 gpu_interval = scheduler.BeginGpuInterval(
         Common::PerformanceTelemetry::GpuIntervalKind::Present, frame->id,
         static_cast<u64>(swapchain.GetExtent().width) * swapchain.GetExtent().height * 4);
@@ -1070,7 +1083,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
 
     {
         auto* profiler_ctx = instance.GetProfilerContext();
-        TracyVkNamedZoneC(profiler_ctx, renderer_gpu_zone, cmdbuf, "Host frame",
+        TracyVkNamedZoneC(profiler_ctx, renderer_gpu_zone, raw_cmdbuf, "Host frame",
                           MarkersPalette::GpuMarkerColor, profiler_ctx != nullptr);
 
         const vk::Extent2D extent = swapchain.GetExtent();
@@ -1171,7 +1184,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
         }
-        ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        ImGui::Core::Render(raw_cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
         if (capture_with_overlays_count > 0) {
             pending_screenshots.emplace_back(
@@ -1235,7 +1248,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, const u64 presentat
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
 
         if (profiler_ctx) {
-            TracyVkCollect(profiler_ctx, cmdbuf);
+            TracyVkCollect(profiler_ctx, raw_cmdbuf);
         }
     }
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {

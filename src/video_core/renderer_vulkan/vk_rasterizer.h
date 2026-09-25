@@ -99,6 +99,8 @@ public:
     void FullGpuBarrier();
     [[nodiscard]] u64 CurrentTick() const noexcept;
     [[nodiscard]] u64 KnownGpuTick() const noexcept;
+    /// Returns true on the command processor thread, the only one that records GPU work.
+    [[nodiscard]] bool IsGpuThread() const noexcept;
     u64 Flush(Common::PerformanceTelemetry::SubmitReason reason =
                   Common::PerformanceTelemetry::SubmitReason::Generic);
     void Finish();
@@ -284,7 +286,8 @@ private:
 
     struct DescriptorState {
         const Pipeline* pipeline{};
-        vk::CommandBuffer command_buffer{};
+        /// Tick of the command buffer the pushed descriptors belong to.
+        u64 command_buffer_tick{};
         u64 push_descriptor_epoch{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
         u64 layout_signature{};

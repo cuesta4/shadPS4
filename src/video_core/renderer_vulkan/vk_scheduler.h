@@ -4,12 +4,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <queue>
 
 #include "common/assert.h"
@@ -18,7 +21,10 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_command_chunk.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_record_audit.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 namespace tracy {
@@ -29,6 +35,7 @@ namespace Vulkan {
 
 class Instance;
 class GpuProfiler;
+class Scheduler;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -193,8 +200,8 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// Records the dirty dynamic state into the current command buffer of the scheduler.
+    void Commit(const Instance& instance, Scheduler& scheduler);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -403,7 +410,11 @@ struct DynamicState {
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance, bool async_submit = false);
+    /// With threaded_recording, commands recorded through this scheduler reach the driver on a
+    /// dedicated recording thread, which also begins, ends and hands off the command buffers.
+    /// The thread that records (the command processor) never touches a Vulkan command buffer.
+    explicit Scheduler(const Instance& instance, bool async_submit = false,
+                       bool threaded_recording = false);
     ~Scheduler();
 
     /// Makes every submission wait for the guest copies enqueued before it. Staging memory
@@ -428,6 +439,12 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason =
                             Common::PerformanceTelemetry::HostWaitReason::Unknown);
+
+    /// Waits until the command buffer of the given tick has been handed to the driver.
+    void WaitSubmitted(u64 tick) const;
+
+    /// Discards the commands of the current command buffer. Shutdown only, after Finish.
+    void ResetCommandBuffer();
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     /// Runs the deferred operations the GPU has caught up with. Draws call this constantly, so
@@ -460,9 +477,57 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Returns the recorder of the current command buffer.
+    [[nodiscard]] CommandRecorder CommandBuffer() noexcept {
+        return CommandRecorder{*this};
+    }
+
+    /// Returns the Vulkan command buffer being recorded, for code that has to call the driver
+    /// directly. Invalid with a recording thread, which owns the command buffer.
+    [[nodiscard]] vk::CommandBuffer RawCommandBuffer() const {
+        ASSERT_MSG(!threaded_recording, "The recording thread owns the command buffer");
         return current_cmdbuf;
+    }
+
+    /// Returns true when recorded commands reach the driver on the recording thread.
+    [[nodiscard]] bool HasRecordingThread() const noexcept {
+        return threaded_recording;
+    }
+
+    /// Records func(vk::CommandBuffer) into the current command buffer. Without a recording
+    /// thread it runs right away. With one it runs later on that thread, so it must hold
+    /// everything it reads by value.
+    template <typename Func>
+    void Record(Func&& func) {
+        if (!threaded_recording) {
+            func(current_cmdbuf);
+            return;
+        }
+        if (RecordAudit::watch_producers.load(std::memory_order_relaxed)) [[unlikely]] {
+            RecordAudit::NoteProducer();
+        }
+        if (!chunk->Record(func)) [[unlikely]] {
+            DispatchWork();
+            const bool recorded = chunk->Record(func);
+            ASSERT(recorded);
+        }
+    }
+
+    /// Records func(vk::CommandBuffer, const std::byte* payload) together with size bytes of
+    /// payload, and returns the payload for the caller to fill before recording anything else.
+    /// Only valid with a recording thread.
+    template <typename Func>
+    [[nodiscard]] std::byte* RecordWithPayload(size_t size, Func&& func) {
+        if (RecordAudit::watch_producers.load(std::memory_order_relaxed)) [[unlikely]] {
+            RecordAudit::NoteProducer();
+        }
+        std::byte* payload = chunk->RecordWithPayload(size, func);
+        if (payload == nullptr) [[unlikely]] {
+            DispatchWork();
+            payload = chunk->RecordWithPayload(size, func);
+            ASSERT(payload != nullptr);
+        }
+        return payload;
     }
 
     /// Returns the current command buffer tick.
@@ -493,13 +558,11 @@ public:
         ASSERT(size <= PushConstantCache::Capacity);
         auto& cache = push_constant_caches[is_compute ? 1U : 0U];
         const u64 tick = CurrentTick();
-        if (cache.valid && cache.command_buffer == current_cmdbuf && cache.layout == layout &&
-            cache.tick == tick && cache.size == size &&
+        if (cache.valid && cache.layout == layout && cache.tick == tick && cache.size == size &&
             std::memcmp(cache.bytes.data(), data, size) == 0) {
             return false;
         }
         cache.valid = true;
-        cache.command_buffer = current_cmdbuf;
         cache.layout = layout;
         cache.tick = tick;
         cache.size = size;
@@ -511,13 +574,14 @@ public:
     /// current guest command buffer.
     void BindGraphicsPipeline(vk::Pipeline pipeline) {
         const u64 tick = CurrentTick();
-        if (graphics_pipeline_valid && graphics_pipeline_command_buffer == current_cmdbuf &&
-            graphics_pipeline_tick == tick && graphics_pipeline == pipeline) {
+        if (graphics_pipeline_valid && graphics_pipeline_tick == tick &&
+            graphics_pipeline == pipeline) {
             return;
         }
-        current_cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        Record([pipeline](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        });
         graphics_pipeline_valid = true;
-        graphics_pipeline_command_buffer = current_cmdbuf;
         graphics_pipeline_tick = tick;
         graphics_pipeline = pipeline;
     }
@@ -559,20 +623,55 @@ public:
     }
 
 private:
+    struct SubmitJob {
+        SubmitInfo info{};
+        vk::CommandBuffer cmdbuf{};
+        u64 guest_copy_seq{};
+        u64 signal_tick{};
+        Common::PerformanceTelemetry::SubmitReason reason{};
+        /// Hands pending ImGui texture uploads to the queue right before this job.
+        bool texture_uploads{};
+    };
+
+    /// Command buffer end requested by the command processor, carried with the last chunk.
+    struct SubmitRequest {
+        SubmitInfo info{};
+        u64 signal_tick{};
+        u64 guest_copy_seq{};
+        Common::PerformanceTelemetry::SubmitReason reason{};
+    };
+
+    struct RecordWork {
+        std::unique_ptr<CommandChunk> chunk;
+        bool submit{};
+        SubmitRequest request{};
+    };
+
     void AllocateWorkerCommandBuffers();
 
     void SubmitExecution(SubmitInfo& info, Common::PerformanceTelemetry::SubmitReason reason);
+    void SubmitRecordedExecution(SubmitInfo& info,
+                                 Common::PerformanceTelemetry::SubmitReason reason);
 
     void SubmitThread(std::stop_token stoken);
-    void WaitSubmitted(u64 tick) const;
+    void SubmitJobNow(SubmitJob& job);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    /// Hands the filled chunk to the recording thread.
+    void DispatchWork();
+    void PushWork(RecordWork&& work);
+    [[nodiscard]] std::unique_ptr<CommandChunk> TakeChunk();
+    /// Waits until the recording thread has replayed every dispatched chunk.
+    void WaitRecordIdle();
+    void RecordThread(std::stop_token stoken);
+    void ExecuteWork(RecordWork& work);
+    void SubmitRecorded(const SubmitRequest& request);
 
 private:
     struct PushConstantCache {
         static constexpr size_t Capacity = 128;
         std::array<std::byte, Capacity> bytes{};
-        vk::CommandBuffer command_buffer{};
         vk::PipelineLayout layout{};
         u64 tick{};
         size_t size{};
@@ -581,6 +680,7 @@ private:
 
     const Instance& instance;
     const bool async_submit;
+    bool threaded_recording{};
     bool gate_guest_copies{};
     MasterSemaphore master_semaphore;
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -595,7 +695,6 @@ private:
     u64 current_pipeline_hash{};
     u64 graphics_push_descriptor_epoch{};
     std::array<PushConstantCache, 2> push_constant_caches{};
-    vk::CommandBuffer graphics_pipeline_command_buffer{};
     vk::Pipeline graphics_pipeline{};
     u64 graphics_pipeline_tick{};
     bool graphics_pipeline_valid{};
@@ -617,16 +716,26 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
-    struct SubmitJob {
-        SubmitInfo info{};
-        vk::CommandBuffer cmdbuf{};
-        u64 guest_copy_seq{};
-        u64 signal_tick{};
-        Common::PerformanceTelemetry::SubmitReason reason{};
-    };
     Common::SPSCQueue<SubmitJob, 8> submit_queue;
     std::atomic<u64> submitted_tick{0};
     std::jthread submit_thread;
+
+    /// Chunk being filled by the command processor.
+    std::unique_ptr<CommandChunk> chunk;
+    std::mutex work_mutex;
+    /// Command processor to recording thread.
+    std::condition_variable_any work_cv;
+    /// Recording thread to command processor.
+    std::condition_variable_any work_done_cv;
+    std::deque<RecordWork> work_queue;
+    u64 dispatched_work{};
+    u64 executed_work{};
+    std::mutex reserve_mutex;
+    std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;
+    /// Command buffer and tick owned by the recording thread.
+    vk::CommandBuffer record_cmdbuf{};
+    u64 record_tick{};
+    std::jthread record_thread;
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};

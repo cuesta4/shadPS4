@@ -2835,8 +2835,11 @@ void TextureCache::GarbageCollectSamplers() {
             return true;
         }
         --num_deletions;
-        const size_t lru_id = samplers.at(hash).lru_id;
-        samplers.erase(hash);
+        const auto it = samplers.find(hash);
+        const size_t lru_id = it->second.lru_id;
+        // Commands recorded this tick may still reference the sampler.
+        scheduler.DeferOperation([sampler = std::move(it.value())]() mutable {});
+        samplers.erase(it);
         sampler_lru_cache.Free(lru_id);
         return false;
     };
@@ -2888,8 +2891,11 @@ void TextureCache::DeleteImage(ImageId image_id) {
         const bool owns_authority =
             (state.writer == image_id && state.writer_uid == image.image_uid) ||
             (state.backing == image_id && state.backing_uid == image.image_uid);
+        // Only the command processor records GPU work. Other threads delete images when guest
+        // memory is unmapped, where the contents the copies would preserve go away anyway.
+        const bool can_record = liverpool->IsGpuThread();
         if (owns_authority) {
-            state_valid = CommitAliasWriter(state);
+            state_valid = can_record && CommitAliasWriter(state);
         }
         if (!state_valid) {
             state.ResetAuthority();

@@ -646,6 +646,11 @@ constexpr std::array FrameCounters{
     Counter::AuthorityRetirements,
     Counter::AuthorityRetiredBytes,
     Counter::AuthorityLiveMax,
+    Counter::VkRecordCommands,
+    Counter::VkRecordChunks,
+    Counter::VkRecordWorkerNs,
+    Counter::VkRecordProducerWaitNs,
+    Counter::VkRecordQueueDepthMax,
     Counter::TextureUploads,
     Counter::TextureUploadBytes,
     Counter::TextureUploadNs,
@@ -1078,6 +1083,11 @@ constexpr std::array CounterNames{
     "authority_retirements",
     "authority_retired_bytes",
     "authority_live_max",
+    "vk_record_commands",
+    "vk_record_chunks",
+    "vk_record_worker_ns",
+    "vk_record_producer_wait_ns",
+    "vk_record_queue_depth_max",
     "texture_uploads",
     "texture_upload_bytes",
     "texture_upload_ns",
@@ -2412,7 +2422,8 @@ void WriteEvent(ThreadRing& ring, EventType type, u64 arg0, u64 arg1) noexcept {
 [[nodiscard]] bool IsMaxCounter(Counter counter) noexcept {
     return counter == Counter::IbDepthMax || counter == Counter::SubmitQueueDepthMax ||
            counter == Counter::ShaderModuleQueueDepthMax ||
-           counter == Counter::GuestCopyQueueDepthMax || counter == Counter::AuthorityLiveMax;
+           counter == Counter::GuestCopyQueueDepthMax || counter == Counter::AuthorityLiveMax ||
+           counter == Counter::VkRecordQueueDepthMax;
 }
 
 [[nodiscard]] std::string CsvSafe(std::string value) {

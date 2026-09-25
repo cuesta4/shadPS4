@@ -13,13 +13,13 @@ namespace Vulkan {
 ResourcePool::ResourcePool(MasterSemaphore* master_semaphore_, std::size_t grow_step_)
     : master_semaphore{master_semaphore_}, grow_step{grow_step_} {}
 
-std::size_t ResourcePool::CommitResource() {
+std::size_t ResourcePool::CommitResource(u64 tick) {
     u64 gpu_tick = master_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
-                                         std::size_t end) -> std::optional<std::size_t> {
+    const auto search = [this, &gpu_tick, tick](std::size_t begin,
+                                                std::size_t end) -> std::optional<std::size_t> {
         for (std::size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {
-                ticks[iterator] = master_semaphore->CurrentTick();
+                ticks[iterator] = tick;
                 return iterator;
             }
         }
@@ -41,7 +41,7 @@ std::size_t ResourcePool::CommitResource() {
             // Both searches failed, the pool is full; handle it.
             const std::size_t free_resource = ManageOverflow();
 
-            ticks[free_resource] = master_semaphore->CurrentTick();
+            ticks[free_resource] = tick;
             found = free_resource;
         }
     }
@@ -96,8 +96,8 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
     }
 }
 
-vk::CommandBuffer CommandPool::Commit() {
-    const std::size_t index = CommitResource();
+vk::CommandBuffer CommandPool::Commit(u64 tick) {
+    const std::size_t index = CommitResource(tick);
     return cmd_buffers[index];
 }
 

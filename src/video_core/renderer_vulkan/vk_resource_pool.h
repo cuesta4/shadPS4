@@ -33,7 +33,8 @@ public:
     ResourcePool(const ResourcePool&) = default;
 
 protected:
-    std::size_t CommitResource();
+    /// Returns a resource the GPU is done with and marks it busy until tick completes.
+    std::size_t CommitResource(u64 tick);
 
     /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(std::size_t begin, std::size_t end) = 0;
@@ -56,7 +57,8 @@ public:
 
     void Allocate(std::size_t begin, std::size_t end) override;
 
-    vk::CommandBuffer Commit();
+    /// Returns a command buffer for the command buffer submitted as tick.
+    vk::CommandBuffer Commit(u64 tick);
 
 private:
     const Instance& instance;

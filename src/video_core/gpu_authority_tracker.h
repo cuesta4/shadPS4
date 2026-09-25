@@ -202,11 +202,17 @@ public:
 
     void SignalAsyncLabel(u64 virtual_fence_seq, u64 producer_tick);
 
+    /// Completes a virtual fence now. Only the command processor can submit the fence's
+    /// command buffer; on other threads a fence that was not submitted yet is left to complete
+    /// on its own, or cancelled when its label lies in [dying_addr, dying_addr + dying_size),
+    /// memory about to be unmapped that nobody can read the label from anymore.
     void EnsureVirtualFenceComplete(
         u64 virtual_fence_seq,
-        Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason);
+        Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason,
+        VAddr dying_addr = 0, u64 dying_size = 0);
     void EnsureAllVirtualFencesComplete(
-        Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason);
+        Common::PerformanceTelemetry::VirtualFenceForcedCompletionReason reason,
+        VAddr dying_addr = 0, u64 dying_size = 0);
 
     /// Makes guest RAM current for a read of [addr, addr + size), materializing GPU
     /// authoritative ranges. With keep_gpu_servable, authorities whose shadow a GPU consumer can
