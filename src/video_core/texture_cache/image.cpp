@@ -4,6 +4,7 @@
 #include <ranges>
 #include "common/assert.h"
 #include "common/performance_telemetry.h"
+#include "video_core/flush_epoch.h"
 #include "video_core/gpu_authority_tracker.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -221,6 +222,22 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+/// Accesses after which a later access with the same state still needs a barrier.
+constexpr vk::AccessFlags2 ImageWriteAccess = vk::AccessFlagBits2::eTransferWrite |
+                                              vk::AccessFlagBits2::eShaderWrite |
+                                              vk::AccessFlagBits2::eMemoryWrite;
+/// Attachment writes are ordered among themselves by rasterization order. Across a guest cache
+/// flush they get a barrier, like any write the guest flushed.
+constexpr vk::AccessFlags2 AttachmentWriteAccess =
+    vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+
+static void RecordWriteEpochs(Image::State& state, vk::AccessFlags2 dst_mask) {
+    if (dst_mask & (ImageWriteAccess | AttachmentWriteAccess)) {
+        state.cache_epoch = FlushEpoch::Cache();
+        state.sync_epoch = FlushEpoch::Sync();
+    }
+}
+
 static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
     Image& image, const vk::ImageLayout dst_layout, const vk::AccessFlags2 dst_mask,
     const vk::PipelineStageFlags2 dst_stage,
@@ -228,6 +245,7 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
     auto& last_state = image.backing->state;
     auto& subresource_states = image.backing->subresource_states;
     const bool partially_transited = !subresource_states.empty();
+    const u64 cache_epoch = FlushEpoch::Cache();
 
     Image::Barriers barriers;
     if (needs_partial_transition || partially_transited) {
@@ -256,11 +274,12 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 
-                constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                             vk::AccessFlagBits2::eShaderWrite |
-                                             vk::AccessFlagBits2::eMemoryWrite;
-                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                const bool is_write = static_cast<bool>(state.access_mask & ImageWriteAccess);
+                const bool flushed_attachment =
+                    static_cast<bool>(state.access_mask & AttachmentWriteAccess) &&
+                    state.cache_epoch != cache_epoch;
+                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write ||
+                    flushed_attachment) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
@@ -282,6 +301,7 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
+                    RecordWriteEpochs(state, dst_mask);
                 }
             }
         }
@@ -313,6 +333,7 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+    RecordWriteEpochs(last_state, dst_mask);
 
     return barriers;
 }
@@ -320,16 +341,36 @@ static SHAD_NO_INLINE Image::Barriers GetBarriersSlow(
 Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                                    vk::PipelineStageFlags2 dst_stage,
                                    std::optional<SubresourceRange> subres_range) {
+    if (direct_authority_seq != 0 && (dst_mask & (ImageWriteAccess | AttachmentWriteAccess)))
+        [[unlikely]] {
+        // The write would destroy bytes a GPU authority still reads from this image.
+        if (preserve_hook != nullptr) {
+            preserve_hook(preserve_hook_context, *this);
+        }
+        direct_authority_seq = 0;
+    }
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const auto& last_state = backing->state;
-    if (!needs_partial_transition && backing->subresource_states.empty()) {
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+    if (!needs_partial_transition && backing->subresource_states.empty() &&
+        last_state.layout == dst_layout && last_state.access_mask == dst_mask) {
+        const bool is_write = static_cast<bool>(last_state.access_mask & ImageWriteAccess);
+        if (!is_write) {
+            const bool attachment_write =
+                static_cast<bool>(last_state.access_mask & AttachmentWriteAccess);
+            if (!attachment_write || last_state.cache_epoch == FlushEpoch::Cache()) {
+                return {};
+            }
+        } else if ((dst_mask & vk::AccessFlagBits2::eShaderWrite) &&
+                   !(dst_mask & (vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite)) &&
+                   last_state.sync_epoch == FlushEpoch::Sync()) {
+            // Storage accesses the guest did not separate with a flush or a wait: on the console
+            // they overlap too, so they need no barrier here. The next barrier waits for both.
+            backing->state.pl_stage |= dst_stage;
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::StorageImageBarriersSkipped);
             return {};
         }
     }
@@ -962,6 +1003,14 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
 void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     if (!backing || backing->num_samples == num_samples) {
         return;
+    }
+    if (direct_authority_seq != 0) [[unlikely]] {
+        // The contents move to another backing, which can be multisampled; copy the bytes of the
+        // GPU authority out of the current one first.
+        if (preserve_hook != nullptr) {
+            preserve_hook(preserve_hook_context, *this);
+        }
+        direct_authority_seq = 0;
     }
     ASSERT_MSG(!info.props.is_depth, "Swapping samples is only valid for color images");
     BackingImage* new_backing;

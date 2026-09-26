@@ -65,6 +65,9 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// Stores a GDS dword to guest memory once the GPU reaches the current point, without
+    /// waiting for it. Signals recorded after it are published after the store lands.
+    void StoreGdsAsync(VAddr address, u32 gds_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size, void* context = nullptr);
     bool HandleWriteFaultOnReadWatchedPage(VAddr addr, u64 size, void* context);
@@ -79,11 +82,14 @@ public:
     bool CancelMemoryWriteWatch(VideoCore::MemoryWriteWatch watch) {
         return page_manager.CancelWriteWatch(watch);
     }
-    bool ProcessDownloadImages(const VideoCore::TextureCache::DownloadContext& context,
-                               bool* gpu_resident = nullptr);
-    bool ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
-                               u32 trigger_control = 0, u32 trigger_data_control = 0,
-                               bool* gpu_resident = nullptr);
+    VideoCore::TextureCache::DownloadDrain ProcessDownloadImages(
+        const VideoCore::TextureCache::DownloadContext& context);
+    VideoCore::TextureCache::DownloadDrain ProcessDownloadImages(
+        Common::PerformanceTelemetry::WritebackTrigger trigger, u32 trigger_control = 0,
+        u32 trigger_data_control = 0);
+    /// Has the command processor record the copy of a direct GPU authority and submit it, for a
+    /// thread that has to read the bytes. Blocks until the command processor ran it.
+    void PreserveAuthorityForHost(const std::shared_ptr<VideoCore::GpuAuthorityEntry>& entry);
     void WaitTick(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason =
                                 Common::PerformanceTelemetry::HostWaitReason::Unknown);
     void DeferGpuCompletion(Common::UniqueFunction<void>&& callback,
@@ -96,7 +102,6 @@ public:
     void FlushCaches(AmdGpu::EventType event_type);
 
     void CpSync();
-    void GpuFenceWait();
     void FullGpuBarrier();
     [[nodiscard]] u64 CurrentTick() const noexcept;
     [[nodiscard]] u64 KnownGpuTick() const noexcept;
@@ -109,6 +114,10 @@ public:
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
+    }
+
+    [[nodiscard]] const VideoCore::PageManager& GetPageManager() const noexcept {
+        return page_manager;
     }
 
     template <typename Func>
@@ -141,6 +150,13 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
     void SynchronizeDmaBuffers();
+    /// Records the guest flushes seen since the last global barrier (see FlushEpoch).
+    void AccumulateFlush(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
+                         vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access);
+    /// Global barrier for accesses resource tracking cannot see, through device addresses.
+    void EmitPendingGlobalBarrier();
+    /// Submits the recorded work when the GPU ran out of it.
+    void MaybeKickGpu();
     void BindPipelineResources(const Pipeline* pipeline);
     void CaptureDescriptorState(const Pipeline* pipeline);
     void MarkImageWrites(Common::PerformanceTelemetry::ImageWriter writer,
@@ -329,6 +345,20 @@ private:
     Common::PerformanceTelemetry::Gate telemetry_enabled{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    /// Guest flushes since the last global barrier.
+    vk::PipelineStageFlags2 pending_flush_src_stages{};
+    vk::AccessFlags2 pending_flush_src_access{};
+    vk::PipelineStageFlags2 pending_flush_dst_stages{};
+    vk::AccessFlags2 pending_flush_dst_access{};
+    /// A pipeline that accesses memory through device addresses ran since the last global
+    /// barrier.
+    bool dma_access_pending{};
+
+    /// Draws and dispatches recorded into the command buffer of kick_tick.
+    u32 kick_work{};
+    u32 kick_polls{};
+    u64 kick_tick{};
 };
 
 } // namespace Vulkan

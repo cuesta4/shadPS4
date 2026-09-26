@@ -1098,8 +1098,11 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/flush_epoch.h
                src/video_core/gpu_authority_tracker.cpp
                src/video_core/gpu_authority_tracker.h
+               src/video_core/guest_access.cpp
+               src/video_core/guest_access.h
                src/video_core/guest_copy_engine.cpp
                src/video_core/guest_copy_engine.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp

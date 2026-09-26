@@ -83,6 +83,9 @@ public:
     /// Lock-free variant over a range, for the guest copy engine.
     [[nodiscard]] bool HasReadWatchers(VAddr address, u64 size) const noexcept;
 
+    /// Number of read watches armed on the page that contains address.
+    [[nodiscard]] u32 ReadWatchCount(VAddr address) const;
+
     /// Temporarily unprotects the page (e.g. for single-stepping after a fault).
     void TemporarilyUnprotect(VAddr address, u64 size) const;
 

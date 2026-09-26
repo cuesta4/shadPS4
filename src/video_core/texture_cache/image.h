@@ -219,6 +219,9 @@ public:
         vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
         vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        /// FlushEpoch values when the state was last entered with a write access.
+        u64 cache_epoch{};
+        u64 sync_epoch{};
     };
     struct BackingImage {
         UniqueImage image;
@@ -239,6 +242,14 @@ public:
     u64 tick_accessed_last{};
     u64 hash{};
     u64 content_epoch{};
+    /// GPU authority whose bytes still live in this image (see GpuAuthorityEntry::direct).
+    u64 direct_authority_seq{};
+
+    /// Called before an image with a direct authority is transitioned for a write, so the
+    /// authority's bytes are copied out first. Set by the texture cache.
+    using PreserveHook = void (*)(void* context, Image& image);
+    static inline PreserveHook preserve_hook{};
+    static inline void* preserve_hook_context{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     u64 telemetry_last_scheduled_epoch{};
     u64 telemetry_last_scheduled_backing{};

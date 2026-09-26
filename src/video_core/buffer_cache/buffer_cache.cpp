@@ -1764,11 +1764,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     return {&buffer, buffer.Offset(device_addr)};
 }
 
-std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
-    if (const auto shadow =
-            GpuAuthorityTracker::Instance().AcquireGpuShadowForImage(gpu_addr, size)) {
-        ASSERT(shadow->buffer_offset <= std::numeric_limits<u32>::max());
-        return {&download_buffer, static_cast<u32>(shadow->buffer_offset)};
+std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size,
+                                                          u32 offset_alignment) {
+    if (const auto shadow = GpuAuthorityTracker::Instance().AcquireGpuShadowForImage(
+            gpu_addr, size, offset_alignment)) {
+        const u64 offset = shadow->buffer_offset + (gpu_addr - shadow->guest_addr);
+        ASSERT(offset <= std::numeric_limits<u32>::max());
+        // Transfers write the download buffer without going through its access tracking; the
+        // consumer's barrier has to order its read after them.
+        download_buffer.access_mask = vk::AccessFlagBits2::eTransferWrite;
+        download_buffer.stage = vk::PipelineStageFlagBits2::eTransfer;
+        return {&download_buffer, static_cast<u32>(offset)};
     }
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
@@ -1822,7 +1828,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
                 };
                 copy_engine.Enqueue(std::span{&op, 1});
             } else {
-                memory->CopySparseMemory(gpu_addr, data, size);
+                CopyGuestMemory(gpu_addr, data, size);
             }
         }
     }
@@ -1857,7 +1863,9 @@ bool BufferCache::ServeGuestCopyFromGpuShadows(
         }
         auto kind = GuestCopyEngine::OpKind::Guest;
         if (page_manager.HasReadWatchers(begin, end - begin)) {
-            if (!memory->IsBackedRange(begin, end - begin)) {
+            // Only pages protected for authorities alone hold current bytes in RAM next to them.
+            if (!authority_tracker.IsBackingReadable(begin, end - begin) ||
+                !memory->IsBackedRange(begin, end - begin)) {
                 return false;
             }
             kind = GuestCopyEngine::OpKind::Backing;
@@ -1902,34 +1910,66 @@ bool BufferCache::ServeGuestCopyFromGpuShadows(
     scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
                            Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     const auto cmdbuf = scheduler.CommandBuffer();
-    // Orders the copy after the transfer that wrote the shadow and after earlier readers of the
-    // destination, and the consumers recorded next after the copy.
-    const vk::MemoryBarrier2 pre_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    const vk::Buffer dst_handle = GuestCopyEngine::ToHandle<vk::Buffer>(op.dst_buffer);
+    u64 src_begin = std::numeric_limits<u64>::max();
+    u64 src_end = 0;
+    for (const auto& copy : copies) {
+        src_begin = std::min(src_begin, copy.srcOffset);
+        src_end = std::max(src_end, copy.srcOffset + copy.size);
+    }
+    // Orders the copy after the transfers that wrote the shadows and after earlier readers of
+    // the destination range, and the consumers recorded next after the copy. Only the two
+    // ranges involved are synchronized.
+    const vk::BufferMemoryBarrier2 pre_barriers[2] = {
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = download_buffer.Handle(),
+            .offset = src_begin,
+            .size = src_end - src_begin,
+        },
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .buffer = dst_handle,
+            .offset = op.dst_offset,
+            .size = op.size,
+        },
     };
-    const vk::MemoryBarrier2 post_barrier = {
+    const vk::BufferMemoryBarrier2 post_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = dst_handle,
+        .offset = op.dst_offset,
+        .size = op.size,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &pre_barrier,
+        .bufferMemoryBarrierCount = 2,
+        .pBufferMemoryBarriers = pre_barriers,
     });
-    cmdbuf.copyBuffer(download_buffer.Handle(),
-                      GuestCopyEngine::ToHandle<vk::Buffer>(op.dst_buffer), copies);
+    cmdbuf.copyBuffer(download_buffer.Handle(), dst_handle, copies);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &post_barrier,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &post_barrier,
     });
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls, 2);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes, gpu_bytes);
     return true;
+}
+
+void BufferCache::CopyGuestMemory(VAddr source, u8* destination, u64 size) {
+    // Authority bytes of the range were materialized by the caller. Other authorities can still
+    // protect its pages; the backing view reads the bytes next to them without faulting.
+    if (!GpuAuthorityTracker::Instance().ReadGuestMemory(source, destination, size)) {
+        memory->CopySparseMemory(source, destination, size);
+    }
 }
 
 bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
@@ -2257,6 +2297,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyCalls);
         Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::CopyBytes,
                                           total_size_bytes);
+        // Only the uploaded span of the buffer takes part in the dependency.
+        u64 span_begin = std::numeric_limits<u64>::max();
+        u64 span_end = 0;
+        for (const auto& copy : copies) {
+            span_begin = std::min<u64>(span_begin, copy.dstOffset);
+            span_end = std::max<u64>(span_end, copy.dstOffset + copy.size);
+        }
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -2265,8 +2312,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
             .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
+            .offset = span_begin,
+            .size = span_end - span_begin,
         };
         const vk::BufferMemoryBarrier2 post_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -2274,8 +2321,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
             .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
+            .offset = span_begin,
+            .size = span_end - span_begin,
         };
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -2341,7 +2388,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                             .dst_offset = offset + copy.srcOffset,
                         });
                     } else {
-                        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                        CopyGuestMemory(device_addr, src_pointer, copy.size);
                     }
                 }
             }
@@ -2385,7 +2432,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                             .size = copy.size,
                         });
                     } else {
-                        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+                        CopyGuestMemory(device_addr, src_pointer, copy.size);
                     }
                 }
             }

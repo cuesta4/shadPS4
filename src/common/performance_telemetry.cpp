@@ -281,7 +281,7 @@ static_assert(StagingMemoryKindNames.size() == StagingMemoryKindCount);
 constexpr std::array SubmitReasonNames{
     "generic",          "guest_submit",       "writeback_eos", "writeback_eop",
     "writeback_release", "present_frame_build", "present_submit", "queue_present",
-    "finish",           "wait_progress",
+    "finish",           "wait_progress",      "gpu_kick",
 };
 static_assert(SubmitReasonNames.size() == SubmitReasonCount);
 
@@ -796,6 +796,27 @@ constexpr std::array FrameCounters{
     Counter::WaitRegMemCalls,
     Counter::WaitRegMemSpinNs,
     Counter::PriorityOpsExecuteNs,
+    Counter::ReadbackDirect,
+    Counter::ReadbackCpuCommit,
+    Counter::ReadbackLegacy,
+    Counter::SignalsPublishedAtCp,
+    Counter::SignalsPublishedAtWait,
+    Counter::SignalsPublishedAtCompletion,
+    Counter::SignalsQueued,
+    Counter::FaultAuthorityBytes,
+    Counter::FaultFalseSharingEmulated,
+    Counter::FaultFalseSharingUnemulated,
+    Counter::ClassifiedCpuConsumer,
+    Counter::ClassifiedHotPage,
+    Counter::GpuKicks,
+    Counter::FlushEpochs,
+    Counter::EpochBufferBarriers,
+    Counter::EpochGlobalBarriers,
+    Counter::StorageImageBarriersSkipped,
+    Counter::DirectAuthorityCopies,
+    Counter::DirectAuthorityUnconsumed,
+    Counter::AuthorityMaskedWrites,
+    Counter::GdsStoresAsync,
 };
 
 struct FrameRecord {
@@ -1105,6 +1126,27 @@ constexpr std::array CounterNames{
     "dispatch_phase_hle_ns",
     "dispatch_phase_bind_ns",
     "dispatch_phase_record_ns",
+    "readback_direct",
+    "readback_cpu_commit",
+    "readback_legacy",
+    "signals_published_at_cp",
+    "signals_published_at_wait",
+    "signals_published_at_completion",
+    "signals_queued",
+    "fault_authority_bytes",
+    "fault_false_sharing_emulated",
+    "fault_false_sharing_unemulated",
+    "classified_cpu_consumer",
+    "classified_hot_page",
+    "gpu_kicks",
+    "flush_epochs",
+    "epoch_buffer_barriers",
+    "epoch_global_barriers",
+    "storage_image_barriers_skipped",
+    "direct_authority_copies",
+    "direct_authority_unconsumed",
+    "authority_masked_writes",
+    "gds_stores_async",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 

@@ -13,6 +13,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/buffer_cache/stream_buffer_pin.h"
+#include "video_core/flush_epoch.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -147,8 +148,22 @@ public:
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
+        constexpr vk::AccessFlags2 WriteAccess =
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite |
+            vk::AccessFlagBits2::eMemoryWrite;
+        const u64 epoch = FlushEpoch::Cache();
         if (dst_acess_mask == access_mask && stage == dst_stage) {
-            return {};
+            // Accesses of the same kind are only ordered when the guest flushed its caches
+            // after the buffer was last written: two read-write bindings of one buffer need a
+            // barrier across a flush, although their access masks match.
+            if (!(access_mask & WriteAccess) || write_epoch == epoch) {
+                return {};
+            }
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::EpochBufferBarriers);
+        }
+        if (dst_acess_mask & WriteAccess) {
+            write_epoch = epoch;
         }
 
         DEBUG_ASSERT(offset < size_bytes);
@@ -211,6 +226,8 @@ public:
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
     vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    /// FlushEpoch::Cache() when a write access was last requested.
+    u64 write_epoch{};
 
 private:
     u32 memory_type_index{};

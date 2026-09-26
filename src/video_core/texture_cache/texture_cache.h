@@ -9,8 +9,10 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <boost/container/small_vector.hpp>
 #include <queue>
 #include <tsl/robin_map.h>
@@ -33,6 +35,7 @@ struct Liverpool;
 namespace VideoCore {
 
 class BufferCache;
+struct GpuAuthorityEntry;
 struct GpuAuthorityShadow;
 class PageManager;
 class ReadbackTracker;
@@ -82,11 +85,6 @@ public:
             : info{group, cpu_address}, type{BindingType::VideoOut} {}
     };
 
-    enum class DownloadPolicy : u8 {
-        LegacyEager,
-        AuthorityManaged,
-    };
-
     enum class DownloadTrigger : u8 {
         EventWriteEos,
         EventWriteEop,
@@ -122,21 +120,15 @@ public:
         Common::PerformanceTelemetry::PacketSeq producer_packet_seq{0};
         VAddr guest_begin{0};
         u32 size{0};
-        DownloadPolicy policy{DownloadPolicy::LegacyEager};
     };
 
-    struct PendingFastpathCandidate {
-        Common::PerformanceTelemetry::CandidateSeq candidate_id{0};
-        ImageId image_id{0};
-        u64 image_uid{0};
-        u64 resource_version{0};
-        u64 alias_epoch{0};
-        u64 created_timestamp_ns{0};
-        VAddr guest_addr{0};
-        u32 download_size{0};
-        u64 producer_seq{0};
-        Common::PerformanceTelemetry::PacketSeq producer_packet_seq{0};
-        Common::PerformanceTelemetry::ImageWriter producer_kind{};
+    /// What a completion scope did with the readbacks pending when it was reached.
+    struct DownloadDrain {
+        /// Readbacks drained in this scope, of any kind.
+        u32 drained{};
+        /// Readbacks committed to guest RAM when the GPU completes. A signal of the scope must
+        /// follow their commit.
+        u32 eager{};
     };
 
 public:
@@ -157,30 +149,36 @@ public:
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
-    /// Schedules a copy of pending images for download back to CPU memory.
-    bool ProcessDownloadImages(const DownloadContext& context, bool* gpu_resident = nullptr);
+    /// Drains the pending readbacks at a completion scope. Readbacks of linear single-mip images
+    /// become GPU authorities (see GpuAuthorityTracker); the others are committed to guest RAM
+    /// when the GPU completes. Command processor thread.
+    DownloadDrain ProcessDownloadImages(const DownloadContext& context);
 
-    bool ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
-                               u32 trigger_control = 0, u32 trigger_data_control = 0,
-                               bool* gpu_resident = nullptr);
+    DownloadDrain ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
+                                        u32 trigger_control = 0, u32 trigger_data_control = 0);
 
-    [[nodiscard]] bool PromotePendingDownloadAuthority(ImageId image_id, u64 image_uid,
-                                                        u64 resource_version,
-                                                        std::shared_ptr<GpuAuthorityShadow>* shadow);
-    void PruneSupersededPendingDownloads(u64 image_uid, u64 superseded_version);
     void ScheduleComputeDownload(ImageId image_id);
     void ScheduleRenderTargetDownload(ImageId image_id);
-
-    [[nodiscard]] std::optional<PendingFastpathCandidate> TakePendingFastpathCandidate();
 
     [[nodiscard]] bool IsGpuAuthorityImageCurrent(ImageId image_id, u64 image_uid,
                                                   u64 resource_version, VAddr address,
                                                   size_t size);
 
+    /// Records the copy of a direct authority's bytes out of its image, before anything
+    /// overwrites the image or when a consumer needs them elsewhere. With restore_state the image
+    /// goes back to the layout it had, for callers in the middle of preparing a draw that already
+    /// bound it. Command processor thread.
+    void PreserveDirectAuthority(const std::shared_ptr<GpuAuthorityEntry>& entry,
+                                 bool restore_state);
+
     void WaitGpuAuthorityShadow(const std::shared_ptr<GpuAuthorityShadow>& shadow);
     bool MaterializeGpuAuthority(const std::shared_ptr<GpuAuthorityShadow>& shadow,
                                  VAddr required_addr, size_t required_size,
+                                 std::span<const std::pair<VAddr, VAddr>> masked,
                                  s8* out_validation_bytes_equal = nullptr);
+
+    /// Hashes guest memory without faulting on pages protected for GPU authorities.
+    [[nodiscard]] u64 HashGuestMemory(VAddr address, size_t size);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -365,8 +363,20 @@ private:
 
     void PrepareImageAccess(ImageId image_id, AliasAccess access);
     void UpdateImageImpl(ImageId image_id);
-    void ScheduleImageDownload(ImageId image_id, bool fastpath_candidate, bool replace_existing,
+    void ScheduleImageDownload(ImageId image_id, bool replace_existing,
                                Common::PerformanceTelemetry::ImageWriter producer_kind);
+
+    /// True when the readback of the image can stay on the GPU as an authority: its bytes in
+    /// the download layout are exactly what guest RAM holds.
+    [[nodiscard]] bool IsAuthorityEligible(ImageId image_id, const Image& image,
+                                           u32 download_size) const;
+
+    /// Records the copy of the image into a pinned shadow of the download buffer.
+    [[nodiscard]] std::shared_ptr<GpuAuthorityShadow> RecordAuthorityShadow(Image& image,
+                                                                          u32 download_size,
+                                                                          bool restore_state);
+
+    static void PreserveBeforeWrite(void* context, Image& image);
 
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -386,7 +396,7 @@ private:
 
     /// Copies image memory back to CPU.
     bool DownloadImageMemory(ImageId image_id, bool validate_identity = false,
-                             bool track_gpu_source = false, bool* gpu_resident = nullptr,
+                             bool track_gpu_source = false,
                              u64 candidate_created_timestamp_ns = 0,
                              u64 candidate_alias_epoch = 0);
 
@@ -521,8 +531,7 @@ private:
     std::recursive_mutex mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
-    mutable std::mutex fastpath_candidate_mutex;
-    std::optional<PendingFastpathCandidate> pending_fastpath_candidate;
+    std::vector<u8> hash_scratch;
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;

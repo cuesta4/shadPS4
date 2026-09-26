@@ -212,8 +212,6 @@ private:
     bool WriteGraphicsRegisters8(u32 first_register, const u32* payload);
     bool WriteGraphicsRegistersSlow(u32 first_register, const u32* payload, u32 word_count);
     void HandleContextRegisterHint(u32 register_address, u32 packet_count, const u32* payload);
-    bool TryPromoteGoW3Eos(const PM4CmdEventWriteEos& packet,
-                           const Common::PerformanceTelemetry::CausalTraceToken& completion_trace);
     void ProcessGraphicsEventWrite(const PM4Header* header, u32 count, u32 ib_depth,
                                    bool telemetry_enabled, bool telemetry_detail);
     void ProcessEventWriteEop(const PM4CmdEventWriteEop& packet);
@@ -222,12 +220,11 @@ private:
                                   const u32* queue_pipe_id, u32 ib_depth, bool telemetry_enabled,
                                   bool telemetry_detail);
 
-    bool TrackDeferredGpuCompletion(u32 queue_id, VAddr address = 0, u64 value = 0,
-                                    u32 num_bytes = 0);
-    bool TryBypassGpuCompletionWait(u32 queue_id, VAddr address, u32 function, u32 mask,
-                                    u32 reference);
-    void FlushPendingGpuCompletionsForWait();
-    void RefreshPendingGpuCompletions();
+    /// Publishes a completion signal through the GPU authority tracker, which queues it behind
+    /// pending readback commits when it has to follow them.
+    /// Returns true when the signal was queued.
+    bool PublishCompletionSignal(VAddr label_addr, u64 label_size,
+                                 Common::UniqueFunction<void, bool>&& publish);
 
     bool ArmMemoryWait(u32 queue_id, VAddr address);
     void CancelMemoryWait(u32 queue_id);
@@ -258,18 +255,9 @@ private:
     std::atomic<u64> ready_queue_mask{};
     std::atomic<u64> blocked_queue_mask{};
 
-    struct PendingGpuFenceWord {
-        VAddr address{};
-        u32 value{};
-        u8 queue_id{};
-        bool barriered{};
-    };
-    static_assert(sizeof(PendingGpuFenceWord) == 16);
-    static constexpr u32 MaxPendingGpuFenceWords = 64;
-    std::array<PendingGpuFenceWord, MaxPendingGpuFenceWords> pending_gpu_fence_words{};
-    u64 pending_gpu_completion_tick{};
-    u32 pending_gpu_completion_count{};
-    u32 pending_gpu_fence_word_count{};
+    /// Tick of the last completion signal queued behind readback commits. The command
+    /// processor submits it before going idle, so the signal can be published.
+    u64 queued_signal_tick{};
 
     struct SyncPacketState {
         Common::PerformanceTelemetry::FenceSeq fence_seq{};

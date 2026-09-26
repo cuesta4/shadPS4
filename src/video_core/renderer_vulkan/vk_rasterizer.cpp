@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/flush_epoch.h"
 #include "video_core/gpu_authority_tracker.h"
 #include "video_core/guest_copy_engine.h"
 #include "video_core/texture_cache/image_view.h"
@@ -502,13 +503,6 @@ private:
     return value ^ (value >> 29);
 }
 
-/// SHADPS4_GPU_SHADOW_SERVE=0 makes uploads of GPU-owned guest ranges materialize guest RAM
-/// again instead of copying the authority shadow on the GPU.
-[[nodiscard]] bool GpuShadowServeEnabled() {
-    const char* env = std::getenv("SHADPS4_GPU_SHADOW_SERVE");
-    return env == nullptr || env[0] != '0';
-}
-
 } // Anonymous namespace
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
@@ -530,21 +524,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                                                                                             size);
             },
             &page_manager);
-        if (GpuShadowServeEnabled()) {
-            copy_engine.SetProtectedCopyResolver(
-                [](void* context, const VideoCore::GuestCopyEngine::Op& op,
-                   std::span<VideoCore::GuestCopyEngine::Op,
-                             VideoCore::GuestCopyEngine::MaxResolverRemainder>
-                       remainder,
-                   u32& remainder_count, u64& gpu_bytes) -> bool {
-                    auto& rasterizer = *static_cast<Rasterizer*>(context);
-                    return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
-                        op, remainder, remainder_count, gpu_bytes, rasterizer.page_manager);
-                },
-                this);
-        } else {
-            LOG_INFO(Render_Vulkan, "GPU shadow serving disabled by SHADPS4_GPU_SHADOW_SERVE");
-        }
+        copy_engine.SetProtectedCopyResolver(
+            [](void* context, const VideoCore::GuestCopyEngine::Op& op,
+               std::span<VideoCore::GuestCopyEngine::Op,
+                         VideoCore::GuestCopyEngine::MaxResolverRemainder>
+                   remainder,
+               u32& remainder_count, u64& gpu_bytes) -> bool {
+                auto& rasterizer = *static_cast<Rasterizer*>(context);
+                return rasterizer.buffer_cache.ServeGuestCopyFromGpuShadows(
+                    op, remainder, remainder_count, gpu_bytes, rasterizer.page_manager);
+            },
+            this);
         copy_engine.Start(GuestCopyWorkerCount());
     }
     memory->SetRasterizer(this);
@@ -642,31 +632,7 @@ void Rasterizer::AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size) 
                      vk::AccessFlagBits2::eMemoryRead;
     }
 
-    scheduler.EndRendering(
-        Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
-        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
-    const vk::MemoryBarrier2 barrier{
-        .srcStageMask = src_stages,
-        .srcAccessMask = src_access,
-        .dstStageMask = dst_stages,
-        .dstAccessMask = dst_access,
-    };
-    const u64 barrier_id = RecordBarrierCausality(
-        src_stages, src_access, dst_stages, dst_access, 1, 0, 0,
-        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
-    const u64 interval = scheduler.BeginGpuInterval(
-        Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &barrier,
-    });
-    scheduler.EndGpuInterval(interval);
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AcquireMemBarriers);
-    Common::PerformanceTelemetry::RecordEnabled(
-        Common::PerformanceTelemetry::EventType::VulkanPipelineBarrier,
-        static_cast<u64>(src_stages), static_cast<u64>(dst_stages));
+    AccumulateFlush(src_stages, src_access, dst_stages, dst_access);
 }
 
 void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
@@ -717,38 +683,63 @@ void Rasterizer::FlushCaches(AmdGpu::EventType event_type) {
         return;
     }
 
+    AccumulateFlush(src_stages, src_access,
+                    vk::PipelineStageFlagBits2::eAllGraphics |
+                        vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eColorAttachmentRead |
+                        vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                        vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
+                        vk::AccessFlagBits2::eMemoryRead);
+}
+
+void Rasterizer::AccumulateFlush(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
+                                 vk::PipelineStageFlags2 dst_stages,
+                                 vk::AccessFlags2 dst_access) {
+    // Tracked resources written before this point get a barrier when they are next accessed
+    // (FlushEpoch); nothing is recorded for the packet itself.
+    VideoCore::FlushEpoch::AdvanceCache();
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FlushEpochs);
+    pending_flush_src_stages |= src_stages;
+    pending_flush_src_access |= src_access;
+    pending_flush_dst_stages |= dst_stages;
+    pending_flush_dst_access |= dst_access;
+    if (dma_access_pending) {
+        // A pipeline wrote memory through device addresses, which no resource tracks.
+        EmitPendingGlobalBarrier();
+    }
+}
+
+void Rasterizer::EmitPendingGlobalBarrier() {
+    dma_access_pending = false;
+    if (pending_flush_src_stages == vk::PipelineStageFlagBits2::eNone) {
+        return;
+    }
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = pending_flush_src_stages,
+        .srcAccessMask = pending_flush_src_access,
+        .dstStageMask = pending_flush_dst_stages,
+        .dstAccessMask = pending_flush_dst_access,
+    };
+    pending_flush_src_stages = vk::PipelineStageFlagBits2::eNone;
+    pending_flush_src_access = vk::AccessFlagBits2::eNone;
+    pending_flush_dst_stages = vk::PipelineStageFlagBits2::eNone;
+    pending_flush_dst_access = vk::AccessFlagBits2::eNone;
     scheduler.EndRendering(
         Common::PerformanceTelemetry::ScopeBreakReason::RequiredMemoryDependency,
         Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
-    const vk::MemoryBarrier2 barrier{
-        .srcStageMask = src_stages,
-        .srcAccessMask = src_access,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
-                        vk::PipelineStageFlagBits2::eComputeShader |
-                        vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
-                         vk::AccessFlagBits2::eColorAttachmentRead |
-                         vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eTransferRead |
-                         vk::AccessFlagBits2::eMemoryRead,
-    };
     const u64 barrier_id = RecordBarrierCausality(
-        src_stages, src_access, barrier.dstStageMask, barrier.dstAccessMask, 1, 0, 0,
-        Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
+        barrier.srcStageMask, barrier.srcAccessMask, barrier.dstStageMask, barrier.dstAccessMask,
+        1, 0, 0, Common::PerformanceTelemetry::Avoidability::ConservativeFallback);
     const u64 interval = scheduler.BeginGpuInterval(
         Common::PerformanceTelemetry::GpuIntervalKind::DependencyDelay, barrier_id);
-    auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
     scheduler.EndGpuInterval(interval);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
-    Common::PerformanceTelemetry::Add(
-        Common::PerformanceTelemetry::Counter::EventWriteFlushBarriers);
-    Common::PerformanceTelemetry::RecordEnabled(
-        Common::PerformanceTelemetry::EventType::VulkanPipelineBarrier,
-        static_cast<u64>(src_stages), static_cast<u64>(barrier.dstStageMask));
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::EpochGlobalBarriers);
 }
 
 void Rasterizer::FullGpuBarrier() {
@@ -783,11 +774,6 @@ void Rasterizer::FullGpuBarrier() {
     scheduler.EndGpuInterval(interval);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BarrierCalls);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::BruteForceBarriers);
-}
-
-void Rasterizer::GpuFenceWait() {
-    FullGpuBarrier();
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GpuFenceWaitBarriers);
 }
 
 u64 Rasterizer::CurrentTick() const noexcept {
@@ -1068,6 +1054,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     ResetBindings();
     phases.Lap(Counter::DrawPhaseMarkWritesNs);
+    MaybeKickGpu();
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1156,6 +1143,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
+    MaybeKickGpu();
 }
 
 void Rasterizer::DispatchDirect() {
@@ -1207,6 +1195,7 @@ void Rasterizer::DispatchDirect() {
 
     ResetBindings();
     phases.Lap(Counter::DispatchPhaseRecordNs);
+    MaybeKickGpu();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1258,6 +1247,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     ResetBindings();
     phases.Lap(Counter::DispatchPhaseRecordNs);
+    MaybeKickGpu();
 }
 
 u64 Rasterizer::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
@@ -1280,7 +1270,30 @@ void Rasterizer::OnSubmit() {
         Common::PerformanceTelemetry::WritebackTrigger::GuestSubmit);
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
+    VideoCore::FlushEpoch::AdvanceSync();
     Flush(Common::PerformanceTelemetry::SubmitReason::GuestSubmit);
+}
+
+void Rasterizer::MaybeKickGpu() {
+    // Recording a frame takes the command processor several milliseconds. Waits used to submit
+    // the work recorded so far as a side effect; now that most of them are gone, the work is
+    // submitted whenever the GPU has finished everything it was given.
+    static constexpr u32 KickMinWork = 48;
+    static constexpr u32 KickPollPeriod = 8;
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != kick_tick) {
+        kick_tick = tick;
+        kick_work = 0;
+        kick_polls = 0;
+    }
+    if (++kick_work < KickMinWork || (++kick_polls % KickPollPeriod) != 0) {
+        return;
+    }
+    if (!scheduler.IsFree(tick - 1)) {
+        return;
+    }
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GpuKicks);
+    Flush(Common::PerformanceTelemetry::SubmitReason::GpuKick);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -1355,6 +1368,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        // Memory reached through device addresses escapes resource tracking: the flushes the
+        // guest issued since the last global barrier apply to all of it, and whatever the
+        // pipeline writes gets a global barrier at the next flush.
+        EmitPendingGlobalBarrier();
+        dma_access_pending = true;
         SynchronizeDmaBuffers();
     }
 
@@ -2741,6 +2759,73 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+void Rasterizer::StoreGdsAsync(VAddr address, u32 gds_offset) {
+    auto& download_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download);
+    const auto [data, offset] = download_buffer.Map(sizeof(u32), sizeof(u32));
+    if (data == nullptr) {
+        Finish();
+        const u32 value = ReadDataFromGds(gds_offset);
+        std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+        NotifyMemoryWrite(address, sizeof(value), VideoCore::MemoryWriteSource::CommandProcessor);
+        return;
+    }
+    // Later GPU work may change the GDS before the host reads it; copy the value at this point
+    // of the command stream. The pin keeps the ring from reusing the bytes before they are read.
+    auto pin = std::make_shared<VideoCore::GpuAuthorityShadow>(data, address, offset,
+                                                               static_cast<u32>(sizeof(u32)),
+                                                               scheduler.CurrentTick());
+    download_buffer.Commit(pin);
+    auto* gds_buf = buffer_cache.GetGdsBuffer();
+    scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
+                           Common::PerformanceTelemetry::Avoidability::ProvenRequired);
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = gds_buf->Handle(),
+        .offset = gds_offset,
+        .size = sizeof(u32),
+    };
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(gds_buf->Handle(), download_buffer.Handle(),
+                      vk::BufferCopy{
+                          .srcOffset = gds_offset,
+                          .dstOffset = offset,
+                          .size = sizeof(u32),
+                      });
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GdsStoresAsync);
+
+    auto& authority_tracker = VideoCore::GpuAuthorityTracker::Instance();
+    const u64 timeline_seq = authority_tracker.BeginEagerWriteback(true);
+    const u64 authority_bound = authority_tracker.AuthoritySeqBound();
+    scheduler.DeferPriorityOperation([this, pin, address, timeline_seq, authority_bound,
+                                      &download_buffer] {
+        u32 value{};
+        {
+            std::scoped_lock lock{pin->data_mutex};
+            if (!pin->owned_data) {
+                download_buffer.Invalidate(pin->buffer_offset, sizeof(u32));
+            }
+            std::memcpy(&value, pin->data, sizeof(value));
+        }
+        pin->Release();
+        VideoCore::GuestCopyEngine::Instance().WaitForGuestWrite(address, sizeof(value));
+        auto* memory = Core::Memory::Instance();
+        const VideoCore::ScopedBackingWriteBound bound{authority_bound};
+        if (!memory->TryWriteBacking(reinterpret_cast<void*>(address), &value, sizeof(value),
+                                     Core::MemoryWriteOrigin::GpuCompletion)) {
+            std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+            NotifyMemoryWrite(address, sizeof(value), VideoCore::MemoryWriteSource::GpuCompletion);
+        }
+        VideoCore::GpuAuthorityTracker::Instance().CompleteEagerWriteback(timeline_seq);
+    });
+}
+
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -2828,16 +2913,31 @@ VideoCore::MemoryWriteNotifyResult Rasterizer::NotifyMemoryWrite(
     return page_manager.NotifyWrite(addr, size, source);
 }
 
-bool Rasterizer::ProcessDownloadImages(const VideoCore::TextureCache::DownloadContext& context,
-                                       bool* gpu_resident) {
-    return texture_cache.ProcessDownloadImages(context, gpu_resident);
+VideoCore::TextureCache::DownloadDrain Rasterizer::ProcessDownloadImages(
+    const VideoCore::TextureCache::DownloadContext& context) {
+    return texture_cache.ProcessDownloadImages(context);
 }
 
-bool Rasterizer::ProcessDownloadImages(Common::PerformanceTelemetry::WritebackTrigger trigger,
-                                       u32 trigger_control, u32 trigger_data_control,
-                                       bool* gpu_resident) {
-    return texture_cache.ProcessDownloadImages(trigger, trigger_control, trigger_data_control,
-                                               gpu_resident);
+VideoCore::TextureCache::DownloadDrain Rasterizer::ProcessDownloadImages(
+    Common::PerformanceTelemetry::WritebackTrigger trigger, u32 trigger_control,
+    u32 trigger_data_control) {
+    return texture_cache.ProcessDownloadImages(trigger, trigger_control, trigger_data_control);
+}
+
+void Rasterizer::PreserveAuthorityForHost(
+    const std::shared_ptr<VideoCore::GpuAuthorityEntry>& entry) {
+    liverpool->SendCommand<true>([this, &entry] {
+        texture_cache.PreserveDirectAuthority(entry, true);
+        bool submit = false;
+        {
+            std::scoped_lock entry_lock{*entry->entry_mutex};
+            submit = entry->shadow && entry->shadow->ReadyTick() >= scheduler.CurrentTick();
+        }
+        if (submit) {
+            // The calling thread waits for the copy right away.
+            Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+        }
+    });
 }
 
 void Rasterizer::WaitTick(u64 tick, Common::PerformanceTelemetry::HostWaitReason reason) {
