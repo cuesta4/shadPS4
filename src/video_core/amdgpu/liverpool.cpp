@@ -24,9 +24,9 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/platform.h"
+#include "common/elf_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
-#include "video_core/flush_epoch.h"
 #include "video_core/gpu_authority_tracker.h"
 #include "video_core/guest_copy_engine.h"
 #include "video_core/renderdoc.h"
@@ -285,70 +285,6 @@ static SHAD_NO_INLINE void BeginHostMarker(Vulkan::Rasterizer& rasterizer,
     return PM4CmdWaitRegMem::TestValue(value, function, mask, reference);
 }
 
-/// True when a packet keeps its order behind a WAIT_REG_MEM the command processor passed without
-/// waiting for the GPU (Liverpool::PassWaitOnGpu). GPU work, DMA_DATA included, is ordered by
-/// the barrier recorded for the wait, register state stays inside the command processor,
-/// completion signals follow the publication timeline, occlusion dumps write synthetic counters
-/// that no GPU work produces, and some packets are not emulated. Anything else, such as memory
-/// the command processor writes (WRITE_DATA, MEM_SEMAPHORE) or reads (COND_EXEC) itself, or an
-/// interrupt it raises right away, waits for the signal first, as it would on the console.
-[[nodiscard]] static bool IsOrderedAfterPassedWait(PM4ItOpcode opcode, const PM4Header* header) {
-    switch (opcode) {
-    case PM4ItOpcode::Nop: {
-        // Patched flips raise an interrupt right away.
-        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-        return nop->header.count.Value() == 0 ||
-               nop->data_block[0] != PM4CmdNop::PayloadType::PatchedFlip;
-    }
-    case PM4ItOpcode::ReleaseMem:
-        // GDS stores are published right away.
-        return reinterpret_cast<const PM4CmdReleaseMem*>(header)->data_sel.Value() !=
-               DataSelect::GdsMemStore;
-    case PM4ItOpcode::SetConfigReg:
-    case PM4ItOpcode::SetContextReg:
-    case PM4ItOpcode::SetShReg:
-    case PM4ItOpcode::SetUconfigReg:
-    case PM4ItOpcode::SetQueueReg:
-    case PM4ItOpcode::SetBase:
-    case PM4ItOpcode::IndexBase:
-    case PM4ItOpcode::IndexBufferSize:
-    case PM4ItOpcode::IndexType:
-    case PM4ItOpcode::NumInstances:
-    case PM4ItOpcode::ContextControl:
-    case PM4ItOpcode::ClearState:
-    case PM4ItOpcode::DrawIndex2:
-    case PM4ItOpcode::DrawIndexAuto:
-    case PM4ItOpcode::DrawIndexOffset2:
-    case PM4ItOpcode::DrawIndirect:
-    case PM4ItOpcode::DrawIndexIndirect:
-    case PM4ItOpcode::DrawIndirectMulti:
-    case PM4ItOpcode::DrawIndexIndirectMulti:
-    case PM4ItOpcode::DrawIndexIndirectCountMulti:
-    case PM4ItOpcode::DispatchDirect:
-    case PM4ItOpcode::DispatchIndirect:
-    case PM4ItOpcode::DmaData:
-    case PM4ItOpcode::AcquireMem:
-    case PM4ItOpcode::EventWrite:
-    case PM4ItOpcode::EventWriteEop:
-    case PM4ItOpcode::EventWriteEos:
-    case PM4ItOpcode::WaitRegMem:
-    case PM4ItOpcode::IndirectBuffer:
-    case PM4ItOpcode::IndirectBufferConst:
-    case PM4ItOpcode::PfpSyncMe:
-    case PM4ItOpcode::IncrementDeCounter:
-    case PM4ItOpcode::WaitOnCeCounter:
-    case PM4ItOpcode::Rewind:
-    // Not emulated beyond a warning.
-    case PM4ItOpcode::SetPredication:
-    case PM4ItOpcode::CopyData:
-    case PM4ItOpcode::StrmoutBufferUpdate:
-    case PM4ItOpcode::GetLodStats:
-        return true;
-    default:
-        return false;
-    }
-}
-
 void RecordPendingCompletionHazard(Common::PerformanceTelemetry::CausalTraceToken& trace,
                                    u64 completed_stages, u64 completed_writes,
                                    u64 requirement_bits, u8 confidence) {
@@ -508,23 +444,6 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
                 CancelMemoryWait(queue_id);                                                        \
             }                                                                                      \
         }                                                                                          \
-    } while (false)
-
-/// Waits, yielding, until the signal a passed WAIT_REG_MEM of queue_id waits for is published.
-#define RESOLVE_PASSED_WAIT(queue_id, yield_command)                                               \
-    do {                                                                                           \
-        auto& passed_wait_tracker = VideoCore::GpuAuthorityTracker::Instance();                   \
-        if (!passed_wait_tracker.IsPublished(passed_wait_seq[queue_id])) {                         \
-            PrepareVirtualWaitResolve();                                                           \
-            while (!passed_wait_tracker.IsPublished(passed_wait_seq[queue_id])) {                  \
-                if (passed_wait_tracker.TryPublishReady(                                           \
-                        Common::PerformanceTelemetry::Counter::SignalsPublishedAtWait)) {          \
-                    continue;                                                                      \
-                }                                                                                  \
-                yield_command                                                                      \
-            }                                                                                      \
-        }                                                                                          \
-        passed_wait_seq[queue_id] = 0;                                                             \
     } while (false)
 
 #define RESUME(task, name)                                                                         \
@@ -796,12 +715,6 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
-        if (rasterizer && queued_signal_tick != 0 &&
-            queued_signal_tick >= rasterizer->CurrentTick()) {
-            // Signals queued behind readback commits wait for this tick; with the command
-            // processor idle nothing else would submit it.
-            rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
-        }
         if (num_submits.load(std::memory_order_acquire) == 0) {
             if (submit_done) {
                 VideoCore::EndCapture();
@@ -1184,17 +1097,14 @@ SHAD_NO_INLINE void SignalEventWriteEos(const PM4CmdEventWriteEos& packet,
 SHAD_NO_INLINE void SignalEventWriteEop(const PM4CmdEventWriteEop& packet,
                                         Vulkan::Rasterizer* rasterizer,
                                         const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {},
-                                        const Common::PerformanceTelemetry::CausalTraceToken& causal = {},
-                                        bool write_label = true) {
+                                        const Common::PerformanceTelemetry::CausalTraceToken& causal = {}) {
     {
         Common::PerformanceTelemetry::ScopedMemoryWriteOrigin origin{
             Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
             fence_token.fence_seq};
         packet.SignalFence(
-            [rasterizer, write_label](void* address, u64 data, u32 num_bytes) {
-                if (write_label) {
-                    WriteFenceMemory(rasterizer, address, data, num_bytes);
-                }
+            [rasterizer](void* address, u64 data, u32 num_bytes) {
+                WriteFenceMemory(rasterizer, address, data, num_bytes);
             },
             [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
     }
@@ -1237,16 +1147,10 @@ SHAD_NO_INLINE void SignalEventWriteEop(const PM4CmdEventWriteEop& packet,
 #endif
 }
 
-SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& release_packet,
+SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& packet,
                                      Vulkan::Rasterizer* rasterizer, u32 pipe_id,
                                      const Common::PerformanceTelemetry::FenceTraceToken& fence_token = {},
-                                     const Common::PerformanceTelemetry::CausalTraceToken& causal = {},
-                                     bool write_label = true) {
-    PM4CmdReleaseMem packet = release_packet;
-    if (!write_label) {
-        // The label lies in memory that was unmapped; only the interrupt remains.
-        packet.data_sel.Assign(DataSelect::None);
-    }
+                                     const Common::PerformanceTelemetry::CausalTraceToken& causal = {}) {
     {
         Common::PerformanceTelemetry::ScopedMemoryWriteOrigin origin{
             Common::PerformanceTelemetry::MemoryWriteOrigin::FenceSignal,
@@ -1306,46 +1210,429 @@ SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& release_packet,
 
 } // namespace
 
-bool Liverpool::PublishCompletionSignal(VAddr label_addr, u64 label_size, u64 label_value,
-                                        bool value_known,
-                                        Common::UniqueFunction<void, bool>&& publish) {
-    auto& authority_tracker = VideoCore::GpuAuthorityTracker::Instance();
-    const bool queued = authority_tracker.PublishSignal(VideoCore::SignalPublication{
-        .label_addr = label_addr,
-        .label_size = label_size,
-        .label_value = label_value,
-        .value_known = value_known,
-        .publish = std::move(publish),
-    });
-    if (!queued) {
+void Liverpool::RefreshPendingGpuCompletions() {
+    if (pending_gpu_completion_count == 0) {
+        return;
+    }
+    if (rasterizer && pending_gpu_completion_tick == rasterizer->CurrentTick()) {
+        return;
+    }
+    pending_gpu_completion_tick = 0;
+    pending_gpu_completion_count = 0;
+    pending_gpu_fence_word_count = 0;
+}
+
+bool Liverpool::TrackDeferredGpuCompletion(u32 queue_id, VAddr address, u64 value,
+                                            u32 num_bytes) {
+    ASSERT(num_bytes == 0 || num_bytes == sizeof(u32) || num_bytes == sizeof(u64));
+    RefreshPendingGpuCompletions();
+
+    const u32 num_words = num_bytes / sizeof(u32);
+    u32 new_words{};
+    for (u32 word = 0; word < num_words; ++word) {
+        const VAddr word_address = address + word * sizeof(u32);
+        bool found{};
+        for (u32 index = 0; index < pending_gpu_fence_word_count; ++index) {
+            const auto& pending = pending_gpu_fence_words[index];
+            if (pending.queue_id == queue_id && pending.address == word_address) {
+                found = true;
+                break;
+            }
+        }
+        new_words += !found;
+    }
+
+    if (pending_gpu_fence_word_count + new_words > MaxPendingGpuFenceWords) [[unlikely]] {
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::GpuFenceTokenOverflows);
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackFlushes);
+        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+        pending_gpu_completion_tick = 0;
+        pending_gpu_completion_count = 0;
+        pending_gpu_fence_word_count = 0;
         return false;
     }
-    // The signal follows readbacks committed when the GPU reaches the current tick at the
-    // latest. The tick has to be submitted for that, even if the command processor goes idle.
-    rasterizer->DeferGpuCompletion([] { VideoCore::GpuAuthorityTracker::Instance().PublishReady(); });
-    queued_signal_tick = rasterizer->CurrentTick();
+
+    if (pending_gpu_completion_count == 0) {
+        pending_gpu_completion_tick = rasterizer->CurrentTick();
+    }
+    ++pending_gpu_completion_count;
+
+    for (u32 word = 0; word < num_words; ++word) {
+        const PendingGpuFenceWord replacement{
+            .address = address + word * sizeof(u32),
+            .value = static_cast<u32>(value >> (word * 32)),
+            .queue_id = static_cast<u8>(queue_id),
+        };
+        bool replaced{};
+        for (u32 index = pending_gpu_fence_word_count; index != 0; --index) {
+            auto& pending = pending_gpu_fence_words[index - 1];
+            if (pending.queue_id == queue_id && pending.address == replacement.address) {
+                pending = replacement;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            pending_gpu_fence_words[pending_gpu_fence_word_count++] = replacement;
+        }
+    }
+
     Common::PerformanceTelemetry::Add(
-        Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
+        Common::PerformanceTelemetry::Counter::WritebackFlushesAvoided);
     return true;
 }
 
-void Liverpool::PassWaitOnGpu(u32 queue_id, u64 signal_seq) {
-    VideoCore::GpuAuthorityTracker::Instance().BeginVirtualWait(signal_seq);
-    passed_wait_seq[queue_id] = std::max(passed_wait_seq[queue_id], signal_seq);
-    // The signal is published once the GPU gets there; the tick has to be submitted for that.
-    if (queued_signal_tick >= rasterizer->CurrentTick()) {
-        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+bool Liverpool::TryBypassGpuCompletionWait(u32 queue_id, VAddr address, u32 function, u32 mask,
+                                            u32 reference) {
+    RefreshPendingGpuCompletions();
+    if (pending_gpu_completion_count == 0) {
+        return false;
     }
-    // On the console, nothing behind the wait starts before the work in front of it finished.
-    rasterizer->FullGpuBarrier();
+
+    for (u32 index = pending_gpu_fence_word_count; index != 0; --index) {
+        auto& pending = pending_gpu_fence_words[index - 1];
+        if (pending.queue_id != queue_id || pending.address != address) {
+            continue;
+        }
+        if (!TestWaitValue(pending.value, static_cast<PM4CmdWaitRegMem::Function>(function), mask,
+                           reference)) {
+            return false;
+        }
+        if (!pending.barriered) {
+            rasterizer->GpuFenceWait();
+            pending.barriered = true;
+            Common::PerformanceTelemetry::Add(
+                Common::PerformanceTelemetry::Counter::GpuFenceWaitBarriers);
+        }
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::GpuFenceWaitBypasses);
+        return true;
+    }
+    return false;
 }
 
-void Liverpool::PrepareVirtualWaitResolve() {
-    Common::PerformanceTelemetry::Add(
-        Common::PerformanceTelemetry::Counter::VirtualWaitsResolved);
-    if (rasterizer && queued_signal_tick >= rasterizer->CurrentTick()) {
-        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+void Liverpool::FlushPendingGpuCompletionsForWait() {
+    RefreshPendingGpuCompletions();
+    if (pending_gpu_completion_count == 0) {
+        return;
     }
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::GpuFenceWaitForcedFlushes);
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::WritebackFlushes);
+    rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+    pending_gpu_completion_tick = 0;
+    pending_gpu_completion_count = 0;
+    pending_gpu_fence_word_count = 0;
+}
+
+SHAD_NO_INLINE bool Liverpool::TryPromoteGoW3Eos(
+    const PM4CmdEventWriteEos& packet,
+    const Common::PerformanceTelemetry::CausalTraceToken& completion_trace) {
+    auto& texture_cache = rasterizer->GetTextureCache();
+    auto cand_opt = texture_cache.TakePendingFastpathCandidate();
+    const bool is_sig_fence = (packet.command == PM4CmdEventWriteEos::Command::SignalFence);
+    const bool is_val_1 = (packet.DataDWord() == 1);
+    const VAddr label_addr = packet.Address<VAddr>();
+    std::shared_ptr<VideoCore::GpuAuthorityShadow> authority_shadow;
+    bool promoted{};
+    if (cand_opt && is_sig_fence && is_val_1 && label_addr != 0) {
+        auto candidate_trace = completion_trace;
+        candidate_trace.candidate_id = cand_opt->candidate_id;
+        Common::PerformanceTelemetry::ScopedCausalContext candidate_context{candidate_trace};
+        promoted = texture_cache.PromotePendingDownloadAuthority(
+            cand_opt->image_id, cand_opt->image_uid, cand_opt->resource_version,
+            &authority_shadow);
+    }
+
+    if (promoted) {
+        auto candidate = *cand_opt;
+
+        const u64 candidate_seq = candidate.candidate_id;
+        auto& authority_tracker = VideoCore::GpuAuthorityTracker::Instance();
+        const auto [authority_seq, virtual_fence_seq, label_generation] =
+            authority_tracker.AllocateIds(label_addr);
+        const u64 producer_tick = rasterizer->CurrentTick();
+        const auto cmd_buf_seq = Common::PerformanceTelemetry::CurrentCmdBufferSeq();
+        const auto submit_seq = Common::PerformanceTelemetry::LookupSubmitSeq(producer_tick);
+        const auto fence_seq = Common::PerformanceTelemetry::NextFenceSeq();
+        const auto pkt_seq = Common::PerformanceTelemetry::CurrentPacketSeq();
+
+        VideoCore::GpuAuthorityEntry auth_entry{
+            .authority_seq = authority_seq,
+            .candidate_seq = candidate_seq,
+            .scope_seq = completion_trace.scope_id,
+            .cause_seq = completion_trace.cause_id,
+            .signal_seq = completion_trace.signal_id,
+            .image_id = candidate.image_id.index,
+            .image_uid = candidate.image_uid,
+            .resource_id = candidate.image_uid,
+            .resource_version = candidate.resource_version,
+            .guest_begin = candidate.guest_addr,
+            .guest_end = candidate.guest_addr + candidate.download_size,
+            .download_size = candidate.download_size,
+            .producer_seq = candidate.producer_seq,
+            .producer_packet_seq = candidate.producer_packet_seq,
+            .producer_tick = producer_tick,
+            .fence_seq = fence_seq,
+            .virtual_fence_seq = virtual_fence_seq,
+            .label_addr = label_addr,
+            .label_value = packet.DataDWord(),
+            .label_generation = label_generation,
+            .state = VideoCore::GpuAuthorityState::GpuAuthoritative,
+            .shadow = std::move(authority_shadow),
+        };
+
+        VideoCore::VirtualGpuFence virt_fence{
+            .virtual_fence_seq = virtual_fence_seq,
+            .authority_seq = authority_seq,
+            .candidate_seq = candidate_seq,
+            .scope_seq = completion_trace.scope_id,
+            .cause_seq = completion_trace.cause_id,
+            .signal_seq = completion_trace.signal_id,
+            .fence_seq = fence_seq,
+            .label_addr = label_addr,
+            .label_generation = label_generation,
+            .expected_value = 1,
+            .producer_tick = producer_tick,
+            .producer_packet_seq = candidate.producer_packet_seq,
+            .eos_packet_seq = pkt_seq,
+            .wait_packet_seq = 0,
+            .acquire_packet_seq = 0,
+            .gpu_complete = false,
+            .host_label_written = false,
+            .wait_consumed = false,
+        };
+
+        authority_tracker.RetireStaleAuthorities();
+        authority_tracker.RegisterAuthority(auth_entry);
+        authority_tracker.RegisterVirtualFence(virt_fence);
+
+        Common::PerformanceTelemetry::RecordCandidateDecision(
+            Common::PerformanceTelemetry::CandidateDecisionSample{
+                .candidate_id = candidate_seq,
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .authority_id = authority_seq,
+                .producer_ticket = producer_tick,
+                .sync_requirement_bits =
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                         ExecutionOrder) |
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                         SnapshotPreservation) |
+                    static_cast<u64>(Common::PerformanceTelemetry::SyncRequirement::
+                                         HostSignalVisibility),
+                .evidence_bits =
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         ProducerIdentified) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         ResourceIdentity) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         ResourceEpoch) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::AliasEpoch) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         RangeCovered) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         ScopeIdentified) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         ScopeAfterProducer) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         SameQueueOrder) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         SnapshotRepresentable) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::PinLifetime) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::
+                                         LabelGeneration) |
+                    static_cast<u64>(Common::PerformanceTelemetry::CandidateEvidence::TraceComplete),
+                .proposed_data_action =
+                    Common::PerformanceTelemetry::DataAction::GpuShadow,
+                .proposed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                .executed_data_action =
+                    Common::PerformanceTelemetry::DataAction::GpuShadow,
+                .executed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                .avoidability =
+                    Common::PerformanceTelemetry::Avoidability::ProvenEliminable,
+                .correlation_status =
+                    Common::PerformanceTelemetry::CorrelationStatus::Complete,
+            });
+        Common::PerformanceTelemetry::RecordLogicalSignal(
+            Common::PerformanceTelemetry::LogicalSignalSample{
+                .signal_id = completion_trace.signal_id,
+                .candidate_id = candidate_seq,
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .packet_seq = pkt_seq,
+                .label_addr = label_addr,
+                .label_generation = label_generation,
+                .value = packet.DataDWord(),
+                .producer_tick = producer_tick,
+                .phase = Common::PerformanceTelemetry::LogicalSignalPhase::Created,
+                .action = Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+            });
+
+        texture_cache.PruneSupersededPendingDownloads(candidate.image_uid,
+                                                      candidate.resource_version - 1);
+
+        const u64 virt_seq = virtual_fence_seq;
+        const u64 prod_tk = producer_tick;
+        rasterizer->DeferGpuCompletion([virt_seq, prod_tk] {
+            VideoCore::GpuAuthorityTracker::Instance().SignalAsyncLabel(virt_seq, prod_tk);
+        });
+
+        Common::PerformanceTelemetry::RecordFastpathCandidate(Common::PerformanceTelemetry::FastpathCandidateSample{
+            .candidate_seq = candidate_seq,
+            .timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+            .title_id_hash = 0x01715u,
+            .producer_seq = candidate.producer_seq,
+            .producer_packet_seq = candidate.producer_packet_seq,
+            .producer_kind = static_cast<u32>(candidate.producer_kind),
+            .resource_id = candidate.image_uid,
+            .resource_version = candidate.resource_version,
+            .image_id = candidate.image_id.index,
+            .image_uid = candidate.image_uid,
+            .guest_addr = candidate.guest_addr,
+            .size = candidate.download_size,
+            .fence_seq = fence_seq,
+            .eos_packet_seq = pkt_seq,
+            .label_addr = label_addr,
+            .label_value = packet.DataDWord(),
+            .label_num_bytes = sizeof(u32),
+            .wait_packet_seq = 0,
+            .wait_compare = 0,
+            .wait_ref = 1,
+            .wait_mask = 0xFFFFFFFF,
+            .acquire_packet_seq = 0,
+            .acquire_raw_cntl = 0,
+            .eligibility = Common::PerformanceTelemetry::FastpathEligibility::Eligible,
+            .reject_reason = Common::PerformanceTelemetry::FastpathRejectReason::None,
+        });
+
+        Common::PerformanceTelemetry::RecordGpuAuthorityCreate(Common::PerformanceTelemetry::GpuAuthorityCreateSample{
+            .authority_seq = authority_seq,
+            .candidate_seq = candidate_seq,
+            .timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+            .resource_id = candidate.image_uid,
+            .resource_version = candidate.resource_version,
+            .image_id = candidate.image_id.index,
+            .image_uid = candidate.image_uid,
+            .guest_begin = candidate.guest_addr,
+            .guest_end = candidate.guest_addr + candidate.download_size,
+            .size = candidate.download_size,
+            .producer_seq = candidate.producer_seq,
+            .producer_packet_seq = candidate.producer_packet_seq,
+            .producer_tick = producer_tick,
+            .cmd_buffer_seq = cmd_buf_seq,
+            .submit_seq = submit_seq,
+            .fence_seq = fence_seq,
+            .virtual_fence_seq = virtual_fence_seq,
+            .label_addr = label_addr,
+            .label_generation = label_generation,
+        });
+
+        Common::PerformanceTelemetry::RecordVirtualFenceCreate(Common::PerformanceTelemetry::VirtualFenceCreateSample{
+            .virtual_fence_seq = virtual_fence_seq,
+            .authority_seq = authority_seq,
+            .fence_seq = fence_seq,
+            .label_addr = label_addr,
+            .label_generation = label_generation,
+            .expected_value = 1,
+            .producer_tick = producer_tick,
+            .producer_packet_seq = candidate.producer_packet_seq,
+            .eos_packet_seq = pkt_seq,
+            .wait_packet_seq = 0,
+            .acquire_packet_seq = 0,
+        });
+
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathCandidates);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathTaken);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::AuthorityCreated);
+        return true;
+    } else if (cand_opt) {
+        Common::PerformanceTelemetry::FastpathRejectReason rej = Common::PerformanceTelemetry::FastpathRejectReason::None;
+        if (!is_sig_fence) rej = Common::PerformanceTelemetry::FastpathRejectReason::EosInvalidCommand;
+        else if (!is_val_1) rej = Common::PerformanceTelemetry::FastpathRejectReason::EosInvalidValue;
+        else rej = Common::PerformanceTelemetry::FastpathRejectReason::LifetimeInvalid;
+
+        Common::PerformanceTelemetry::RecordFastpathCandidate(Common::PerformanceTelemetry::FastpathCandidateSample{
+            .candidate_seq = cand_opt->candidate_id,
+            .timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+            .title_id_hash = 0x01715u,
+            .producer_seq = cand_opt->producer_seq,
+            .producer_packet_seq = cand_opt->producer_packet_seq,
+            .producer_kind = static_cast<u32>(cand_opt->producer_kind),
+            .resource_id = cand_opt->image_uid,
+            .resource_version = cand_opt->resource_version,
+            .image_id = cand_opt->image_id.index,
+            .image_uid = cand_opt->image_uid,
+            .guest_addr = cand_opt->guest_addr,
+            .size = cand_opt->download_size,
+            .fence_seq = 0,
+            .eos_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+            .label_addr = label_addr,
+            .label_value = packet.DataDWord(),
+            .label_num_bytes = sizeof(u32),
+            .wait_packet_seq = 0,
+            .wait_compare = 0,
+            .wait_ref = 0,
+            .wait_mask = 0,
+            .acquire_packet_seq = 0,
+            .acquire_raw_cntl = 0,
+            .eligibility = Common::PerformanceTelemetry::FastpathEligibility::Rejected,
+            .reject_reason = rej,
+        });
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathCandidates);
+        Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::FastpathRejectedSignature);
+        const u64 reason_mask = !is_sig_fence
+                                    ? static_cast<u64>(Common::PerformanceTelemetry::
+                                                           CandidateRejectReason::
+                                                               AmbiguousEventSemantics)
+                                    : !is_val_1
+                                          ? static_cast<u64>(Common::PerformanceTelemetry::
+                                                                 CandidateRejectReason::
+                                                                     MultipleSignalConsumers)
+                                          : static_cast<u64>(Common::PerformanceTelemetry::
+                                                                 CandidateRejectReason::
+                                                                     PinOrLifetimeUnavailable);
+        Common::PerformanceTelemetry::RecordCandidateDecision(
+            Common::PerformanceTelemetry::CandidateDecisionSample{
+                .candidate_id = cand_opt->candidate_id,
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .reason_mask = reason_mask,
+                .proposed_data_action =
+                    Common::PerformanceTelemetry::DataAction::GpuShadow,
+                .proposed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::VirtualGpuWait,
+                .executed_data_action =
+                    Common::PerformanceTelemetry::DataAction::LegacyRequired,
+                .executed_signal_action =
+                    Common::PerformanceTelemetry::SignalAction::ForceHostCompletion,
+                .avoidability =
+                    Common::PerformanceTelemetry::Avoidability::ConservativeFallback,
+                .correlation_status =
+                    Common::PerformanceTelemetry::CorrelationStatus::Complete,
+            });
+        Common::PerformanceTelemetry::RecordCandidateTerminal(
+            Common::PerformanceTelemetry::CandidateTerminalSample{
+                .candidate_id = cand_opt->candidate_id,
+                .resource_uid = cand_opt->image_uid,
+                .resource_epoch = cand_opt->resource_version,
+                .alias_epoch = cand_opt->alias_epoch,
+                .created_timestamp_ns = cand_opt->created_timestamp_ns,
+                .terminal_timestamp_ns = Common::PerformanceTelemetry::Timestamp(),
+                .bytes_preserved = cand_opt->download_size,
+                .reason_mask = reason_mask,
+                .reason = Common::PerformanceTelemetry::CandidateTerminalReason::
+                    RejectedAtSchedule,
+            });
+    }
+    return false;
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& packet) {
@@ -1407,6 +1694,11 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
                  : 0),
         255);
     Common::PerformanceTelemetry::ScopedCausalContext completion_context{completion_trace};
+    const bool is_gow3 = (Common::ElfInfo::Instance().GameSerial() == "CUSA01715");
+    if (is_gow3 && rasterizer && TryPromoteGoW3Eos(packet, completion_trace)) {
+        return;
+    }
+
     Common::PerformanceTelemetry::FenceTraceToken fence_token{};
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
     if (Common::PerformanceTelemetry::HeavyEnabled() && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
@@ -1471,51 +1763,50 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
         }
     }
 #endif
-    VideoCore::FlushEpoch::AdvanceSync();
-    VideoCore::TextureCache::DownloadDrain drain{};
+    bool gpu_resident{};
+    bool has_writebacks = false;
     if (rasterizer) {
         Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
-        drain = rasterizer->ProcessDownloadImages(VideoCore::TextureCache::DownloadContext{
-            .scope_id = completion_trace.scope_id,
-            .cause_id = completion_trace.cause_id,
-            .signal_id = completion_trace.signal_id,
-            .hazard_id = completion_trace.hazard_id,
-            .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEos,
-            .fence_seq = fence_token.fence_seq,
-            .trigger_control = packet.event_control,
-            .trigger_data_control = packet.cmd_info,
-        });
+        has_writebacks = rasterizer->ProcessDownloadImages(
+            VideoCore::TextureCache::DownloadContext{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .hazard_id = completion_trace.hazard_id,
+                .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEos,
+                .fence_seq = fence_token.fence_seq,
+                .trigger_control = packet.event_control,
+                .trigger_data_control = packet.cmd_info,
+            },
+            &gpu_resident);
     }
     const u64 guest_copy_seq = GuestCopySeq();
-    if (packet.command == PM4CmdEventWriteEos::Command::GdsStore) {
-        if (packet.size != 1) [[unlikely]] {
-            GraphicsPacketAssertionFailed();
-        }
-        CompleteGuestReads(guest_copy_seq);
-        if (rasterizer) {
-            // The value lands when the GPU gets there; signals after it wait for it.
-            rasterizer->StoreGdsAsync(packet.Address<VAddr>(), packet.gds_index);
-        }
-        return;
-    }
-    if (rasterizer && packet.command == PM4CmdEventWriteEos::Command::SignalFence &&
-        (drain.drained != 0 ||
-         VideoCore::GpuAuthorityTracker::Instance().MustOrderSignals())) {
+    if (has_writebacks && packet.command == PM4CmdEventWriteEos::Command::SignalFence) {
         auto* completion_rasterizer = rasterizer;
-        PublishCompletionSignal(
-            packet.Address<VAddr>(), sizeof(u32), packet.DataDWord(), true,
-            [packet, completion_rasterizer, fence_token, completion_trace,
-             guest_copy_seq](bool write_label) {
-                CompleteGuestReads(guest_copy_seq);
-                if (write_label) {
-                    SignalEventWriteEos(packet, completion_rasterizer, fence_token,
-                                        completion_trace);
-                }
-            });
+        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
+                                        completion_trace, guest_copy_seq] {
+            CompleteGuestReads(guest_copy_seq);
+            SignalEventWriteEos(packet, completion_rasterizer, fence_token, completion_trace);
+        });
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
     CompleteGuestReads(guest_copy_seq);
     SignalEventWriteEos(packet, rasterizer, fence_token, completion_trace);
+    if (packet.command == PM4CmdEventWriteEos::Command::GdsStore) {
+        if (packet.size != 1) [[unlikely]] {
+            GraphicsPacketAssertionFailed();
+        }
+        if (rasterizer) {
+            rasterizer->Finish();
+            const u32 value = rasterizer->ReadDataFromGds(packet.gds_index);
+            *packet.Address() = value;
+            rasterizer->NotifyMemoryWrite(std::bit_cast<VAddr>(packet.Address<void*>()),
+                                          sizeof(value),
+                                          VideoCore::MemoryWriteSource::CommandProcessor);
+        }
+    }
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& packet) {
@@ -1653,42 +1944,31 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
         }
     }
 #endif
-    VideoCore::FlushEpoch::AdvanceSync();
-    VideoCore::TextureCache::DownloadDrain drain{};
+    bool has_writebacks = false;
     if (rasterizer) {
         Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
-        drain = rasterizer->ProcessDownloadImages(VideoCore::TextureCache::DownloadContext{
-            .scope_id = completion_trace.scope_id,
-            .cause_id = completion_trace.cause_id,
-            .signal_id = completion_trace.signal_id,
-            .hazard_id = completion_trace.hazard_id,
-            .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEop,
-            .fence_seq = fence_token.fence_seq,
-            .trigger_control = packet.event_control,
-            .trigger_data_control = packet.data_control,
-        });
+        has_writebacks = rasterizer->ProcessDownloadImages(
+            VideoCore::TextureCache::DownloadContext{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .hazard_id = completion_trace.hazard_id,
+                .trigger = VideoCore::TextureCache::DownloadTrigger::EventWriteEop,
+                .fence_seq = fence_token.fence_seq,
+                .trigger_control = packet.event_control,
+                .trigger_data_control = packet.data_control,
+            });
     }
     const u64 guest_copy_seq = GuestCopySeq();
-    if (rasterizer &&
-        (drain.drained != 0 || VideoCore::GpuAuthorityTracker::Instance().MustOrderSignals())) {
-        const auto data_sel = packet.data_sel.Value();
-        const u64 label_size = data_sel == DataSelect::None        ? 0
-                               : data_sel == DataSelect::Data32Low ? sizeof(u32)
-                                                                   : sizeof(u64);
-        const bool value_known =
-            data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64;
-        const u64 label_value =
-            data_sel == DataSelect::Data32Low ? packet.DataDWord() : packet.DataQWord();
+    if (has_writebacks) {
         auto* completion_rasterizer = rasterizer;
-        PublishCompletionSignal(
-            reinterpret_cast<VAddr>(packet.Address<void>()), label_size, label_value,
-            value_known,
-            [packet, completion_rasterizer, fence_token, completion_trace,
-             guest_copy_seq](bool write_label) {
-                CompleteGuestReads(guest_copy_seq);
-                SignalEventWriteEop(packet, completion_rasterizer, fence_token, completion_trace,
-                                    write_label);
-            });
+        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, fence_token,
+                                        completion_trace, guest_copy_seq] {
+            CompleteGuestReads(guest_copy_seq);
+            SignalEventWriteEop(packet, completion_rasterizer, fence_token, completion_trace);
+        });
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
         return;
     }
     CompleteGuestReads(guest_copy_seq);
@@ -1853,10 +2133,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     });
                 }
 #endif
-            }
-            if (passed_wait_seq[GfxQueueId] != 0 &&
-                !IsOrderedAfterPassedWait(opcode, header)) [[unlikely]] {
-                RESOLVE_PASSED_WAIT(GfxQueueId, YIELD_GFX());
             }
             const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
             switch (opcode) {
@@ -2428,6 +2704,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    if (!mem_semaphore->Signaled()) {
+                        FlushPendingGpuCompletionsForWait();
+                    }
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
                     }
@@ -2536,6 +2815,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                if (!rewind->Valid()) {
+                    FlushPendingGpuCompletionsForWait();
+                }
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
@@ -2621,97 +2903,174 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
-                VideoCore::FlushEpoch::AdvanceSync();
                 if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
                     const u32* poll_address = wait_reg_mem->Address<const u32*>();
-                    [[maybe_unused]] const VAddr wait_addr = reinterpret_cast<VAddr>(poll_address);
-                    Common::PerformanceTelemetry::ScopedSemanticReadOrigin wait_origin{
-                        Common::PerformanceTelemetry::SemanticReadOrigin::WaitRegMemPoll,
-                        matched_fence_seq, 0, 0, 0};
-#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                    wait_location = reinterpret_cast<u64>(poll_address);
-#endif
-                    bool already_satisfied = test_value(*poll_address);
-                    if (!already_satisfied &&
-                        VideoCore::GpuAuthorityTracker::Instance().TryPublishReady(
-                            Common::PerformanceTelemetry::Counter::SignalsPublishedAtWait)) {
-                        // Signals queued behind readbacks that committed meanwhile. On the
-                        // console the wait passes once the label is in memory, which is now.
-                        already_satisfied = test_value(*poll_address);
-                    }
-                    if (!already_satisfied && rasterizer) {
-                        // The label comes from a signal recorded already: the GPU orders what
-                        // follows, and only what the guest CPU could see has to wait for it.
-                        const auto queued =
-                            VideoCore::GpuAuthorityTracker::Instance().FindQueuedLabel(wait_addr);
-                        if (queued && test_value(queued->value)) {
-                            PassWaitOnGpu(GfxQueueId, queued->seq);
-                            already_satisfied = true;
-                        }
-                    }
-                    bool progress_submit_done = false;
-                    if (!already_satisfied) {
-                        wait_required_host_block = true;
-                        {
-                            Common::PerformanceTelemetry::ScopedCausalContext wait_context{
-                                wait_trace};
-                            if (rasterizer) {
-                                rasterizer->Flush(
-                                    Common::PerformanceTelemetry::SubmitReason::WaitProgress);
-                                progress_submit_done = true;
-                            }
-                        }
-                    }
-                    if (!already_satisfied &&
-                        vo_port->IsVoLabel(reinterpret_cast<const u64*>(poll_address)) &&
-                        num_submits == mapped_queues[GfxQueueId].submits.size()) {
-#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                        used_vo_sleep = true;
-                        vo_port->WaitVoLabel([&] {
-                            Common::PerformanceTelemetry::ScopedSemanticReadOrigin vo_origin{
-                                Common::PerformanceTelemetry::SemanticReadOrigin::WaitRegMemPoll,
-                                matched_fence_seq, 0, 0, 0};
-                            const bool passed = test_value(*poll_address);
-                            failed_tests += !passed;
-                            return passed;
-                        });
-#else
-                        vo_port->WaitVoLabel([&] { return test_value(*poll_address); });
-#endif
-                    } else if (!already_satisfied) {
-                        WAIT_MEMORY(GfxQueueId, poll_address, test_value(*poll_address),
-                                    YIELD_GFX());
-                    }
-                    if (!already_satisfied) {
-                        Common::PerformanceTelemetry::Add(
-                            Common::PerformanceTelemetry::Counter::WaitRegMemSpins, failed_tests);
-                        Common::PerformanceTelemetry::Add(
-                            Common::PerformanceTelemetry::Counter::WaitRegMemSpinNs,
-                            Common::PerformanceTelemetry::Timestamp() - wait_spin_start);
-                    }
-#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
-                    if (telemetry_detail) {
-                        const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
-                        Common::PerformanceTelemetry::RecordCpuToGpuLabelWait(
-                            Common::PerformanceTelemetry::CpuToGpuLabelWaitSample{
+                    const VAddr wait_addr = reinterpret_cast<VAddr>(poll_address);
+                    auto virt_fence = VideoCore::GpuAuthorityTracker::Instance().MatchVirtualWait(
+                        wait_addr, reference, mask, static_cast<u32>(function),
+                        Common::PerformanceTelemetry::CurrentPacketSeq(), wait_seq);
+                    if (virt_fence != nullptr) {
+                        const u64 cur_tk = rasterizer ? rasterizer->CurrentTick() : 0;
+                        const u64 completed_tk = rasterizer ? rasterizer->KnownGpuTick() : 0;
+                        const bool needs_progress_submit =
+                            rasterizer && virt_fence->producer_tick >= cur_tk;
+                        const u8 tick_comp = completed_tk >= virt_fence->producer_tick ? 1 : 0;
+                        Common::PerformanceTelemetry::RecordFastpathWaitDecision(
+                            Common::PerformanceTelemetry::FastpathWaitDecisionSample{
+                                .candidate_seq = 0,
+                                .virtual_fence_seq = virt_fence->virtual_fence_seq,
+                                .authority_seq = virt_fence->authority_seq,
                                 .wait_seq = wait_seq,
-                                .frame_id = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                                .wait_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
                                 .label_addr = wait_addr,
+                                .label_generation = virt_fence->label_generation,
                                 .ref = reference,
                                 .mask = mask,
-                                .wait_begin = wait_spin_start,
-                                .wait_end = wait_end_ts,
-                                .duration_ns = wait_end_ts - wait_spin_start,
-                                .last_guest_write_ts = 0,
-                                .last_guest_write_value = 0,
-                                .writer_thread_id = 0,
-                                .delta_write_to_wait_complete_ns = 0,
-                                .yield_count = static_cast<u32>(failed_tests),
-                                .wait_progress_submit_count = progress_submit_done ? 1u : 0u,
-                                .gpu_idle_overlap_ns = 0,
+                                .compare = static_cast<u32>(function),
+                                .producer_tick = virt_fence->producer_tick,
+                                .current_tick = cur_tk,
+                                .decision = Common::PerformanceTelemetry::FastpathWaitDecision::Virtualized,
+                                .reason = 0,
                             });
-                    }
+                        Common::PerformanceTelemetry::RecordVirtualWaitConsume(
+                            Common::PerformanceTelemetry::VirtualWaitConsumeSample{
+                                .virtual_fence_seq = virt_fence->virtual_fence_seq,
+                                .authority_seq = virt_fence->authority_seq,
+                                .wait_seq = wait_seq,
+                                .wait_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+                                .label_addr = wait_addr,
+                                .label_generation = virt_fence->label_generation,
+                                .producer_tick = virt_fence->producer_tick,
+                                .producer_tick_complete_at_consume = tick_comp,
+                                .result = Common::PerformanceTelemetry::VirtualWaitResult::Virtualized,
+                            });
+                        Common::PerformanceTelemetry::Add(
+                            Common::PerformanceTelemetry::Counter::VirtualWaitConsumed);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                        if (telemetry_detail) {
+                            const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
+                            Common::PerformanceTelemetry::RecordWaitComplete(
+                                Common::PerformanceTelemetry::WaitCompleteSample{
+                                    .wait_seq = wait_seq,
+                                    .fence_seq = matched_fence_seq,
+                                    .start_timestamp = wait_spin_start,
+                                    .end_timestamp = wait_end_ts,
+                                    .duration_ns = 0,
+                                    .spin_iterations = 0,
+                                    .yield_count = 0,
+                                    .exit_reason = 0u,
+                                    .value_at_begin = val_begin,
+                                    .value_at_end = val_begin,
+                                    .gpu_completed_tick_begin = 0,
+                                    .gpu_completed_tick_end = 0,
+                                    .shadow_fence_seq = shadow_fence_seq,
+                                });
+                        }
 #endif
+                        if (needs_progress_submit) {
+                            Common::PerformanceTelemetry::ScopedCausalContext wait_context{
+                                wait_trace};
+                            rasterizer->Flush(
+                                Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+                        }
+                        RecordWaitEffect(wait_trace, wait_seq, 0, true,
+                                         wait_producer_correlated);
+                        break;
+                    } else {
+                        Common::PerformanceTelemetry::RecordFastpathWaitDecision(
+                            Common::PerformanceTelemetry::FastpathWaitDecisionSample{
+                                .candidate_seq = 0,
+                                .virtual_fence_seq = 0,
+                                .authority_seq = 0,
+                                .wait_seq = wait_seq,
+                                .wait_packet_seq = Common::PerformanceTelemetry::CurrentPacketSeq(),
+                                .label_addr = wait_addr,
+                                .label_generation = 0,
+                                .ref = reference,
+                                .mask = mask,
+                                .compare = static_cast<u32>(function),
+                                .producer_tick = 0,
+                                .current_tick = rasterizer ? rasterizer->CurrentTick() : 0,
+                                .decision = Common::PerformanceTelemetry::FastpathWaitDecision::Legacy,
+                                .reason = 0,
+                            });
+                        Common::PerformanceTelemetry::ScopedSemanticReadOrigin wait_origin{
+                            Common::PerformanceTelemetry::SemanticReadOrigin::WaitRegMemPoll,
+                            matched_fence_seq, 0, 0, 0};
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                        wait_location = reinterpret_cast<u64>(poll_address);
+#endif
+                        const bool already_satisfied = test_value(*poll_address);
+                        const bool gpu_fence_bypass =
+                            !already_satisfied &&
+                            TryBypassGpuCompletionWait(
+                                GfxQueueId, reinterpret_cast<VAddr>(poll_address),
+                                static_cast<u32>(function), mask, reference);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                        failed_tests += gpu_fence_bypass;
+#endif
+                        bool progress_submit_done = false;
+                        if (!already_satisfied && !gpu_fence_bypass) {
+                            wait_required_host_block = true;
+                            {
+                                Common::PerformanceTelemetry::ScopedCausalContext wait_context{
+                                    wait_trace};
+                                FlushPendingGpuCompletionsForWait();
+                                if (rasterizer) {
+                                    rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::
+                                                          WaitProgress);
+                                    progress_submit_done = true;
+                                }
+                            }
+                        }
+                        if (!already_satisfied && !gpu_fence_bypass &&
+                            vo_port->IsVoLabel(reinterpret_cast<const u64*>(poll_address)) &&
+                            num_submits == mapped_queues[GfxQueueId].submits.size()) {
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                            used_vo_sleep = true;
+                            vo_port->WaitVoLabel([&] {
+                                Common::PerformanceTelemetry::ScopedSemanticReadOrigin vo_origin{
+                                    Common::PerformanceTelemetry::SemanticReadOrigin::WaitRegMemPoll,
+                                    matched_fence_seq, 0, 0, 0};
+                                const bool passed = test_value(*poll_address);
+                                failed_tests += !passed;
+                                return passed;
+                            });
+#else
+                            vo_port->WaitVoLabel([&] { return test_value(*poll_address); });
+#endif
+                        } else if (!already_satisfied && !gpu_fence_bypass) {
+                            WAIT_MEMORY(GfxQueueId, poll_address, test_value(*poll_address), YIELD_GFX());
+                        }
+                        if (!already_satisfied) {
+                            Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WaitRegMemSpins, failed_tests);
+                            Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WaitRegMemSpinNs,
+                                                              Common::PerformanceTelemetry::Timestamp() - wait_spin_start);
+                        }
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                        if (telemetry_detail) {
+                            const u64 wait_end_ts = Common::PerformanceTelemetry::Timestamp();
+                            Common::PerformanceTelemetry::RecordCpuToGpuLabelWait(
+                                Common::PerformanceTelemetry::CpuToGpuLabelWaitSample{
+                                    .wait_seq = wait_seq,
+                                    .frame_id = Common::PerformanceTelemetry::CurrentFrameSeq(),
+                                    .label_addr = wait_addr,
+                                    .ref = reference,
+                                    .mask = mask,
+                                    .wait_begin = wait_spin_start,
+                                    .wait_end = wait_end_ts,
+                                    .duration_ns = wait_end_ts - wait_spin_start,
+                                    .last_guest_write_ts = 0,
+                                    .last_guest_write_value = 0,
+                                    .writer_thread_id = 0,
+                                    .delta_write_to_wait_complete_ns = 0,
+                                    .yield_count = static_cast<u32>(failed_tests),
+                                    .wait_progress_submit_count = progress_submit_done ? 1u : 0u,
+                                    .gpu_idle_overlap_ns = 0,
+                                });
+                        }
+#endif
+                    }
                 } else {
                     const u32 register_index = wait_reg_mem->Reg();
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -2719,6 +3078,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
                     if (!test_value(regs.reg_array[register_index])) {
                         wait_required_host_block = true;
+                        Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
+                        FlushPendingGpuCompletionsForWait();
                     }
                     while (!test_value(regs.reg_array[register_index])) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
@@ -2999,51 +3360,38 @@ SHAD_NO_INLINE void Liverpool::ProcessComputeReleaseMem(
     }
 #endif
     const auto data_sel = release_mem->data_sel.Value();
-    VideoCore::FlushEpoch::AdvanceSync();
-    VideoCore::TextureCache::DownloadDrain drain{};
+    bool has_writebacks = false;
     if (rasterizer) {
         Common::PerformanceTelemetry::ScopedFenceCause cause{fence_token};
-        drain = rasterizer->ProcessDownloadImages(VideoCore::TextureCache::DownloadContext{
-            .scope_id = completion_trace.scope_id,
-            .cause_id = completion_trace.cause_id,
-            .signal_id = completion_trace.signal_id,
-            .hazard_id = completion_trace.hazard_id,
-            .trigger = VideoCore::TextureCache::DownloadTrigger::ReleaseMem,
-            .fence_seq = fence_token.fence_seq,
-            .trigger_control = release_mem->dw1,
-            .trigger_data_control = release_mem->dw2,
-        });
+        has_writebacks = rasterizer->ProcessDownloadImages(
+            VideoCore::TextureCache::DownloadContext{
+                .scope_id = completion_trace.scope_id,
+                .cause_id = completion_trace.cause_id,
+                .signal_id = completion_trace.signal_id,
+                .hazard_id = completion_trace.hazard_id,
+                .trigger = VideoCore::TextureCache::DownloadTrigger::ReleaseMem,
+                .fence_seq = fence_token.fence_seq,
+                .trigger_control = release_mem->dw1,
+                .trigger_data_control = release_mem->dw2,
+            });
     }
     const u64 guest_copy_seq = GuestCopySeq();
-    // A GDS store records a GPU copy, which only the command processor can do.
-    if (rasterizer && data_sel != DataSelect::GdsMemStore &&
-        (drain.drained != 0 || VideoCore::GpuAuthorityTracker::Instance().MustOrderSignals())) {
+    if (has_writebacks && data_sel != DataSelect::GdsMemStore) {
         const PM4CmdReleaseMem packet = *release_mem;
         auto* completion_rasterizer = rasterizer;
         const u32 pipe_id = *queue_pipe_id;
-        const u64 label_size = data_sel == DataSelect::None        ? 0
-                               : data_sel == DataSelect::Data32Low ? sizeof(u32)
-                                                                   : sizeof(u64);
-        const bool value_known =
-            data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64;
-        const u64 label_value =
-            data_sel == DataSelect::Data32Low ? packet.DataDWord() : packet.DataQWord();
-        const bool queued = PublishCompletionSignal(
-            packet.Address<VAddr>(), label_size, label_value, value_known,
-            [packet, completion_rasterizer, pipe_id, fence_token, completion_trace,
-             guest_copy_seq](bool write_label) {
-                CompleteGuestReads(guest_copy_seq);
-                SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token,
-                                 completion_trace, write_label);
-            });
-        if (queued && drain.eager != 0) {
-            // Compute queues often wait for their own release right after it, and its readbacks
-            // commit only once the GPU gets there. A release queued behind older work only is
-            // submitted along with that work.
-            Common::PerformanceTelemetry::Add(
-                Common::PerformanceTelemetry::Counter::WritebackFlushes);
-            rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WritebackReleaseMem);
-        }
+        rasterizer->DeferGpuCompletion([packet, completion_rasterizer, pipe_id, fence_token,
+                                        completion_trace, guest_copy_seq] {
+            CompleteGuestReads(guest_copy_seq);
+            SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token,
+                             completion_trace);
+        });
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
+        Common::PerformanceTelemetry::Add(
+            Common::PerformanceTelemetry::Counter::WritebackFlushes);
+        rasterizer->Flush(
+            Common::PerformanceTelemetry::SubmitReason::WritebackReleaseMem);
     } else {
         CompleteGuestReads(guest_copy_seq);
         SignalReleaseMem(*release_mem, rasterizer, *queue_pipe_id, fence_token,
@@ -3142,10 +3490,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #endif
         }
 
-        if (passed_wait_seq[vqid + 1] != 0 &&
-            !IsOrderedAfterPassedWait(opcode, header)) [[unlikely]] {
-            RESOLVE_PASSED_WAIT(vqid + 1, YIELD_ASC(vqid));
-        }
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -3326,6 +3670,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            if (!rewind->Valid()) {
+                FlushPendingGpuCompletionsForWait();
+            }
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -3438,6 +3785,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                if (!mem_semaphore->Signaled()) {
+                    FlushPendingGpuCompletionsForWait();
+                }
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -3522,7 +3872,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                 last_wait_seq = wait_seq;
             }
 #endif
-            VideoCore::FlushEpoch::AdvanceSync();
             if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
                 Common::PerformanceTelemetry::ScopedSemanticReadOrigin wait_origin{
                     Common::PerformanceTelemetry::SemanticReadOrigin::WaitRegMemPoll,
@@ -3531,24 +3880,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
                 wait_location = reinterpret_cast<u64>(poll_address);
 #endif
-                bool already_satisfied = test_value(*poll_address);
-                if (!already_satisfied &&
-                    VideoCore::GpuAuthorityTracker::Instance().TryPublishReady(
-                        Common::PerformanceTelemetry::Counter::SignalsPublishedAtWait)) {
-                    already_satisfied = test_value(*poll_address);
-                }
-                if (!already_satisfied && rasterizer) {
-                    const auto queued = VideoCore::GpuAuthorityTracker::Instance().FindQueuedLabel(
-                        reinterpret_cast<VAddr>(poll_address));
-                    if (queued && test_value(queued->value)) {
-                        PassWaitOnGpu(vqid + 1, queued->seq);
-                        already_satisfied = true;
-                    }
-                }
-                if (!already_satisfied) {
+                const bool already_satisfied = test_value(*poll_address);
+                const bool gpu_fence_bypass =
+                    !already_satisfied &&
+                    TryBypassGpuCompletionWait(vqid + 1, reinterpret_cast<VAddr>(poll_address),
+                                               static_cast<u32>(function), mask, reference);
+#ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY
+                failed_tests += gpu_fence_bypass;
+#endif
+                if (!already_satisfied && !gpu_fence_bypass) {
                     wait_required_host_block = true;
                     {
                         Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
+                        FlushPendingGpuCompletionsForWait();
                         if (rasterizer) {
                             rasterizer->Flush(
                                 Common::PerformanceTelemetry::SubmitReason::WaitProgress);
@@ -3564,6 +3908,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #endif
                 if (!test_value(regs.reg_array[register_index])) {
                     wait_required_host_block = true;
+                    Common::PerformanceTelemetry::ScopedCausalContext wait_context{wait_trace};
+                    FlushPendingGpuCompletionsForWait();
                 }
                 while (!test_value(regs.reg_array[register_index])) {
 #ifdef SHADPS4_ENABLE_DETAILED_TELEMETRY

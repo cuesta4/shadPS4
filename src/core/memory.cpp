@@ -23,7 +23,6 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
-#include "video_core/gpu_authority_tracker.h"
 #include "video_core/guest_copy_engine.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -610,9 +609,6 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     // Deferred staging copies of this range must read the old bytes. Wait before taking the
     // mapping lock: copy workers need it in shared mode.
     VideoCore::GuestCopyEngine::Instance().WaitForGuestWrite(virtual_addr, size);
-    // The write bypasses the page protection of GPU authorities; their older bytes must not
-    // land on top of it later. Before the mapping lock, like any wait on a materialization.
-    VideoCore::GpuAuthorityTracker::Instance().HandleBackingWrite(virtual_addr, size);
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);

@@ -161,14 +161,8 @@ public:
 
     [[nodiscard]] const StreamCopyResult& GetStreamCopyResult(u16 index) const;
 
-    /// Reads guest memory for an upload without faulting on pages protected for GPU
-    /// authorities.
-    void CopyGuestMemory(VAddr source, u8* destination, u64 size);
-
-    /// Attempts to obtain a buffer without modifying the cache contents. A GPU authority shadow
-    /// is used directly when its bytes start offset_alignment-aligned in the download buffer.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size,
-                                                               u32 offset_alignment = 16);
+    /// Attempts to obtain a buffer without modifying the cache contents.
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
 
     /// Protected copy resolver of the guest copy engine. Writes the parts of op that GPU
     /// authority shadows hold into op.dst_buffer with GPU copies, so the command processor

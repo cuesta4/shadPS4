@@ -259,15 +259,8 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
-        const bool is_write = Common::IsWriteError(context);
-        // Pages next to GPU authorities: the tracker emulates accesses that miss the authority
-        // bytes, and makes RAM current otherwise.
-        bool authority_page = false;
-        if (VideoCore::GpuAuthorityTracker::Instance().HandleCpuAccess(addr, context, is_write,
-                                                                       authority_page)) {
-            return true;
-        }
-        if (is_write) {
+        if (Common::IsWriteError(context)) {
+            VideoCore::GpuAuthorityTracker::Instance().HandleCpuWrite(addr, 8);
             const bool handled_write = rasterizer->InvalidateMemory(addr, 8);
             // After handling write-watchers, check if the page still has
             // semantic read-watchers. If so, disarm them to prevent a
@@ -304,16 +297,12 @@ struct PageManager::Impl {
             }
             return true;
         } else {
-            if (authority_page && !HasReadWatcherStatic(addr)) {
+            if (VideoCore::GpuAuthorityTracker::Instance().HandleCpuRead(addr, 8)) {
                 return true;
             }
             return rasterizer->ReadMemory(addr, 8, context);
         }
         return false;
-    }
-
-    static bool HasReadWatcherStatic(VAddr address) {
-        return rasterizer->GetPageManager().HasReadWatcher(address);
     }
 #endif
 
@@ -743,13 +732,6 @@ struct PageManager::Impl {
         return cached_pages[page].num_read_watchers > 0;
     }
 
-    u32 ReadWatchCount(VAddr address) const {
-        const size_t page = address >> PM_PAGE_BITS;
-        std::scoped_lock lock{read_watch_mutex};
-        const auto it = read_watch_refcounts.find(page);
-        return it != read_watch_refcounts.end() ? it->second : 0;
-    }
-
     void TemporarilyUnprotect(VAddr address, u64 size) {
         const size_t page = address >> PM_PAGE_BITS;
         const VAddr page_addr = page << PM_PAGE_BITS;
@@ -816,10 +798,6 @@ bool PageManager::HasReadWatcher(VAddr address) const {
 
 bool PageManager::HasReadWatchers(VAddr address, u64 size) const noexcept {
     return impl->HasReadWatchers(address, size);
-}
-
-u32 PageManager::ReadWatchCount(VAddr address) const {
-    return impl->ReadWatchCount(address);
 }
 
 void PageManager::TemporarilyUnprotect(VAddr address, u64 size) const {
