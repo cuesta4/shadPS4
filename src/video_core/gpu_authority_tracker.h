@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -153,6 +154,10 @@ struct SignalPublication {
     /// Label bytes the publication writes, empty when it only raises an interrupt.
     VAddr label_addr{};
     u64 label_size{};
+    /// Value the label receives, when the command processor knows it in advance (not a
+    /// timestamp or a GDS store).
+    u64 label_value{};
+    bool value_known{};
     /// Publishes the signal. The argument is false when the label lies in memory that was
     /// unmapped in the meantime; the interrupt is still raised.
     Common::UniqueFunction<void, bool> publish;
@@ -290,13 +295,47 @@ public:
     /// Publication timeline. Eager readbacks commit guest RAM when the GPU completes; a signal
     /// that follows one of them in program order must not become visible before that commit.
     /// With orders_all_signals, every signal follows the write until it lands, also the ones
-    /// of scopes without readbacks.
-    [[nodiscard]] u64 BeginEagerWriteback(bool orders_all_signals = false);
+    /// of scopes without readbacks. With gpu_ordered, GPU consumers of the range read the
+    /// producing image instead of guest RAM until the commit (BufferCache::TrackImageReadback),
+    /// so GPU work does not need the commit to have landed.
+    [[nodiscard]] u64 BeginEagerWriteback(bool orders_all_signals = false,
+                                          bool gpu_ordered = false);
     void CompleteEagerWriteback(u64 seq);
 
-    /// True while a write that every signal has to follow is pending.
+    /// True while every signal has to follow the timeline: a write that all of them have to
+    /// follow is pending, or the command processor passed a wait on a signal still queued.
     [[nodiscard]] bool MustOrderSignals() const noexcept {
-        return ordering_items.load(std::memory_order_acquire) != 0;
+        return ordering_items.load(std::memory_order_acquire) != 0 || IsVirtualWaitPending();
+    }
+
+    /// A queued signal that writes a dword a WAIT_REG_MEM polls.
+    struct QueuedLabel {
+        u64 seq{};
+        u32 value{};
+    };
+
+    /// Finds the value the latest queued signal writes to the dword at addr, when the command
+    /// processor can pass a wait on it without waiting for the GPU: the value is known and
+    /// everything the signal follows reaches GPU consumers without the command processor
+    /// (direct or GPU-ordered readbacks). Command processor.
+    [[nodiscard]] std::optional<QueuedLabel> FindQueuedLabel(VAddr addr);
+
+    /// The command processor passed a wait that the queued signal seq satisfies, without
+    /// waiting for it. On the GPU, the barrier it records orders the work behind the wait;
+    /// towards the guest CPU, everything the command processor makes visible afterwards
+    /// follows the signal until it is published (MustOrderSignals, and the packets that wait
+    /// for it, see Liverpool).
+    void BeginVirtualWait(u64 seq) noexcept;
+
+    /// True once the timeline item seq was published or committed.
+    [[nodiscard]] bool IsPublished(u64 seq) const noexcept {
+        return published_seq.load(std::memory_order_acquire) >= seq;
+    }
+
+    /// True while a signal a wait was passed on is not published yet.
+    [[nodiscard]] bool IsVirtualWaitPending() const noexcept {
+        return published_seq.load(std::memory_order_acquire) <
+               virtual_wait_seq.load(std::memory_order_acquire);
     }
 
     /// Publishes the signal now when nothing it has to follow is pending, or queues it behind
@@ -327,9 +366,12 @@ private:
         bool is_writeback{};
         bool done{};
         bool orders_all{};
+        bool gpu_ordered{};
         bool write_label{true};
+        bool value_known{};
         VAddr label_addr{};
         u64 label_size{};
+        u64 label_value{};
         Common::UniqueFunction<void, bool> publish;
     };
 
@@ -367,6 +409,10 @@ private:
     std::atomic<u32> timeline_items{0};
     std::atomic<u32> ordering_items{0};
     u64 next_timeline_seq{1};
+    /// Sequence of the last item that left the timeline, published or committed.
+    std::atomic<u64> published_seq{0};
+    /// Sequence of the latest signal a wait was passed on.
+    std::atomic<u64> virtual_wait_seq{0};
 };
 
 } // namespace VideoCore

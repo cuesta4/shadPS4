@@ -155,8 +155,6 @@ private:
                          vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access);
     /// Global barrier for accesses resource tracking cannot see, through device addresses.
     void EmitPendingGlobalBarrier();
-    /// Submits the recorded work when the GPU ran out of it.
-    void MaybeKickGpu();
     void BindPipelineResources(const Pipeline* pipeline);
     void CaptureDescriptorState(const Pipeline* pipeline);
     void MarkImageWrites(Common::PerformanceTelemetry::ImageWriter writer,
@@ -354,11 +352,6 @@ private:
     /// A pipeline that accesses memory through device addresses ran since the last global
     /// barrier.
     bool dma_access_pending{};
-
-    /// Draws and dispatches recorded into the command buffer of kick_tick.
-    u32 kick_work{};
-    u32 kick_polls{};
-    u64 kick_tick{};
 };
 
 } // namespace Vulkan

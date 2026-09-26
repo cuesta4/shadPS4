@@ -1123,11 +1123,15 @@ void GpuAuthorityTracker::NoteFalseSharing(VAddr page) {
     }
 }
 
-u64 GpuAuthorityTracker::BeginEagerWriteback(bool orders_all_signals) {
+u64 GpuAuthorityTracker::BeginEagerWriteback(bool orders_all_signals, bool gpu_ordered) {
     std::scoped_lock lock{timeline_mutex};
     const u64 seq = next_timeline_seq++;
-    timeline.push_back(
-        TimelineItem{.seq = seq, .is_writeback = true, .orders_all = orders_all_signals});
+    timeline.push_back(TimelineItem{
+        .seq = seq,
+        .is_writeback = true,
+        .orders_all = orders_all_signals,
+        .gpu_ordered = gpu_ordered,
+    });
     timeline_items.fetch_add(1, std::memory_order_release);
     if (orders_all_signals) {
         ordering_items.fetch_add(1, std::memory_order_release);
@@ -1164,6 +1168,7 @@ void GpuAuthorityTracker::DrainTimelineLocked(Common::PerformanceTelemetry::Coun
                 if (!front.done) {
                     return;
                 }
+                published_seq.store(front.seq, std::memory_order_release);
                 timeline.pop_front();
                 timeline_items.fetch_sub(1, std::memory_order_release);
                 continue;
@@ -1173,6 +1178,8 @@ void GpuAuthorityTracker::DrainTimelineLocked(Common::PerformanceTelemetry::Coun
             timeline_items.fetch_sub(1, std::memory_order_release);
         }
         item.publish(static_cast<bool>(item.write_label));
+        // Items leave in order, one drain at a time (publish mutex).
+        published_seq.store(item.seq, std::memory_order_release);
         Common::PerformanceTelemetry::Add(counter);
     }
 }
@@ -1193,13 +1200,58 @@ bool GpuAuthorityTracker::PublishSignal(SignalPublication&& signal) {
     std::scoped_lock lock{timeline_mutex};
     timeline.push_back(TimelineItem{
         .seq = next_timeline_seq++,
+        .value_known = signal.value_known,
         .label_addr = signal.label_addr,
         .label_size = signal.label_size,
+        .label_value = signal.label_value,
         .publish = std::move(signal.publish),
     });
     timeline_items.fetch_add(1, std::memory_order_release);
     Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::SignalsQueued);
     return true;
+}
+
+std::optional<GpuAuthorityTracker::QueuedLabel> GpuAuthorityTracker::FindQueuedLabel(
+    VAddr addr) {
+    if (!HasQueuedWork()) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{timeline_mutex};
+    // The latest queued signal decides the value the dword ends up with.
+    auto match = timeline.rbegin();
+    for (; match != timeline.rend(); ++match) {
+        if (!match->is_writeback && match->write_label && match->label_size != 0 &&
+            addr >= match->label_addr &&
+            addr - match->label_addr + sizeof(u32) <= match->label_size) {
+            break;
+        }
+    }
+    if (match == timeline.rend() || !match->value_known) {
+        return std::nullopt;
+    }
+    // GPU work behind the wait may consume what the signal follows. That is fine once it no
+    // longer depends on guest RAM: direct authorities are served from their image, and
+    // GPU-ordered readbacks too. A commit other GPU work reads from RAM, such as a GDS store,
+    // needs the wait.
+    for (auto it = std::next(match); it != timeline.rend(); ++it) {
+        if (it->is_writeback && !it->done && (it->orders_all || !it->gpu_ordered)) {
+            return std::nullopt;
+        }
+    }
+    const u64 shift = (addr - match->label_addr) * 8;
+    return QueuedLabel{
+        .seq = match->seq,
+        .value = static_cast<u32>(match->label_value >> shift),
+    };
+}
+
+void GpuAuthorityTracker::BeginVirtualWait(u64 seq) noexcept {
+    u64 current = virtual_wait_seq.load(std::memory_order_relaxed);
+    while (current < seq &&
+           !virtual_wait_seq.compare_exchange_weak(current, seq, std::memory_order_release,
+                                                   std::memory_order_relaxed)) {
+    }
+    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::WaitsPassedOnGpu);
 }
 
 void GpuAuthorityTracker::PublishReady() {

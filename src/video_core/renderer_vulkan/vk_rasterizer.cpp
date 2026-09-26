@@ -1054,7 +1054,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     ResetBindings();
     phases.Lap(Counter::DrawPhaseMarkWritesNs);
-    MaybeKickGpu();
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1143,7 +1142,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     MarkImageWrites(Common::PerformanceTelemetry::ImageWriter::GraphicsDraw, true);
 
     ResetBindings();
-    MaybeKickGpu();
 }
 
 void Rasterizer::DispatchDirect() {
@@ -1195,7 +1193,6 @@ void Rasterizer::DispatchDirect() {
 
     ResetBindings();
     phases.Lap(Counter::DispatchPhaseRecordNs);
-    MaybeKickGpu();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1247,7 +1244,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     ResetBindings();
     phases.Lap(Counter::DispatchPhaseRecordNs);
-    MaybeKickGpu();
 }
 
 u64 Rasterizer::Flush(Common::PerformanceTelemetry::SubmitReason reason) {
@@ -1272,28 +1268,6 @@ void Rasterizer::OnSubmit() {
     buffer_cache.RunGarbageCollector();
     VideoCore::FlushEpoch::AdvanceSync();
     Flush(Common::PerformanceTelemetry::SubmitReason::GuestSubmit);
-}
-
-void Rasterizer::MaybeKickGpu() {
-    // Recording a frame takes the command processor several milliseconds. Waits used to submit
-    // the work recorded so far as a side effect; now that most of them are gone, the work is
-    // submitted whenever the GPU has finished everything it was given.
-    static constexpr u32 KickMinWork = 48;
-    static constexpr u32 KickPollPeriod = 8;
-    const u64 tick = scheduler.CurrentTick();
-    if (tick != kick_tick) {
-        kick_tick = tick;
-        kick_work = 0;
-        kick_polls = 0;
-    }
-    if (++kick_work < KickMinWork || (++kick_polls % KickPollPeriod) != 0) {
-        return;
-    }
-    if (!scheduler.IsFree(tick - 1)) {
-        return;
-    }
-    Common::PerformanceTelemetry::Add(Common::PerformanceTelemetry::Counter::GpuKicks);
-    Flush(Common::PerformanceTelemetry::SubmitReason::GpuKick);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -2824,6 +2798,9 @@ void Rasterizer::StoreGdsAsync(VAddr address, u32 gds_offset) {
         }
         VideoCore::GpuAuthorityTracker::Instance().CompleteEagerWriteback(timeline_seq);
     });
+    // The guest may poll the address right away; the GPU has to get there without waiting for
+    // another submit. Nothing waits here, unlike a synchronous store.
+    Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {

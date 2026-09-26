@@ -285,6 +285,70 @@ static SHAD_NO_INLINE void BeginHostMarker(Vulkan::Rasterizer& rasterizer,
     return PM4CmdWaitRegMem::TestValue(value, function, mask, reference);
 }
 
+/// True when a packet keeps its order behind a WAIT_REG_MEM the command processor passed without
+/// waiting for the GPU (Liverpool::PassWaitOnGpu). GPU work, DMA_DATA included, is ordered by
+/// the barrier recorded for the wait, register state stays inside the command processor,
+/// completion signals follow the publication timeline, occlusion dumps write synthetic counters
+/// that no GPU work produces, and some packets are not emulated. Anything else, such as memory
+/// the command processor writes (WRITE_DATA, MEM_SEMAPHORE) or reads (COND_EXEC) itself, or an
+/// interrupt it raises right away, waits for the signal first, as it would on the console.
+[[nodiscard]] static bool IsOrderedAfterPassedWait(PM4ItOpcode opcode, const PM4Header* header) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop: {
+        // Patched flips raise an interrupt right away.
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        return nop->header.count.Value() == 0 ||
+               nop->data_block[0] != PM4CmdNop::PayloadType::PatchedFlip;
+    }
+    case PM4ItOpcode::ReleaseMem:
+        // GDS stores are published right away.
+        return reinterpret_cast<const PM4CmdReleaseMem*>(header)->data_sel.Value() !=
+               DataSelect::GdsMemStore;
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::EventWriteEos:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::IndirectBufferConst:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::Rewind:
+    // Not emulated beyond a warning.
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+    case PM4ItOpcode::GetLodStats:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void RecordPendingCompletionHazard(Common::PerformanceTelemetry::CausalTraceToken& trace,
                                    u64 completed_stages, u64 completed_writes,
                                    u64 requirement_bits, u8 confidence) {
@@ -444,6 +508,23 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
                 CancelMemoryWait(queue_id);                                                        \
             }                                                                                      \
         }                                                                                          \
+    } while (false)
+
+/// Waits, yielding, until the signal a passed WAIT_REG_MEM of queue_id waits for is published.
+#define RESOLVE_PASSED_WAIT(queue_id, yield_command)                                               \
+    do {                                                                                           \
+        auto& passed_wait_tracker = VideoCore::GpuAuthorityTracker::Instance();                   \
+        if (!passed_wait_tracker.IsPublished(passed_wait_seq[queue_id])) {                         \
+            PrepareVirtualWaitResolve();                                                           \
+            while (!passed_wait_tracker.IsPublished(passed_wait_seq[queue_id])) {                  \
+                if (passed_wait_tracker.TryPublishReady(                                           \
+                        Common::PerformanceTelemetry::Counter::SignalsPublishedAtWait)) {          \
+                    continue;                                                                      \
+                }                                                                                  \
+                yield_command                                                                      \
+            }                                                                                      \
+        }                                                                                          \
+        passed_wait_seq[queue_id] = 0;                                                             \
     } while (false)
 
 #define RESUME(task, name)                                                                         \
@@ -1225,12 +1306,15 @@ SHAD_NO_INLINE void SignalReleaseMem(const PM4CmdReleaseMem& release_packet,
 
 } // namespace
 
-bool Liverpool::PublishCompletionSignal(VAddr label_addr, u64 label_size,
+bool Liverpool::PublishCompletionSignal(VAddr label_addr, u64 label_size, u64 label_value,
+                                        bool value_known,
                                         Common::UniqueFunction<void, bool>&& publish) {
     auto& authority_tracker = VideoCore::GpuAuthorityTracker::Instance();
     const bool queued = authority_tracker.PublishSignal(VideoCore::SignalPublication{
         .label_addr = label_addr,
         .label_size = label_size,
+        .label_value = label_value,
+        .value_known = value_known,
         .publish = std::move(publish),
     });
     if (!queued) {
@@ -1243,6 +1327,25 @@ bool Liverpool::PublishCompletionSignal(VAddr label_addr, u64 label_size,
     Common::PerformanceTelemetry::Add(
         Common::PerformanceTelemetry::Counter::WritebackFenceDeferrals);
     return true;
+}
+
+void Liverpool::PassWaitOnGpu(u32 queue_id, u64 signal_seq) {
+    VideoCore::GpuAuthorityTracker::Instance().BeginVirtualWait(signal_seq);
+    passed_wait_seq[queue_id] = std::max(passed_wait_seq[queue_id], signal_seq);
+    // The signal is published once the GPU gets there; the tick has to be submitted for that.
+    if (queued_signal_tick >= rasterizer->CurrentTick()) {
+        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+    }
+    // On the console, nothing behind the wait starts before the work in front of it finished.
+    rasterizer->FullGpuBarrier();
+}
+
+void Liverpool::PrepareVirtualWaitResolve() {
+    Common::PerformanceTelemetry::Add(
+        Common::PerformanceTelemetry::Counter::VirtualWaitsResolved);
+    if (rasterizer && queued_signal_tick >= rasterizer->CurrentTick()) {
+        rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WaitProgress);
+    }
 }
 
 SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& packet) {
@@ -1392,7 +1495,6 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
         if (rasterizer) {
             // The value lands when the GPU gets there; signals after it wait for it.
             rasterizer->StoreGdsAsync(packet.Address<VAddr>(), packet.gds_index);
-            queued_signal_tick = rasterizer->CurrentTick();
         }
         return;
     }
@@ -1401,7 +1503,7 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEos(const PM4CmdEventWriteEos& p
          VideoCore::GpuAuthorityTracker::Instance().MustOrderSignals())) {
         auto* completion_rasterizer = rasterizer;
         PublishCompletionSignal(
-            packet.Address<VAddr>(), sizeof(u32),
+            packet.Address<VAddr>(), sizeof(u32), packet.DataDWord(), true,
             [packet, completion_rasterizer, fence_token, completion_trace,
              guest_copy_seq](bool write_label) {
                 CompleteGuestReads(guest_copy_seq);
@@ -1573,9 +1675,14 @@ SHAD_NO_INLINE void Liverpool::ProcessEventWriteEop(const PM4CmdEventWriteEop& p
         const u64 label_size = data_sel == DataSelect::None        ? 0
                                : data_sel == DataSelect::Data32Low ? sizeof(u32)
                                                                    : sizeof(u64);
+        const bool value_known =
+            data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64;
+        const u64 label_value =
+            data_sel == DataSelect::Data32Low ? packet.DataDWord() : packet.DataQWord();
         auto* completion_rasterizer = rasterizer;
         PublishCompletionSignal(
-            reinterpret_cast<VAddr>(packet.Address<void>()), label_size,
+            reinterpret_cast<VAddr>(packet.Address<void>()), label_size, label_value,
+            value_known,
             [packet, completion_rasterizer, fence_token, completion_trace,
              guest_copy_seq](bool write_label) {
                 CompleteGuestReads(guest_copy_seq);
@@ -1746,6 +1853,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     });
                 }
 #endif
+            }
+            if (passed_wait_seq[GfxQueueId] != 0 &&
+                !IsOrderedAfterPassedWait(opcode, header)) [[unlikely]] {
+                RESOLVE_PASSED_WAIT(GfxQueueId, YIELD_GFX());
             }
             const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
             switch (opcode) {
@@ -2528,6 +2639,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         // console the wait passes once the label is in memory, which is now.
                         already_satisfied = test_value(*poll_address);
                     }
+                    if (!already_satisfied && rasterizer) {
+                        // The label comes from a signal recorded already: the GPU orders what
+                        // follows, and only what the guest CPU could see has to wait for it.
+                        const auto queued =
+                            VideoCore::GpuAuthorityTracker::Instance().FindQueuedLabel(wait_addr);
+                        if (queued && test_value(queued->value)) {
+                            PassWaitOnGpu(GfxQueueId, queued->seq);
+                            already_satisfied = true;
+                        }
+                    }
                     bool progress_submit_done = false;
                     if (!already_satisfied) {
                         wait_required_host_block = true;
@@ -2903,16 +3024,22 @@ SHAD_NO_INLINE void Liverpool::ProcessComputeReleaseMem(
         const u64 label_size = data_sel == DataSelect::None        ? 0
                                : data_sel == DataSelect::Data32Low ? sizeof(u32)
                                                                    : sizeof(u64);
+        const bool value_known =
+            data_sel == DataSelect::Data32Low || data_sel == DataSelect::Data64;
+        const u64 label_value =
+            data_sel == DataSelect::Data32Low ? packet.DataDWord() : packet.DataQWord();
         const bool queued = PublishCompletionSignal(
-            packet.Address<VAddr>(), label_size,
+            packet.Address<VAddr>(), label_size, label_value, value_known,
             [packet, completion_rasterizer, pipe_id, fence_token, completion_trace,
              guest_copy_seq](bool write_label) {
                 CompleteGuestReads(guest_copy_seq);
                 SignalReleaseMem(packet, completion_rasterizer, pipe_id, fence_token,
                                  completion_trace, write_label);
             });
-        if (queued) {
-            // Compute queues often wait for their own release right after it.
+        if (queued && drain.eager != 0) {
+            // Compute queues often wait for their own release right after it, and its readbacks
+            // commit only once the GPU gets there. A release queued behind older work only is
+            // submitted along with that work.
             Common::PerformanceTelemetry::Add(
                 Common::PerformanceTelemetry::Counter::WritebackFlushes);
             rasterizer->Flush(Common::PerformanceTelemetry::SubmitReason::WritebackReleaseMem);
@@ -3015,6 +3142,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
 #endif
         }
 
+        if (passed_wait_seq[vqid + 1] != 0 &&
+            !IsOrderedAfterPassedWait(opcode, header)) [[unlikely]] {
+            RESOLVE_PASSED_WAIT(vqid + 1, YIELD_ASC(vqid));
+        }
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -3405,6 +3536,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, u3
                     VideoCore::GpuAuthorityTracker::Instance().TryPublishReady(
                         Common::PerformanceTelemetry::Counter::SignalsPublishedAtWait)) {
                     already_satisfied = test_value(*poll_address);
+                }
+                if (!already_satisfied && rasterizer) {
+                    const auto queued = VideoCore::GpuAuthorityTracker::Instance().FindQueuedLabel(
+                        reinterpret_cast<VAddr>(poll_address));
+                    if (queued && test_value(queued->value)) {
+                        PassWaitOnGpu(vqid + 1, queued->seq);
+                        already_satisfied = true;
+                    }
                 }
                 if (!already_satisfied) {
                     wait_required_host_block = true;

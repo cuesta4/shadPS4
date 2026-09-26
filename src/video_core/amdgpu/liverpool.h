@@ -221,10 +221,18 @@ private:
                                   bool telemetry_detail);
 
     /// Publishes a completion signal through the GPU authority tracker, which queues it behind
-    /// pending readback commits when it has to follow them.
-    /// Returns true when the signal was queued.
-    bool PublishCompletionSignal(VAddr label_addr, u64 label_size,
-                                 Common::UniqueFunction<void, bool>&& publish);
+    /// pending readback commits when it has to follow them. label_value is the value the label
+    /// receives when value_known. Returns true when the signal was queued.
+    bool PublishCompletionSignal(VAddr label_addr, u64 label_size, u64 label_value,
+                                 bool value_known, Common::UniqueFunction<void, bool>&& publish);
+
+    /// Passes a WAIT_REG_MEM of queue_id on the queued signal signal_seq without waiting for the
+    /// GPU (see GpuAuthorityTracker::BeginVirtualWait).
+    void PassWaitOnGpu(u32 queue_id, u64 signal_seq);
+
+    /// Submits what the signal a wait was passed on needs, before the command processor waits
+    /// for its publication.
+    void PrepareVirtualWaitResolve();
 
     bool ArmMemoryWait(u32 queue_id, VAddr address);
     void CancelMemoryWait(u32 queue_id);
@@ -258,6 +266,9 @@ private:
     /// Tick of the last completion signal queued behind readback commits. The command
     /// processor submits it before going idle, so the signal can be published.
     u64 queued_signal_tick{};
+    /// Per queue, the queued signal its last passed WAIT_REG_MEM waits for, until published.
+    /// Packets of the queue that the guest CPU could observe out of order wait for it first.
+    std::array<u64, NumTotalQueues> passed_wait_seq{};
 
     struct SyncPacketState {
         Common::PerformanceTelemetry::FenceSeq fence_seq{};

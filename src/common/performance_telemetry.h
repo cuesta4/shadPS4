@@ -803,7 +803,6 @@ enum class Counter : u16 {
     FaultFalseSharingUnemulated,
     ClassifiedCpuConsumer,
     ClassifiedHotPage,
-    GpuKicks,
     FlushEpochs,
     EpochBufferBarriers,
     EpochGlobalBarriers,
@@ -812,6 +811,8 @@ enum class Counter : u16 {
     DirectAuthorityUnconsumed,
     AuthorityMaskedWrites,
     GdsStoresAsync,
+    WaitsPassedOnGpu,
+    VirtualWaitsResolved,
     Count,
 };
 
@@ -1217,7 +1218,6 @@ enum class SubmitReason : u8 {
     QueuePresent,
     Finish,
     WaitProgress,
-    GpuKick,
     Count,
 };
 

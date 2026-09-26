@@ -281,7 +281,7 @@ static_assert(StagingMemoryKindNames.size() == StagingMemoryKindCount);
 constexpr std::array SubmitReasonNames{
     "generic",          "guest_submit",       "writeback_eos", "writeback_eop",
     "writeback_release", "present_frame_build", "present_submit", "queue_present",
-    "finish",           "wait_progress",      "gpu_kick",
+    "finish",           "wait_progress",
 };
 static_assert(SubmitReasonNames.size() == SubmitReasonCount);
 
@@ -808,7 +808,6 @@ constexpr std::array FrameCounters{
     Counter::FaultFalseSharingUnemulated,
     Counter::ClassifiedCpuConsumer,
     Counter::ClassifiedHotPage,
-    Counter::GpuKicks,
     Counter::FlushEpochs,
     Counter::EpochBufferBarriers,
     Counter::EpochGlobalBarriers,
@@ -817,6 +816,8 @@ constexpr std::array FrameCounters{
     Counter::DirectAuthorityUnconsumed,
     Counter::AuthorityMaskedWrites,
     Counter::GdsStoresAsync,
+    Counter::WaitsPassedOnGpu,
+    Counter::VirtualWaitsResolved,
 };
 
 struct FrameRecord {
@@ -1138,7 +1139,6 @@ constexpr std::array CounterNames{
     "fault_false_sharing_unemulated",
     "classified_cpu_consumer",
     "classified_hot_page",
-    "gpu_kicks",
     "flush_epochs",
     "epoch_buffer_barriers",
     "epoch_global_barriers",
@@ -1147,6 +1147,8 @@ constexpr std::array CounterNames{
     "direct_authority_unconsumed",
     "authority_masked_writes",
     "gds_stores_async",
+    "waits_passed_on_gpu",
+    "virtual_waits_resolved",
 };
 static_assert(CounterNames.size() == static_cast<size_t>(Counter::Count));
 

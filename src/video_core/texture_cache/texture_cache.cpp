@@ -1018,9 +1018,6 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
     const auto [download, offset] =
         download_buffer.Map(download_size, DownloadAlignment(image.info));
     download_buffer.Commit();
-    // Signals that follow this readback in program order wait for its commit.
-    const u64 timeline_seq = GpuAuthorityTracker::Instance().BeginEagerWriteback();
-    const u64 authority_bound = GpuAuthorityTracker::Instance().AuthoritySeqBound();
     scheduler.EndRendering(Common::PerformanceTelemetry::ScopeBreakReason::RequiredTransfer,
                            Common::PerformanceTelemetry::Avoidability::ProvenRequired);
     const vk::BufferImageCopy image_download = {
@@ -1050,9 +1047,13 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool validate_identity,
     scheduler.EndGpuInterval(gpu_copy_interval);
     image.flags &= ~ImageFlagBits::GpuModified;
 
-    if (track_gpu_source) {
-        buffer_cache.TrackImageReadback(image, download_size);
-    }
+    // GPU consumers of a tracked range copy from the image until the commit lands.
+    const bool gpu_ordered =
+        track_gpu_source && buffer_cache.TrackImageReadback(image, download_size);
+    // Signals that follow this readback in program order wait for its commit.
+    auto& authority_tracker = GpuAuthorityTracker::Instance();
+    const u64 timeline_seq = authority_tracker.BeginEagerWriteback(false, gpu_ordered);
+    const u64 authority_bound = authority_tracker.AuthoritySeqBound();
 
     auto readback_token = validate_identity ? image.readback_token : nullptr;
     const u64 image_uid = image.image_uid;
