@@ -131,11 +131,18 @@ looks choppy when frames arrive unevenly.
     fullscreen or a slow launch, could leave a game stuttering at a fraction of its
     speed until you restarted it.
   - In this build, that clock no longer depends on when Windows shows a frame.
+  - On a G-Sync or FreeSync monitor, it keeps exact time. Older builds ran it slightly
+    fast there, so a game with its own 60 FPS limit skipped a frame every few seconds.
 - **Frames are timed to your monitor.**
   - The emulator measures when your monitor shows each frame and learns its exact
     refresh rate. It then releases each new frame just in time for the next refresh.
   - A frame that cannot be shown sooner waits for the next refresh. It is never thrown
     away, so your graphics card never renders frames that no one sees.
+- **VRR Frame Pacing (optional).** A G-Sync or FreeSync monitor shows each frame the
+  moment your graphics card finishes it, so frames that take a little more or less work
+  reach the screen at uneven times. This option waits until each frame is done and
+  shows it at the same moment of every refresh cycle. It adds a few milliseconds of lag
+  and does nothing on a monitor with a fixed refresh rate.
 
 ### Controls feel more responsive
 
@@ -149,7 +156,11 @@ finished frames wait in line to be shown.
   bottleneck.
 - **NVIDIA Reflex.** On NVIDIA graphics cards, Reflex holds the emulated console back
   until your graphics card is about to need the next frame, so frames do not wait in a
-  queue.
+  queue. The game itself now waits right after showing a frame, so it reads your input
+  as late as possible.
+- **Round analog sticks.** A DualShock 4 stick moves inside a round gate. Keyboards and
+  controllers with square gates could push both axes to the end at once, and some games
+  then moved up to 41% faster diagonally. Stick values are now kept inside the circle.
 
 ### Sound keeps up after a hitch
 
@@ -333,6 +344,10 @@ own.
   120 FPS patch.
 - **NVIDIA Reflex.** Try it on. If motion looks less even, turn it off for that game.
   In our tests, Bloodborne at 120 Hz looked smoother without it.
+- **VRR Frame Pacing**, in the Graphics tab, only for G-Sync and FreeSync monitors. Try
+  it on if motion looks uneven at a steady frame rate. It works together with Reflex,
+  but each pulls the other way: Reflex cuts lag, this option trades a little lag for
+  even frame times.
 - **GPU Frames Ahead.** 2 is the default. Try 1 for less lag when your graphics card is
   the bottleneck. 0 removes the limit and is not recommended.
 - **Async Shader Recompiling.** Keep it on to avoid shader stutter. If a game shows
