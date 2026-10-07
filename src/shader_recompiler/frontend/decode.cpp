@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
 

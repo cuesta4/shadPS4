@@ -8,6 +8,7 @@
 #include <toml.hpp>
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "key_manager.h"
 #include "path_util.h"
 

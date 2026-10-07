@@ -7,7 +7,7 @@
 
 namespace Common::Log::Class {
 // clang-format off
-/// Listing all log classes, if you add here, dont forget ALL_LOGGERS
+/// Backend category catalog. If you add here, don't forget ALL_LOGGERS in log.cpp.
 constexpr auto Common = "Common";                                   ///< Library routines
 constexpr auto Common_Filesystem = "Common.Filesystem";             ///< Filesystem interface library
 constexpr auto Common_Memory = "Common.Memory";                     ///< Memory mapping and management functions

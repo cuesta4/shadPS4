@@ -3,6 +3,7 @@
 
 #ifdef WIN32
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <algorithm>
 #include <Ws2tcpip.h>
 #include <iphlpapi.h>
 #include <winsock2.h>
@@ -16,6 +17,7 @@
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"

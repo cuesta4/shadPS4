@@ -3,6 +3,8 @@
 
 #include "common/elf_info.h"
 #include "common/io_file.h"
+#include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"

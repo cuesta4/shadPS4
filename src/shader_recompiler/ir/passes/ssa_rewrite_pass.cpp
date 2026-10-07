@@ -13,6 +13,7 @@
 //      https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6
 //
 
+#include <algorithm>
 #include <map>
 #include <span>
 #include <unordered_map>

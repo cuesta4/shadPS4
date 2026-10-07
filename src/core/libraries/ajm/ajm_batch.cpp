@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "core/libraries/ajm/ajm_batch.h"
 
 namespace Libraries::Ajm {

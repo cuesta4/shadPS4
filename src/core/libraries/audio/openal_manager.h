@@ -7,6 +7,7 @@
 #include <vector>
 #include <AL/al.h>
 #include <AL/alc.h>
+#include "common/logging/log.h"
 
 namespace Libraries::AudioOut {
 

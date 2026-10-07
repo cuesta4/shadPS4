@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/ajm/ajm.h"
 #include "core/libraries/app_content/app_content.h"
 #include "core/libraries/audio/audioin.h"
@@ -74,9 +76,32 @@
 #include "core/libraries/vr_tracker/vr_tracker.h"
 #include "core/libraries/web_browser_dialog/webbrowserdialog.h"
 #include "core/libraries/zlib/zlib_sce.h"
+#include "core/loader/symbols_resolver.h"
 #include "fiber/fiber.h"
 
 namespace Libraries {
+
+void RegisterHLEFunction(Core::Loader::SymbolsResolver* sym, const char* nid, const char* library,
+                         u16 library_version, const char* module, u64 address) {
+    Core::Loader::SymbolResolver sr{};
+    sr.name = nid;
+    sr.library = library;
+    sr.library_version = library_version;
+    sr.module = module;
+    sr.type = Core::Loader::SymbolType::Function;
+    sym->AddSymbol(sr, address);
+}
+
+void RegisterHLEObject(Core::Loader::SymbolsResolver* sym, const char* nid, const char* library,
+                       u16 library_version, const char* module, u64 address) {
+    Core::Loader::SymbolResolver sr{};
+    sr.name = nid;
+    sr.library = library;
+    sr.library_version = library_version;
+    sr.module = module;
+    sr.type = Core::Loader::SymbolType::Object;
+    sym->AddSymbol(sr, address);
+}
 
 void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_Kernel, "Initializing HLE libraries");

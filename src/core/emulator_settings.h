@@ -1,17 +1,15 @@
-﻿// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <mutex>
-#include <sstream>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
-#include <nlohmann/json.hpp>
-#include "common/logging/log.h"
 #include "common/types.h"
 
 #define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
@@ -88,73 +86,7 @@ struct Setting {
     }
 };
 
-template <typename T>
-void to_json(nlohmann::json& j, const Setting<T>& s) {
-    j = s.value;
-}
-
-template <typename T>
-void from_json(const nlohmann::json& j, Setting<T>& s) {
-    s.value = j.get<T>();
-}
-
-struct OverrideItem {
-    const char* key;
-    std::function<void(void* group_ptr, const nlohmann::json& entry,
-                       std::vector<std::string>& changed)>
-        apply;
-    /// Return the value that should be written to the per-game config file.
-    /// Falls back to base value if no game-specific override is set.
-    std::function<nlohmann::json(const void* group_ptr)> get_for_save;
-
-    /// Clear game_specific_value for this field.
-    std::function<void(void* group_ptr)> reset_game_specific;
-};
-
-template <typename Struct, typename T>
-inline OverrideItem make_override(const char* key, Setting<T> Struct::* member) {
-    return OverrideItem{
-        key,
-        [member, key](void* base, const nlohmann::json& entry, std::vector<std::string>& changed) {
-            LOG_DEBUG(Config, "[make_override] Processing key: {}", key);
-            LOG_DEBUG(Config, "[make_override] Entry JSON: {}", entry.dump());
-            Struct* obj = reinterpret_cast<Struct*>(base);
-            Setting<T>& dst = obj->*member;
-            try {
-                T newValue = entry.get<T>();
-                LOG_DEBUG(Config, "[make_override] Parsed value: {}", newValue);
-                LOG_DEBUG(Config, "[make_override] Current value: {}", dst.value);
-                if (dst.value != newValue) {
-                    std::ostringstream oss;
-                    oss << key << " ( " << dst.value << " → " << newValue << " )";
-                    changed.push_back(oss.str());
-                    LOG_DEBUG(Config, "[make_override] Recorded change: {}", oss.str());
-                }
-                dst.game_specific_value = newValue;
-                LOG_DEBUG(Config, "[make_override] Successfully updated {}", key);
-            } catch (const std::exception& e) {
-                LOG_ERROR(Config, "[make_override] ERROR parsing {}: {}", key, e.what());
-                LOG_ERROR(Config, "[make_override] Entry was: {}", entry.dump());
-                LOG_ERROR(Config, "[make_override] Type name: {}", entry.type_name());
-            }
-        },
-
-        // --- get_for_save -------------------------------------------
-        // Returns game_specific_value when present, otherwise base value.
-        // This means a freshly-opened game-specific dialog still shows
-        // useful (current-global) values rather than empty entries.
-        [member](const void* base) -> nlohmann::json {
-            const Struct* obj = reinterpret_cast<const Struct*>(base);
-            const Setting<T>& src = obj->*member;
-            return nlohmann::json(src.game_specific_value.value_or(src.value));
-        },
-
-        // --- reset_game_specific ------------------------------------
-        [member](void* base) {
-            Struct* obj = reinterpret_cast<Struct*>(base);
-            (obj->*member).reset_game_specific();
-        }};
-}
+struct OverrideItem;
 
 // -------------------------------
 // Support types
@@ -163,7 +95,6 @@ struct GameInstallDir {
     std::filesystem::path path;
     bool enabled;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GameInstallDir, path, enabled)
 
 // -------------------------------
 // General settings
@@ -191,34 +122,9 @@ struct GeneralSettings {
     Setting<int> big_picture_scale{1000};
     Setting<std::string> shadnet_server{""};
 
-    // return a vector of override descriptors (runtime, but tiny)
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<GeneralSettings>("volume_slider", &GeneralSettings::volume_slider),
-            make_override<GeneralSettings>("neo_mode", &GeneralSettings::neo_mode),
-            make_override<GeneralSettings>("dev_kit_mode", &GeneralSettings::dev_kit_mode),
-            make_override<GeneralSettings>("extra_dmem_in_mbytes",
-                                           &GeneralSettings::extra_dmem_in_mbytes),
-            make_override<GeneralSettings>("shad_net_enabled", &GeneralSettings::shad_net_enabled),
-            make_override<GeneralSettings>("trophy_popup_disabled",
-                                           &GeneralSettings::trophy_popup_disabled),
-            make_override<GeneralSettings>("trophy_notification_duration",
-                                           &GeneralSettings::trophy_notification_duration),
-            make_override<GeneralSettings>("show_splash", &GeneralSettings::show_splash),
-            make_override<GeneralSettings>("trophy_notification_side",
-                                           &GeneralSettings::trophy_notification_side),
-            make_override<GeneralSettings>("connected_to_network",
-                                           &GeneralSettings::connected_to_network)};
-    }
+    // Persistence metadata is constructed out of line.
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_dir, home_dir,
-                                   sys_modules_dir, font_dir, volume_slider, neo_mode, dev_kit_mode,
-                                   extra_dmem_in_mbytes, shad_net_enabled, trophy_popup_disabled,
-                                   trophy_notification_duration, show_splash,
-                                   trophy_notification_side, connected_to_network,
-                                   discord_rpc_enabled, show_fps_counter, console_language,
-                                   big_picture_scale, shadnet_server)
 
 // -------------------------------
 // Log settings
@@ -236,30 +142,9 @@ struct LogSettings {
     Setting<std::string> type{"wincolor"};
 #endif
 
-    // return a vector of override descriptors (runtime, but tiny)
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<LogSettings>("append", &LogSettings::append),
-            make_override<LogSettings>("enable", &LogSettings::enable),
-            make_override<LogSettings>("filter", &LogSettings::filter),
-            make_override<LogSettings>("max_skip_duration", &LogSettings::max_skip_duration),
-            make_override<LogSettings>("separate", &LogSettings::separate),
-            make_override<LogSettings>("size_limit", &LogSettings::size_limit),
-            make_override<LogSettings>("skip_duplicate", &LogSettings::skip_duplicate),
-            make_override<LogSettings>("sync", &LogSettings::sync),
-#ifdef _WIN32
-            make_override<LogSettings>("type", &LogSettings::type),
-#endif
-        };
-    }
+    // Persistence metadata is constructed out of line.
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-#ifdef _WIN32
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, max_skip_duration, separate,
-                                   size_limit, skip_duplicate, sync, type)
-#else
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, max_skip_duration, separate,
-                                   size_limit, skip_duplicate, sync)
-#endif
 
 // -------------------------------
 // Debug settings
@@ -269,13 +154,8 @@ struct DebugSettings {
     Setting<bool> shader_collect{false};     // specific
     Setting<std::string> config_version{""}; // specific
 
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
-            make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
-    }
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, debug_dump, shader_collect, config_version)
 
 // -------------------------------
 // Input settings
@@ -296,30 +176,9 @@ struct InputSettings {
     Setting<bool> is_circle_enter{false};             // specific
     Setting<s32> camera_id{-1};
 
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<InputSettings>("cursor_state", &InputSettings::cursor_state),
-            make_override<InputSettings>("cursor_hide_timeout",
-                                         &InputSettings::cursor_hide_timeout),
-            make_override<InputSettings>("usb_device_backend", &InputSettings::usb_device_backend),
-            make_override<InputSettings>("motion_controls_enabled",
-                                         &InputSettings::motion_controls_enabled),
-            make_override<InputSettings>("background_controller_input",
-                                         &InputSettings::background_controller_input),
-            make_override<InputSettings>("ime_accessibility_enabled",
-                                         &InputSettings::ime_accessibility_enabled),
-            make_override<InputSettings>("ime_url_mail_short_panel",
-                                         &InputSettings::ime_url_mail_short_panel),
-            make_override<InputSettings>("is_circle_enter", &InputSettings::is_circle_enter),
-            make_override<InputSettings>("camera_id", &InputSettings::camera_id)};
-    }
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
-                                   usb_device_backend, use_special_pad, special_pad_class,
-                                   motion_controls_enabled, use_unified_input_config,
-                                   default_controller_id, background_controller_input,
-                                   ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
-                                   is_circle_enter)
+
 // -------------------------------
 // Audio settings
 // -------------------------------
@@ -332,26 +191,8 @@ struct AudioSettings {
     Setting<std::string> openal_main_output_device{"Default Device"};
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
 
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<AudioSettings>("audio_backend", &AudioSettings::audio_backend),
-            make_override<AudioSettings>("sdl_mic_device", &AudioSettings::sdl_mic_device),
-            make_override<AudioSettings>("sdl_main_output_device",
-                                         &AudioSettings::sdl_main_output_device),
-            make_override<AudioSettings>("sdl_padSpk_output_device",
-                                         &AudioSettings::sdl_padSpk_output_device),
-            make_override<AudioSettings>("openal_mic_device", &AudioSettings::openal_mic_device),
-            make_override<AudioSettings>("openal_main_output_device",
-                                         &AudioSettings::openal_main_output_device),
-            make_override<AudioSettings>("openal_padSpk_output_device",
-                                         &AudioSettings::openal_padSpk_output_device)};
-    }
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
-                                   sdl_main_output_device, sdl_padSpk_output_device,
-                                   openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device)
 
 // -------------------------------
 // GPU settings
@@ -377,36 +218,9 @@ struct GPUSettings {
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
     // TODO add overrides
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<GPUSettings>("null_gpu", &GPUSettings::null_gpu),
-            make_override<GPUSettings>("copy_gpu_buffers", &GPUSettings::copy_gpu_buffers),
-            make_override<GPUSettings>("full_screen", &GPUSettings::full_screen),
-            make_override<GPUSettings>("full_screen_mode", &GPUSettings::full_screen_mode),
-            make_override<GPUSettings>("present_mode", &GPUSettings::present_mode),
-            make_override<GPUSettings>("window_height", &GPUSettings::window_height),
-            make_override<GPUSettings>("window_width", &GPUSettings::window_width),
-            make_override<GPUSettings>("hdr_allowed", &GPUSettings::hdr_allowed),
-            make_override<GPUSettings>("fsr_enabled", &GPUSettings::fsr_enabled),
-            make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
-            make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
-            make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
-            make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
-            make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
-            make_override<GPUSettings>("readback_linear_images_enabled",
-                                       &GPUSettings::readback_linear_images_enabled),
-            make_override<GPUSettings>("direct_memory_access_enabled",
-                                       &GPUSettings::direct_memory_access_enabled),
-            make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
-        };
-    }
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -422,34 +236,8 @@ struct VulkanSettings {
     Setting<bool> vkguest_markers{false};
     Setting<bool> pipeline_cache_enabled{false};
     Setting<bool> pipeline_cache_archived{false};
-    std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<VulkanSettings>("gpu_id", &VulkanSettings::gpu_id),
-            make_override<VulkanSettings>("renderdoc_enabled", &VulkanSettings::renderdoc_enabled),
-            make_override<VulkanSettings>("vkvalidation_enabled",
-                                          &VulkanSettings::vkvalidation_enabled),
-            make_override<VulkanSettings>("vkvalidation_core_enabled",
-                                          &VulkanSettings::vkvalidation_core_enabled),
-            make_override<VulkanSettings>("vkvalidation_sync_enabled",
-                                          &VulkanSettings::vkvalidation_sync_enabled),
-            make_override<VulkanSettings>("vkvalidation_gpu_enabled",
-                                          &VulkanSettings::vkvalidation_gpu_enabled),
-            make_override<VulkanSettings>("vkcrash_diagnostic_enabled",
-                                          &VulkanSettings::vkcrash_diagnostic_enabled),
-            make_override<VulkanSettings>("vkhost_markers", &VulkanSettings::vkhost_markers),
-            make_override<VulkanSettings>("vkguest_markers", &VulkanSettings::vkguest_markers),
-            make_override<VulkanSettings>("pipeline_cache_enabled",
-                                          &VulkanSettings::pipeline_cache_enabled),
-            make_override<VulkanSettings>("pipeline_cache_archived",
-                                          &VulkanSettings::pipeline_cache_archived),
-        };
-    }
+    std::vector<OverrideItem> GetOverrideableFields() const;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled,
-                                   vkvalidation_core_enabled, vkvalidation_sync_enabled,
-                                   vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
-                                   vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived)
 
 // -------------------------------
 // Main manager
@@ -518,53 +306,16 @@ private:
     static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
 
-    /// Apply overrideable fields from groupJson into group.game_specific_value.
-    template <typename Group>
-    void ApplyGroupOverrides(Group& group, const nlohmann::json& groupJson,
-                             std::vector<std::string>& changed) {
-        for (auto& item : group.GetOverrideableFields()) {
-            if (!groupJson.contains(item.key))
-                continue;
-            item.apply(&group, groupJson.at(item.key), changed);
-        }
-    }
-
-    // Write all overrideable fields from group into out (for game-specific save).
-    template <typename Group>
-    static void SaveGroupGameSpecific(const Group& group, nlohmann::json& out) {
-        for (auto& item : group.GetOverrideableFields())
-            out[item.key] = item.get_for_save(&group);
-    }
-
-    // Discard every game-specific override in group.
-    template <typename Group>
-    static void ClearGroupOverrides(Group& group) {
-        for (auto& item : group.GetOverrideableFields())
-            item.reset_game_specific(&group);
-    }
-
     static void PrintChangedSummary(const std::vector<std::string>& changed);
 
 public:
-    // Add these getters to access overrideable fields
-    std::vector<OverrideItem> GetGeneralOverrideableFields() const {
-        return m_general.GetOverrideableFields();
-    }
-    std::vector<OverrideItem> GetDebugOverrideableFields() const {
-        return m_debug.GetOverrideableFields();
-    }
-    std::vector<OverrideItem> GetInputOverrideableFields() const {
-        return m_input.GetOverrideableFields();
-    }
-    std::vector<OverrideItem> GetAudioOverrideableFields() const {
-        return m_audio.GetOverrideableFields();
-    }
-    std::vector<OverrideItem> GetGPUOverrideableFields() const {
-        return m_gpu.GetOverrideableFields();
-    }
-    std::vector<OverrideItem> GetVulkanOverrideableFields() const {
-        return m_vulkan.GetOverrideableFields();
-    }
+    // Persistence metadata; include emulator_settings_serialization.h to use the descriptors.
+    std::vector<OverrideItem> GetGeneralOverrideableFields() const;
+    std::vector<OverrideItem> GetDebugOverrideableFields() const;
+    std::vector<OverrideItem> GetInputOverrideableFields() const;
+    std::vector<OverrideItem> GetAudioOverrideableFields() const;
+    std::vector<OverrideItem> GetGPUOverrideableFields() const;
+    std::vector<OverrideItem> GetVulkanOverrideableFields() const;
     std::vector<std::string> GetAllOverrideableKeys() const;
 
 #define SETTING_FORWARD(group, Name, field)                                                        \

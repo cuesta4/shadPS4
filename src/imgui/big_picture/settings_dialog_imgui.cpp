@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/devtools/layer.h"
+#include "core/emulator_settings.h"
 #include "imgui/imgui_std.h"
 #include "settings_dialog_imgui.h"
 

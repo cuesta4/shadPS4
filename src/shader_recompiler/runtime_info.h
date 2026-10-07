@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"

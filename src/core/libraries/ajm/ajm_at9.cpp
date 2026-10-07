@@ -3,6 +3,7 @@
 
 #include "ajm_result.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "core/libraries/ajm/ajm_at9.h"
 #include "error_codes.h"
 

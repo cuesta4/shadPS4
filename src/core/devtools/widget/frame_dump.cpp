@@ -1,11 +1,13 @@
 //  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdio>
 #include <ctime>
 #include <fmt/chrono.h>
 #include <imgui.h>
 #include <magic_enum/magic_enum.hpp>
+#include "common/logging/log.h"
 
 #include "common/io_file.h"
 #include "core/devtools/options.h"

@@ -8,6 +8,7 @@
 #include <cmrc/cmrc.hpp>
 #include <imgui.h>
 #include <queue>
+#include "common/logging/log.h"
 
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3.h>

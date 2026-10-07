@@ -3,6 +3,7 @@
 
 #include <ctime>
 #include <thread>
+#include "common/logging/log.h"
 
 #include "common/assert.h"
 #include "common/native_clock.h"

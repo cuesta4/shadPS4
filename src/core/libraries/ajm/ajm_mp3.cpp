@@ -4,6 +4,7 @@
 #include "ajm_error.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
+#include "common/logging/log.h"
 
 #include "common/assert.h"
 #include "core/libraries/error_codes.h"

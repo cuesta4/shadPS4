@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include "common/logging/log.h"
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"

@@ -6,6 +6,7 @@
 #include <memory>
 #include <string_view>
 #include <spdlog/common.h>
+#include <spdlog/details/fmt_helper.h>
 #include <spdlog/details/log_msg.h>
 #include <spdlog/formatter.h>
 

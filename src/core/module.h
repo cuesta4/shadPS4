@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 #include "common/types.h"
-#include "core/emulator_settings.h"
 #include "core/loader/elf.h"
 #include "core/loader/symbols_resolver.h"
 
@@ -165,13 +164,7 @@ public:
         return elf.IsSharedLib();
     }
 
-    bool IsSystemLib() {
-        auto system_path = EmulatorSettings.GetSysModulesDir();
-        if (file.string().starts_with(system_path.string().c_str())) {
-            return true;
-        }
-        return false;
-    }
+    bool IsSystemLib();
 
     template <typename T = VAddr>
     T GetProcParam() const noexcept {

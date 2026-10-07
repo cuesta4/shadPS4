@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 #include <imgui_internal.h>
+#include "common/logging/log.h"
 #include "core/libraries/ime/ime_kb_layout.h"
 #include "core/libraries/ime/ime_ui_shared.h"
 #include "core/libraries/pad/pad.h"

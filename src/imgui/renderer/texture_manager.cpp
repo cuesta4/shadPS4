@@ -3,6 +3,7 @@
 
 #include <deque>
 #include <utility>
+#include "common/logging/log.h"
 
 #include <imgui.h>
 #include "common/assert.h"

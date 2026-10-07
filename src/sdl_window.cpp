@@ -9,6 +9,7 @@
 #include "SDL3/SDL_video.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/logging/log.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"

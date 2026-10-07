@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -10,6 +11,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -19,6 +21,14 @@
 namespace Core {
 
 using EntryFunc = PS4_SYSV_ABI int (*)(size_t args, const void* argp, void* param);
+
+bool Module::IsSystemLib() {
+    auto system_path = EmulatorSettings.GetSysModulesDir();
+    if (file.string().starts_with(system_path.string().c_str())) {
+        return true;
+    }
+    return false;
+}
 
 static constexpr u64 ModuleLoadBase = 0x800000000;
 

@@ -15,6 +15,7 @@
 #include "common/path_util.h"
 #include "common/scm_rev.h"
 #include "core/emulator_settings.h"
+#include "core/emulator_settings_serialization.h"
 #include "core/emulator_state.h"
 
 namespace fs = std::filesystem;

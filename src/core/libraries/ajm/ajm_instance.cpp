@@ -6,6 +6,7 @@
 #include "ajm_instance.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
+#include "common/logging/log.h"
 
 #include <magic_enum/magic_enum.hpp>
 

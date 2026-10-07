@@ -3,6 +3,7 @@
 
 #include <fmt/format.h>
 #include "common/io_file.h"
+#include "common/logging/log.h"
 #include "common/string_util.h"
 #include "common/types.h"
 #include "core/aerolib/aerolib.h"

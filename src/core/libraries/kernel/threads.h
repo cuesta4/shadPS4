@@ -5,8 +5,8 @@
 
 #include <functional>
 #include "common/polyfill_thread.h"
+#include "core/host_call.h"
 #include "core/libraries/kernel/threads/pthread.h"
-#include "core/tls.h"
 
 namespace Core::Loader {
 class SymbolsResolver;

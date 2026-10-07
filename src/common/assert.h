@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "common/logging/log.h"
+#include <fmt/format.h>
 
 // Sometimes we want to try to continue even after hitting an assert.
 // However touching this file yields a global recompilation as this header is included almost
@@ -13,6 +13,15 @@
 
 void assert_fail_impl();
 [[noreturn]] void unreachable_impl();
+
+void assert_log_message_impl(const char* file, unsigned int line, const char* function,
+                             fmt::string_view format, fmt::format_args args) noexcept;
+
+template <typename... Args>
+void assert_log_message(const char* file, unsigned int line, const char* function,
+                        fmt::format_string<Args...> format, Args&&... args) noexcept {
+    assert_log_message_impl(file, line, function, format, fmt::make_format_args(args...));
+}
 
 #ifdef _MSC_VER
 #define SHAD_NO_INLINE __declspec(noinline)
@@ -23,7 +32,7 @@ void assert_fail_impl();
 #define ASSERT(_a_)                                                                                \
     do {                                                                                           \
         if (!(_a_)) [[unlikely]] {                                                                 \
-            LOG_CRITICAL(Debug, "Assertion Failed!");                                              \
+            assert_log_message(__FILE__, __LINE__, __func__, "Assertion Failed!");                 \
             assert_fail_impl();                                                                    \
         }                                                                                          \
     } while (false)
@@ -31,20 +40,20 @@ void assert_fail_impl();
 #define ASSERT_MSG(_a_, ...)                                                                       \
     do {                                                                                           \
         if (!(_a_)) [[unlikely]] {                                                                 \
-            LOG_CRITICAL(Debug, "Assertion Failed!\n" __VA_ARGS__);                                \
+            assert_log_message(__FILE__, __LINE__, __func__, "Assertion Failed!\n" __VA_ARGS__);   \
             assert_fail_impl();                                                                    \
         }                                                                                          \
     } while (false)
 
 #define UNREACHABLE()                                                                              \
     do {                                                                                           \
-        LOG_CRITICAL(Debug, "Unreachable code!");                                                  \
+        assert_log_message(__FILE__, __LINE__, __func__, "Unreachable code!");                     \
         unreachable_impl();                                                                        \
     } while (0)
 
 #define UNREACHABLE_MSG(...)                                                                       \
     do {                                                                                           \
-        LOG_CRITICAL(Debug, "Unreachable code!\n" __VA_ARGS__);                                    \
+        assert_log_message(__FILE__, __LINE__, __func__, "Unreachable code!\n" __VA_ARGS__);       \
         unreachable_impl();                                                                        \
     } while (0)
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <string_view>
 
 #include "assert.h"

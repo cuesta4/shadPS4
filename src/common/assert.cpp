@@ -1,8 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <stdexcept>
+
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+
+void assert_log_message_impl(const char* file, unsigned int line, const char* function,
+                             fmt::string_view format, fmt::format_args args) noexcept {
+    Common::Log::WriteImpl("Debug", Common::Log::Level::Critical, {file, line, function}, format,
+                           args);
+}
 
 #if defined(ARCH_X86_64)
 #define Crash() __asm__ __volatile__("int $3")

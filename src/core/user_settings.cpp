@@ -7,6 +7,7 @@
 #include <map>
 #include <common/path_util.h>
 #include <common/scm_rev.h>
+#include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "user_settings.h"
 

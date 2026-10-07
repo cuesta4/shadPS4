@@ -1,18 +1,39 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
+#include <iterator>
+#include <memory>
+#include <ranges>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include <fmt/std.h>
+#include <spdlog/details/err_helper.h>
+#include <spdlog/sinks/async_sink.h>
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/dup_filter_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include "common/assert.h"
+#include "common/logging/classes.h"
 #include "common/logging/log.h"
 #include "common/logging/thread_name_formatter.h"
+#include "common/path_util.h"
+#include "common/thread.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #ifdef _WIN32
 #include <Windows.h>
+#include <spdlog/sinks/msvc_sink.h>
+#include <spdlog/sinks/wincolor_sink.h>
+using spdlog_stdout = spdlog::sinks::sink;
+#else
+using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #endif
 
 // return codes above 'standard'
@@ -29,7 +50,7 @@ bool g_should_append = false;
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<spdlog::sinks::basic_file_sink_mt> g_shad_file_sink;
 
-std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS{
+static std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS{
     {Class::Common, nullptr},
     {Class::Common_Filesystem, nullptr},
     {Class::Common_Memory, nullptr},
@@ -133,6 +154,57 @@ std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGER
     {Class::Render_Vulkan, nullptr},
     {Class::Tty, nullptr},
 };
+
+static constexpr std::array level_names{"Trace", "Debug",    "Info", "Warning",
+                                        "Error", "Critical", "Off"};
+
+static spdlog::level BackendLevel(Level level) {
+    return static_cast<spdlog::level>(level);
+}
+
+static_assert(static_cast<spdlog::level>(Level::Trace) == spdlog::level::trace);
+static_assert(static_cast<spdlog::level>(Level::Debug) == spdlog::level::debug);
+static_assert(static_cast<spdlog::level>(Level::Info) == spdlog::level::info);
+static_assert(static_cast<spdlog::level>(Level::Warning) == spdlog::level::warn);
+static_assert(static_cast<spdlog::level>(Level::Error) == spdlog::level::err);
+static_assert(static_cast<spdlog::level>(Level::Critical) == spdlog::level::critical);
+static_assert(static_cast<spdlog::level>(Level::Off) == spdlog::level::off);
+
+bool IsEnabled(std::string_view log_class, Level level) {
+    const auto it = ALL_LOGGERS.find(log_class);
+    return it != ALL_LOGGERS.end() && it->second && it->second->should_log(BackendLevel(level));
+}
+
+void WriteImpl(std::string_view log_class, Level level, SourceLocation source,
+               fmt::string_view format, fmt::format_args args) noexcept {
+    const auto it = ALL_LOGGERS.find(log_class);
+    if (it == ALL_LOGGERS.end() || !it->second) {
+        return;
+    }
+    const auto logger = it->second;
+    const auto backend_level = BackendLevel(level);
+    if (!logger->should_log(backend_level)) {
+        return;
+    }
+
+    const spdlog::source_loc location{source.file, source.line, source.function};
+    try {
+        fmt::memory_buffer buffer;
+        fmt::format_to(std::back_inserter(buffer), "[{}] <{}> ({}) {}:{} {}: ", log_class,
+                       level_names[static_cast<std::size_t>(level)], Common::GetCurrentThreadName(),
+                       location.short_filename, source.line,
+                       std::string_view(source.function) == "operator()" ? "lambda"
+                                                                         : source.function);
+        fmt::vformat_to(std::back_inserter(buffer), format, args);
+        logger->log(backend_level, std::string_view(buffer.data(), buffer.size()));
+    } catch (const std::exception& exception) {
+        static spdlog::details::err_helper errors;
+        errors.handle_ex(logger->name(), location, exception);
+    } catch (...) {
+        static spdlog::details::err_helper errors;
+        errors.handle_unknown_ex(logger->name(), location);
+    }
+}
 
 template <typename T>
 static auto UpdateColorLevels(T sink) {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <common/assert.h>
+#include "common/logging/log.h"
 #include "core/libraries/kernel/kernel.h"
 #include "net.h"
 #include "net_error.h"

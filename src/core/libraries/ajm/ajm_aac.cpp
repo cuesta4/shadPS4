@@ -4,6 +4,7 @@
 #include "ajm.h"
 #include "ajm_aac.h"
 #include "ajm_result.h"
+#include "common/logging/log.h"
 
 #include <aacdecoder_lib.h>
 // using this internal header to manually configure the decoder in RAW mode
