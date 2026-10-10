@@ -95,25 +95,33 @@ void L::DrawMenuBar() {
                 SliderFloat("Gamma", &pp_settings.gamma, 0.1f, 2.0f);
                 ImGui::EndMenu();
             }
-            if (BeginMenu("FSR")) {
-                auto& fsr = presenter->GetFsrSettingsRef();
-                Checkbox("FSR Enabled", &fsr.enable);
-                BeginDisabled(!fsr.enable);
-                {
-                    Checkbox("RCAS", &fsr.use_rcas);
-                    BeginDisabled(!fsr.use_rcas);
-                    {
-                        SliderFloat("RCAS Attenuation", &fsr.rcas_attenuation, 0.0, 3.0);
-                    }
-                    EndDisabled();
+            if (BeginMenu("Image Processing")) {
+                auto options = presenter->GetPostFxOptions();
+                constexpr const char* aa[] = {"None", "FSR1", "PSMAA", "CMAA2"};
+                constexpr const char* sharp[] = {"None", "RCAS"};
+                int aa_index = options.anti_aliasing > 1 ? options.anti_aliasing - 1
+                                                        : options.anti_aliasing;
+                bool changed = Combo("Anti-aliasing", &aa_index, aa, 4);
+                options.anti_aliasing = aa_index > 1 ? aa_index + 1 : aa_index;
+                changed |= Combo("Upscaler / Downscaler", &options.upscaler, aa, 2);
+                changed |= Combo("Sharpening", &options.sharpening, sharp, 2);
+                float attenuation = options.attenuation / 1000.f;
+                BeginDisabled(options.sharpening == 0);
+                if (SliderFloat("RCAS Attenuation", &attenuation, 0.0, 3.0)) {
+                    options.attenuation = static_cast<int>(attenuation * 1000);
+                    changed = true;
                 }
                 EndDisabled();
+                if (changed) {
+                    presenter->SetPostFxOptions(options.upscaler, options.anti_aliasing,
+                                               options.sharpening, options.attenuation);
+                }
 
                 if (Button("Save")) {
-                    EmulatorSettings.SetFsrEnabled(fsr.enable);
-                    EmulatorSettings.SetRcasEnabled(fsr.use_rcas);
-                    EmulatorSettings.SetRcasAttenuation(
-                        static_cast<int>(fsr.rcas_attenuation * 1000));
+                    EmulatorSettings.SetUpscaler(options.upscaler);
+                    EmulatorSettings.SetAntiAliasing(options.anti_aliasing);
+                    EmulatorSettings.SetSharpening(options.sharpening);
+                    EmulatorSettings.SetRcasAttenuation(options.attenuation);
                     EmulatorSettings.Save();
                     CloseCurrentPopup();
                 }
@@ -123,12 +131,8 @@ void L::DrawMenuBar() {
             ImGui::EndMenu();
         }
         if (BeginMenu("Debug")) {
-            if (MenuItem("Memory map")) {
-                memory_map.open = true;
-            }
-            if (MenuItem("Module list")) {
-                module_list.open = true;
-            }
+            MenuItem("Memory map", nullptr, &memory_map.open);
+            MenuItem("Module list", nullptr, &module_list.open);
             ImGui::EndMenu();
         }
 
@@ -156,7 +160,7 @@ void L::DrawAdvanced() {
 
     frame_graph.Draw();
 
-    if (DebugState.should_show_frame_dump && DebugState.waiting_reg_dumps.empty()) {
+    if (DebugState.should_show_frame_dump && !DebugState.DumpingCurrentReg()) {
         DebugState.should_show_frame_dump = false;
         std::unique_lock lock{DebugState.frame_dump_list_mutex};
         while (!DebugState.frame_dump_list.empty()) {
@@ -303,6 +307,18 @@ static void LoadSettings(const char* line) {
         frame_graph.is_open = i != 0;
         return;
     }
+    if (sscanf(line, "show_shader_list=%d", &i) == 1) {
+        shader_list.open = i != 0;
+        return;
+    }
+    if (sscanf(line, "show_memory_map=%d", &i) == 1) {
+        memory_map.open = i != 0;
+        return;
+    }
+    if (sscanf(line, "show_module_list=%d", &i) == 1) {
+        module_list.open = i != 0;
+        return;
+    }
     if (sscanf(line, "dump_frame_count=%d", &i) == 1) {
         dump_frame_count = i;
         return;
@@ -344,6 +360,9 @@ void L::SetupSettings() {
         buf->appendf("fps_scale=%f\n", fps_scale);
         buf->appendf("show_advanced_debug=%d\n", DebugState.IsShowingDebugMenuBar());
         buf->appendf("show_frame_graph=%d\n", frame_graph.is_open);
+        buf->appendf("show_shader_list=%d\n", shader_list.open);
+        buf->appendf("show_memory_map=%d\n", memory_map.open);
+        buf->appendf("show_module_list=%d\n", module_list.open);
         buf->appendf("dump_frame_count=%d\n", dump_frame_count);
         buf->append("\n");
         buf->appendf("[%s][CmdList]\n", handler->TypeName);
@@ -479,6 +498,10 @@ void L::Draw() {
     }
 
     PopID();
+}
+
+bool L::NeedsRender() const {
+    return show_simple_fps || show_quit_window || show_volume || DebugState.IsShowingDebugMenuBar();
 }
 
 namespace Overlay {

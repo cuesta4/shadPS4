@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D input_image;
+layout(set = 0, binding = 9) uniform sampler linear_sampler;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D output_image;
+layout(push_constant) uniform Constants {
+    vec4 metrics;
+    vec4 target;
+    uint conversion;
+} params;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pos, imageSize(output_image)))) return;
+    vec3 c = textureLod(sampler2D(input_image, linear_sampler), (vec2(pos) + 0.5) * params.target.xy, 0).rgb;
+    if (params.conversion == 1)
+        c = mix(1.055 * pow(max(c, vec3(0)), vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+    else if (params.conversion == 2)
+        c = mix(pow(max((c + 0.055) / 1.055, vec3(0)), vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+    imageStore(output_image, pos, vec4(c, 1));
+}

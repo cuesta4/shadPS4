@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include "common/logging/log.h"
 #include "input_handler.h"
 
 #include <fstream>
@@ -182,6 +184,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
             {"hotkey_emulator_settings", "f3"},
+            {"hotkey_toggle_friends", "f2"},
         };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
@@ -804,6 +807,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case HOTKEY_OPEN_EMULATOR_SETTINGS:
             ImGuiEmuSettings::OpenInGameSettingsDialog();
+            break;
+        case HOTKEY_TOGGLE_FRIENDS:
+            PushSDLEvent(SDL_EVENT_TOGGLE_FRIENDS);
             break;
         case KEY_TOGGLE:
             // noop

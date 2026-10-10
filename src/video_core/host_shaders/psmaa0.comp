@@ -1,0 +1,107 @@
+// SPDX-FileCopyrightText: Copyright 2025 RdenBlaauwen; Jorge Jimenez et al.; NVIDIA Corporation; Derek Brush
+// SPDX-License-Identifier: LicenseRef-PSMAA-ThirdParty
+
+#version 450
+#extension GL_EXT_spirv_intrinsics : require
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float _69;
+
+layout(push_constant, std430) uniform type_PushConstant_Constants
+{
+    vec4 metrics;
+    vec4 target;
+    uint conversion;
+} params;
+
+layout(set = 0, binding = 0) uniform texture2D tex0;
+layout(set = 0, binding = 8) uniform sampler point_sampler;
+layout(set = 0, binding = 9) uniform sampler linear_sampler;
+layout(set = 0, binding = 10, PSMAA_LUMA_FORMAT) uniform writeonly image2D output0;
+layout(set = 0, binding = 12, PSMAA_VECTOR_FORMAT) uniform writeonly image2D output2;
+
+spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec2 spvNMin(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec3 spvNMin(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec4 spvNMin(vec4, vec4);
+spirv_instruction(set = "GLSL.std.450", id = 80) float spvNMax(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
+
+void main()
+{
+    do
+    {
+        if (any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(params.target.zw))))
+        {
+            break;
+        }
+        float _164;
+        vec2 _88 = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) * params.metrics.xy;
+        vec2 _285;
+        do
+        {
+            vec4 _94 = textureGather(sampler2D(tex0, point_sampler), _88);
+            vec4 _97 = textureGather(sampler2D(tex0, point_sampler), _88, 1);
+            vec4 _100 = textureGather(sampler2D(tex0, point_sampler), _88, 2);
+            float _101 = _94.w;
+            float _102 = _97.w;
+            float _103 = _100.w;
+            vec3 _104 = vec3(_101, _102, _103);
+            float _105 = _94.z;
+            float _106 = _97.z;
+            float _107 = _100.z;
+            vec3 _108 = vec3(_105, _106, _107);
+            float _109 = _94.x;
+            float _110 = _97.x;
+            float _111 = _100.x;
+            vec3 _112 = vec3(_109, _110, _111);
+            vec2 _120 = vec4(_88, _69, _69).xy;
+            vec4 _131 = textureLod(sampler2D(tex0, linear_sampler), _120 + (vec2(-1.0, 0.0) * params.metrics.xy), 0.0);
+            vec3 _132 = _131.xyz;
+            vec4 _143 = textureLod(sampler2D(tex0, linear_sampler), _120 + (vec2(0.0, -1.0) * params.metrics.xy), 0.0);
+            vec3 _144 = _143.xyz;
+            vec3 _159 = spvNMax(spvNMax(spvNMax(textureLod(sampler2D(tex0, linear_sampler), _120 + (vec2(-1.0) * params.metrics.xy), 0.0).xyz, _132), spvNMax(textureLod(sampler2D(tex0, linear_sampler), _120 + (vec2(-1.0, 1.0) * params.metrics.xy), 0.0).xyz, _144)), spvNMax(spvNMax(_112, textureLod(sampler2D(tex0, linear_sampler), _120 + (vec2(1.0, -1.0) * params.metrics.xy), 0.0).xyz), spvNMax(spvNMax(_108, vec3(_94.y, _97.y, _100.y)), _104))) * vec3(0.296999990940093994140625, 1.0, 0.101000003516674041748046875);
+            _164 = spvNMax(spvNMax(_159.x, _159.y), _159.z);
+            float _165 = _131.x;
+            float _166 = _131.y;
+            float _168 = _131.z;
+            float _177 = spvNMax(spvNMax(_101, _102), _103) - spvNMin(spvNMin(_101, _102), _103);
+            vec3 _179 = abs(_132 - _104);
+            float _188 = _143.x;
+            float _189 = _143.y;
+            float _191 = _143.z;
+            vec3 _197 = abs(_144 - _104);
+            vec3 _212 = abs(_108 - _104);
+            vec3 _227 = abs(_112 - _104);
+            vec4 _236 = vec4(mix(dot(_179, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)), spvNMax(spvNMax(_179.x, _179.y), _179.z), spvNMax(spvNMax(spvNMax(_165, _166), _168) - spvNMin(spvNMin(_165, _166), _168), _177)), mix(dot(_197, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)), spvNMax(spvNMax(_197.x, _197.y), _197.z), spvNMax(spvNMax(spvNMax(_188, _189), _191) - spvNMin(spvNMin(_188, _189), _191), _177)), mix(dot(_212, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)), spvNMax(spvNMax(_212.x, _212.y), _212.z), spvNMax(spvNMax(spvNMax(_105, _106), _107) - spvNMin(spvNMin(_105, _106), _107), _177)), mix(dot(_227, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)), spvNMax(spvNMax(_227.x, _227.y), _227.z), spvNMax(spvNMax(spvNMax(_109, _110), _111) - spvNMin(spvNMin(_109, _110), _111), _177)));
+            vec2 _240 = spvNMax(vec2(mix(0.004999999888241291046142578125, 0.070000000298023223876953125, _164)) * 3.5, vec2(0.014999999664723873138427734375));
+            float _241 = _240.x;
+            vec4 _242 = vec4(_241);
+            if (dot(step(_242, _236), vec4(1.0)) < 2.0)
+            {
+                _285 = vec2(0.0);
+                break;
+            }
+            vec2 _250 = spvNMax(_236.xy, _236.zw);
+            vec4 _259 = step(_242, mix(_236, (_236 * _236) / vec4((_250.x + _250.y) * 0.5), vec4(0.85000002384185791015625)));
+            vec4 _273 = smoothstep(vec4(_241 * 0.5555555820465087890625), vec4(_241 * 1.7999999523162841796875), _236);
+            _285 = vec2(spvNMax(((_273.x + _273.z) * (_273.y + _273.w)) * 0.25, 0.1500000059604644775390625) * 0.699999988079071044921875, float(((_259.x + _259.z) * (_259.y + _259.w)) == 1.0));
+            break;
+        } while(false);
+        imageStore(output0, ivec2(gl_GlobalInvocationID.xy), vec4(_164, 0.0, 0.0, 0.0));
+        imageStore(output2, ivec2(gl_GlobalInvocationID.xy), vec4(_285, 0.0, 0.0));
+        break;
+    } while(false);
+}

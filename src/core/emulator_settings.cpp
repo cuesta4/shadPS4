@@ -11,31 +11,226 @@
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "emulator_settings.h"
+#include "emulator_settings_serialization.h"
 #include "emulator_state.h"
 
 #include <SDL3/SDL_messagebox.h>
 
 using json = nlohmann::json;
 
+std::ostream& operator<<(std::ostream& output, WindowsGuestRedZoneProtectionMode mode) {
+    return output << nlohmann::json(mode).get<std::string>();
+}
+
+std::vector<OverrideItem> GeneralSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<GeneralSettings>("volume_slider", &GeneralSettings::volume_slider),
+        make_override<GeneralSettings>("neo_mode", &GeneralSettings::neo_mode),
+        make_override<GeneralSettings>("dev_kit_mode", &GeneralSettings::dev_kit_mode),
+        make_override<GeneralSettings>("extra_dmem_in_mbytes",
+                                       &GeneralSettings::extra_dmem_in_mbytes),
+        make_override<GeneralSettings>("extra_fmem_in_mbytes",
+                                       &GeneralSettings::extra_fmem_in_mbytes),
+        make_override<GeneralSettings>("app0_read_bandwidth_mibps",
+                                       &GeneralSettings::app0_read_bandwidth_mibps),
+        make_override<GeneralSettings>("app0_read_disable_time_stretching",
+                                       &GeneralSettings::app0_read_disable_time_stretching),
+        make_override<GeneralSettings>("shad_net_enabled", &GeneralSettings::shad_net_enabled),
+        make_override<GeneralSettings>("trophy_popup_disabled",
+                                       &GeneralSettings::trophy_popup_disabled),
+        make_override<GeneralSettings>("trophy_notification_duration",
+                                       &GeneralSettings::trophy_notification_duration),
+        make_override<GeneralSettings>("show_splash", &GeneralSettings::show_splash),
+        make_override<GeneralSettings>("trophy_notification_side",
+                                       &GeneralSettings::trophy_notification_side),
+        make_override<GeneralSettings>("connected_to_network",
+                                       &GeneralSettings::connected_to_network),
+        make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
+        make_override<GeneralSettings>("shadnet_server", &GeneralSettings::shadnet_server),
+        make_override<GeneralSettings>("shadnet_webapi_server",
+                                       &GeneralSettings::shadnet_webapi_server),
+        make_override<GeneralSettings>("signaling_info", &GeneralSettings::signaling_info),
+        make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp)};
+}
+
+std::vector<OverrideItem> LogSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<LogSettings>("append", &LogSettings::append),
+        make_override<LogSettings>("enable", &LogSettings::enable),
+        make_override<LogSettings>("filter", &LogSettings::filter),
+        make_override<LogSettings>("flush_level", &LogSettings::flush_level),
+        make_override<LogSettings>("max_skip_duration", &LogSettings::max_skip_duration),
+        make_override<LogSettings>("separate", &LogSettings::separate),
+        make_override<LogSettings>("size_limit", &LogSettings::size_limit),
+        make_override<LogSettings>("skip_duplicate", &LogSettings::skip_duplicate),
+        make_override<LogSettings>("sync", &LogSettings::sync),
+#ifdef _WIN32
+        make_override<LogSettings>("type", &LogSettings::type),
+#endif
+    };
+}
+
+std::vector<OverrideItem> DebugSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<DebugSettings>("debug_dump", &DebugSettings::debug_dump),
+        make_override<DebugSettings>("shader_collect", &DebugSettings::shader_collect)};
+}
+
+std::vector<OverrideItem> InputSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<InputSettings>("cursor_state", &InputSettings::cursor_state),
+        make_override<InputSettings>("cursor_hide_timeout",
+                                     &InputSettings::cursor_hide_timeout),
+        make_override<InputSettings>("usb_device_backend", &InputSettings::usb_device_backend),
+        make_override<InputSettings>("motion_controls_enabled",
+                                     &InputSettings::motion_controls_enabled),
+        make_override<InputSettings>("background_controller_input",
+                                     &InputSettings::background_controller_input),
+        make_override<InputSettings>("ime_accessibility_enabled",
+                                     &InputSettings::ime_accessibility_enabled),
+        make_override<InputSettings>("ime_url_mail_short_panel",
+                                     &InputSettings::ime_url_mail_short_panel),
+        make_override<InputSettings>("is_circle_enter", &InputSettings::is_circle_enter),
+        make_override<InputSettings>("camera_id", &InputSettings::camera_id),
+        make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice)};
+}
+
+std::vector<OverrideItem> AudioSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<AudioSettings>("audio_backend", &AudioSettings::audio_backend),
+        make_override<AudioSettings>("sdl_mic_device", &AudioSettings::sdl_mic_device),
+        make_override<AudioSettings>("sdl_main_output_device",
+                                     &AudioSettings::sdl_main_output_device),
+        make_override<AudioSettings>("sdl_padSpk_output_device",
+                                     &AudioSettings::sdl_padSpk_output_device),
+        make_override<AudioSettings>("openal_mic_device", &AudioSettings::openal_mic_device),
+        make_override<AudioSettings>("openal_main_output_device",
+                                     &AudioSettings::openal_main_output_device),
+        make_override<AudioSettings>("openal_padSpk_output_device",
+                                     &AudioSettings::openal_padSpk_output_device),
+        make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
+        make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+}
+
+std::vector<OverrideItem> WindowsGuestRedZoneProtectionSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{make_override<WindowsGuestRedZoneProtectionSettings>(
+        "windows_guest_red_zone_protection_mode",
+        &WindowsGuestRedZoneProtectionSettings::windows_guest_red_zone_protection_mode)};
+}
+
+std::vector<OverrideItem> GPUSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<GPUSettings>("null_gpu", &GPUSettings::null_gpu),
+        make_override<GPUSettings>("copy_gpu_buffers", &GPUSettings::copy_gpu_buffers),
+        make_override<GPUSettings>("full_screen", &GPUSettings::full_screen),
+        make_override<GPUSettings>("full_screen_mode", &GPUSettings::full_screen_mode),
+        make_override<GPUSettings>("present_mode", &GPUSettings::present_mode),
+        make_override<GPUSettings>("enable_reflex", &GPUSettings::enable_reflex),
+        make_override<GPUSettings>("vrr_pacing", &GPUSettings::vrr_pacing),
+        make_override<GPUSettings>("window_height", &GPUSettings::window_height),
+        make_override<GPUSettings>("window_width", &GPUSettings::window_width),
+        make_override<GPUSettings>("hdr_allowed", &GPUSettings::hdr_allowed),
+        make_override<GPUSettings>("upscaler", &GPUSettings::upscaler),
+        make_override<GPUSettings>("anti_aliasing", &GPUSettings::anti_aliasing),
+        make_override<GPUSettings>("sharpening", &GPUSettings::sharpening),
+        make_override<GPUSettings>("fsr_enabled", &GPUSettings::fsr_enabled),
+        make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
+        make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
+        make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
+        make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
+        make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
+        make_override<GPUSettings>("readback_linear_images_enabled",
+                                   &GPUSettings::readback_linear_images_enabled),
+        make_override<GPUSettings>("direct_memory_access_enabled",
+                                   &GPUSettings::direct_memory_access_enabled),
+        make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
+    };
+}
+
+std::vector<OverrideItem> VulkanSettings::GetOverrideableFields() const {
+    return std::vector<OverrideItem>{
+        make_override<VulkanSettings>("gpu_id", &VulkanSettings::gpu_id),
+        make_override<VulkanSettings>("renderdoc_enabled", &VulkanSettings::renderdoc_enabled),
+        make_override<VulkanSettings>("vkvalidation_enabled",
+                                      &VulkanSettings::vkvalidation_enabled),
+        make_override<VulkanSettings>("vkvalidation_core_enabled",
+                                      &VulkanSettings::vkvalidation_core_enabled),
+        make_override<VulkanSettings>("vkvalidation_sync_enabled",
+                                      &VulkanSettings::vkvalidation_sync_enabled),
+        make_override<VulkanSettings>("vkvalidation_gpu_enabled",
+                                      &VulkanSettings::vkvalidation_gpu_enabled),
+        make_override<VulkanSettings>("vkcrash_diagnostic_enabled",
+                                      &VulkanSettings::vkcrash_diagnostic_enabled),
+        make_override<VulkanSettings>("vkhost_markers", &VulkanSettings::vkhost_markers),
+        make_override<VulkanSettings>("vkguest_markers", &VulkanSettings::vkguest_markers),
+        make_override<VulkanSettings>("pipeline_cache_enabled",
+                                      &VulkanSettings::pipeline_cache_enabled),
+        make_override<VulkanSettings>("pipeline_cache_archived",
+                                      &VulkanSettings::pipeline_cache_archived),
+        make_override<VulkanSettings>("async_shader_recompiling",
+                                      &VulkanSettings::async_shader_recompiling),
+        make_override<VulkanSettings>("use_nv_raw_access_chains",
+                                      &VulkanSettings::use_nv_raw_access_chains),
+        make_override<VulkanSettings>("force_uniform_buffers",
+                                      &VulkanSettings::force_uniform_buffers),
+        make_override<VulkanSettings>("gpu_frames_ahead", &VulkanSettings::gpu_frames_ahead),
+    };
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetGeneralOverrideableFields() const {
+    return m_general.GetOverrideableFields();
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetDebugOverrideableFields() const {
+    return m_debug.GetOverrideableFields();
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetInputOverrideableFields() const {
+    return m_input.GetOverrideableFields();
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetAudioOverrideableFields() const {
+    return m_audio.GetOverrideableFields();
+}
+
+std::vector<OverrideItem>
+EmulatorSettingsImpl::GetWindowsGuestRedZoneProtectionOverrideableFields() const {
+    return m_windows_guest_red_zone_protection.GetOverrideableFields();
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetGPUOverrideableFields() const {
+    return m_gpu.GetOverrideableFields();
+}
+
+std::vector<OverrideItem> EmulatorSettingsImpl::GetVulkanOverrideableFields() const {
+    return m_vulkan.GetOverrideableFields();
+}
+
+static void MigratePostFx(json& config, bool legacy_fsr, bool legacy_rcas) {
+    if (!config.contains("GPU")) {
+        return;
+    }
+    auto& gpu = config["GPU"];
+    const bool enabled = gpu.value("fsr_enabled", legacy_fsr);
+    if (!gpu.contains("upscaler") && gpu.contains("fsr_enabled")) {
+        gpu["upscaler"] = enabled ? 1 : 0;
+    }
+    if (!gpu.contains("sharpening") &&
+        (gpu.contains("fsr_enabled") || gpu.contains("rcas_enabled"))) {
+        gpu["sharpening"] = enabled && gpu.value("rcas_enabled", legacy_rcas) ? 1 : 0;
+    }
+    if (const auto it = gpu.find("upscaler"); it != gpu.end() && *it != 0 && *it != 1) {
+        *it = 0;
+    }
+    if (const auto it = gpu.find("anti_aliasing");
+        it != gpu.end() && *it != 0 && *it != 1 && *it != 3 && *it != 4) {
+        *it = 0;
+    }
+}
+
 // ── Singleton storage ─────────────────────────────────────────────────
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::s_instance = nullptr;
 std::mutex EmulatorSettingsImpl::s_mutex;
-
-// ── nlohmann helpers for std::filesystem::path ───────────────────────
-namespace nlohmann {
-template <>
-struct adl_serializer<std::filesystem::path> {
-    static void to_json(json& j, const std::filesystem::path& p) {
-        const auto u8 = p.u8string();
-        j = std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
-    }
-    static void from_json(const json& j, std::filesystem::path& p) {
-        const std::string s = j.get<std::string>();
-        p = std::filesystem::path(
-            std::u8string_view(reinterpret_cast<const char8_t*>(s.data()), s.size()));
-    }
-};
-} // namespace nlohmann
 
 namespace toml {
 // why is it so hard to avoid exceptions with this library
@@ -89,7 +284,6 @@ std::optional<T> get_optional(const toml::value& v, const std::string& key) {
 
 void EmulatorSettingsImpl::PrintChangedSummary(const std::vector<std::string>& changed) {
     if (changed.empty()) {
-        LOG_DEBUG(Config, "No game-specific overrides applied");
         return;
     }
     LOG_DEBUG(Config, "Game-specific overrides applied:");
@@ -225,14 +419,15 @@ void EmulatorSettingsImpl::SetAddonInstallDir(const std::filesystem::path& dir) 
 
 // ── Game-specific override management ────────────────────────────────
 void EmulatorSettingsImpl::ClearGameSpecificOverrides() {
-    ClearGroupOverrides(m_general);
-    ClearGroupOverrides(m_log);
-    ClearGroupOverrides(m_debug);
-    ClearGroupOverrides(m_input);
-    ClearGroupOverrides(m_audio);
-    ClearGroupOverrides(m_gpu);
-    ClearGroupOverrides(m_vulkan);
-    LOG_DEBUG(Config, "All game-specific overrides cleared");
+    SettingsSerialization::ClearGroupOverrides(m_general);
+    SettingsSerialization::ClearGroupOverrides(m_log);
+    SettingsSerialization::ClearGroupOverrides(m_debug);
+    SettingsSerialization::ClearGroupOverrides(m_input);
+    SettingsSerialization::ClearGroupOverrides(m_audio);
+    // Windows static guest red-zone protection
+    SettingsSerialization::ClearGroupOverrides(m_windows_guest_red_zone_protection);
+    SettingsSerialization::ClearGroupOverrides(m_gpu);
+    SettingsSerialization::ClearGroupOverrides(m_vulkan);
 }
 
 void EmulatorSettingsImpl::ResetGameSpecificValue(const std::string& key) {
@@ -256,6 +451,9 @@ void EmulatorSettingsImpl::ResetGameSpecificValue(const std::string& key) {
         return;
     if (tryGroup(m_audio))
         return;
+    // Windows static guest red-zone protection
+    if (tryGroup(m_windows_guest_red_zone_protection))
+        return;
     if (tryGroup(m_gpu))
         return;
     if (tryGroup(m_vulkan))
@@ -273,31 +471,37 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
             json j = json::object();
 
             json generalObj = json::object();
-            SaveGroupGameSpecific(m_general, generalObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_general, generalObj);
             j["General"] = generalObj;
 
             json logObj = json::object();
-            SaveGroupGameSpecific(m_log, logObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_log, logObj);
             j["Log"] = logObj;
 
             json debugObj = json::object();
-            SaveGroupGameSpecific(m_debug, debugObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_debug, debugObj);
             j["Debug"] = debugObj;
 
             json inputObj = json::object();
-            SaveGroupGameSpecific(m_input, inputObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_input, inputObj);
             j["Input"] = inputObj;
 
             json audioObj = json::object();
-            SaveGroupGameSpecific(m_audio, audioObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_audio, audioObj);
             j["Audio"] = audioObj;
 
+            // Windows static guest red-zone protection
+            json windowsGuestRedZoneProtectionObj = json::object();
+            SettingsSerialization::SaveGroupGameSpecific(m_windows_guest_red_zone_protection,
+                                  windowsGuestRedZoneProtectionObj);
+            j["WindowsGuestRedZoneProtection"] = windowsGuestRedZoneProtectionObj;
+
             json gpuObj = json::object();
-            SaveGroupGameSpecific(m_gpu, gpuObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_gpu, gpuObj);
             j["GPU"] = gpuObj;
 
             json vulkanObj = json::object();
-            SaveGroupGameSpecific(m_vulkan, vulkanObj);
+            SettingsSerialization::SaveGroupGameSpecific(m_vulkan, vulkanObj);
             j["Vulkan"] = vulkanObj;
 
             std::ofstream out(path);
@@ -359,16 +563,19 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
 // ── Load ──────────────────────────────────────────────────────────────
 
 bool EmulatorSettingsImpl::Load(const std::string& serial) {
+    // A newly loaded profile replaces, rather than extends, the previous profile.
+    ClearGameSpecificOverrides(); // Windows static guest red-zone protection
+
     try {
         if (serial.empty()) {
             // ── Global config ──────────────────────────────────────────
             const auto userDir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
             const auto configPath = userDir / "config.json";
-            LOG_DEBUG(Config, "Loading global config from: {}", configPath.string());
 
             if (std::ifstream in{configPath}; in.good()) {
                 json gj;
                 in >> gj;
+                MigratePostFx(gj, m_gpu.fsr_enabled.get(), m_gpu.rcas_enabled.get());
 
                 auto mergeGroup = [&gj](auto& group, const char* section) {
                     if (!gj.contains(section))
@@ -385,8 +592,6 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
                 mergeGroup(m_vulkan, "Vulkan");
-
-                LOG_DEBUG(Config, "Global config loaded successfully");
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {
@@ -420,7 +625,6 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                         }
                     }
                 }
-                LOG_DEBUG(Config, "Global config not found - using defaults");
                 SetDefaultValues();
                 Save();
             }
@@ -436,21 +640,19 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             // base configuration.
             const auto gamePath =
                 Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (serial + ".json");
-            LOG_DEBUG(Config, "Applying game config: {}", gamePath.string());
 
             if (!std::filesystem::exists(gamePath)) {
-                LOG_DEBUG(Config, "No game-specific config found for {}", serial);
                 return false;
             }
 
             std::ifstream in(gamePath);
             if (!in) {
-                LOG_ERROR(Config, "Failed to open game config: {}", gamePath.string());
                 return false;
             }
 
             json gj;
             in >> gj;
+            MigratePostFx(gj, m_gpu.upscaler.get() == 1, m_gpu.sharpening.get() == 1);
 
             std::vector<std::string> changed;
 
@@ -459,19 +661,23 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             // ConfigMode::Default will then resolve them at getter call
             // time without ever touching the base values.
             if (gj.contains("General"))
-                ApplyGroupOverrides(m_general, gj.at("General"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_general, gj.at("General"), changed);
             if (gj.contains("Log"))
-                ApplyGroupOverrides(m_log, gj.at("Log"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_log, gj.at("Log"), changed);
             if (gj.contains("Debug"))
-                ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
             if (gj.contains("Input"))
-                ApplyGroupOverrides(m_input, gj.at("Input"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_input, gj.at("Input"), changed);
             if (gj.contains("Audio"))
-                ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
+            // Windows static guest red-zone protection
+            if (gj.contains("WindowsGuestRedZoneProtection"))
+                SettingsSerialization::ApplyGroupOverrides(m_windows_guest_red_zone_protection,
+                    gj.at("WindowsGuestRedZoneProtection"), changed);
             if (gj.contains("GPU"))
-                ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
             if (gj.contains("Vulkan"))
-                ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
+                SettingsSerialization::ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
 
             PrintChangedSummary(changed);
             EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
@@ -489,6 +695,8 @@ void EmulatorSettingsImpl::SetDefaultValues() {
     m_debug = DebugSettings{};
     m_input = InputSettings{};
     m_audio = AudioSettings{};
+    // Windows static guest red-zone protection
+    m_windows_guest_red_zone_protection = WindowsGuestRedZoneProtectionSettings{};
     m_gpu = GPUSettings{};
     m_vulkan = VulkanSettings{};
 }
@@ -616,6 +824,8 @@ bool EmulatorSettingsImpl::TransferSettings() {
         setFromToml(s.fsr_enabled, gpu, "fsrEnabled");
         setFromToml(s.rcas_enabled, gpu, "rcasEnabled");
         setFromToml(s.rcas_attenuation, gpu, "rcasAttenuation");
+        s.upscaler.set(s.fsr_enabled.get() ? 1 : 0);
+        s.sharpening.set(s.fsr_enabled.get() && s.rcas_enabled.get() ? 1 : 0);
     }
 
     if (og_data.contains("Vulkan")) {
@@ -747,6 +957,8 @@ std::vector<std::string> EmulatorSettingsImpl::GetAllOverrideableKeys() const {
     addGroup(m_debug.GetOverrideableFields());
     addGroup(m_input.GetOverrideableFields());
     addGroup(m_audio.GetOverrideableFields());
+    // Windows static guest red-zone protection
+    addGroup(m_windows_guest_red_zone_protection.GetOverrideableFields());
     addGroup(m_gpu.GetOverrideableFields());
     addGroup(m_vulkan.GetOverrideableFields());
     return keys;

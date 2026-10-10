@@ -11,6 +11,7 @@ struct Bindings {
     u32 unified{};
     u32 buffer{};
     u32 user_data{};
+    u32 uniform_buffers{};
 
     auto operator<=>(const Bindings&) const = default;
 };

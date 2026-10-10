@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <array>
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -42,6 +44,11 @@ enum class MemoryProt : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryProt)
 
+enum class MemoryWriteOrigin : u8 {
+    CommandProcessor,
+    GpuCompletion,
+};
+
 enum class MemoryMapFlags : u32 {
     NoFlags = 0,
     Shared = 1,
@@ -52,6 +59,7 @@ enum class MemoryMapFlags : u32 {
     Stack = 0x400,
     NoSync = 0x800,
     Anon = 0x1000,
+    System = 0x2000,
     NoCore = 0x20000,
     NoCoalesce = 0x400000,
 };
@@ -100,6 +108,7 @@ enum class VMAType : u32 {
     Stack = 6,
     Code = 7,
     File = 8,
+    System = 9,
 };
 
 struct VirtualMemoryArea {
@@ -232,13 +241,39 @@ public:
         return size_to_validate <= 0;
     }
 
-    u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+    u64 ClampRangeSize(VAddr virtual_addr, u64 size) {
+        // Dont bother with clamping if the size is small so we dont pay a map lookup on every
+        // buffer, nor a call.
+        if (size < MinSizeToClamp) [[likely]] {
+            return size;
+        }
+        return ClampRangeSizeSlow(virtual_addr, size);
+    }
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
-    void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    struct SparseCopyRequest {
+        VAddr source{};
+        u8* destination{};
+        u64 size{};
+    };
 
-    bool TryWriteBacking(void* address, const void* data, u64 size);
+    void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    /// Copies a request batch whose sizes sum to total_size.
+    void CopySparseMemoryBatch(std::span<const SparseCopyRequest> requests, u64 total_size,
+                               bool allow_non_temporal = true);
+
+    bool TryWriteBacking(void* address, const void* data, u64 size,
+                         MemoryWriteOrigin origin = MemoryWriteOrigin::CommandProcessor);
+
+    /// Returns true when every byte of the range lives in physical backing, so ReadBacking can
+    /// read it.
+    [[nodiscard]] bool IsBackedRange(VAddr source, u64 size);
+
+    /// Reads guest memory through the backing view, which ignores the page protection of the
+    /// guest mapping and so never faults. Returns false, copying nothing meaningful, when part of
+    /// the range has no physical backing.
+    bool ReadBacking(VAddr source, u8* destination, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -289,6 +324,25 @@ public:
     void InvalidateMemory(VAddr addr, u64 size) const;
 
 private:
+    static constexpr u64 MinSizeToClamp = 1ULL << 30;
+
+    u64 ClampRangeSizeSlow(VAddr virtual_addr, u64 size);
+
+    struct SparseCopyStats {
+        u32 mapped_runs{};
+        u32 zero_runs{};
+        u32 non_temporal_runs{};
+        u64 mapped_bytes{};
+        u64 zero_bytes{};
+        u64 non_temporal_bytes{};
+    };
+
+    [[nodiscard]] bool ResolveMappedSpan(VAddr source, u64 size, VAddr& span_begin,
+                                         VAddr& span_end);
+    [[nodiscard]] bool CopySparseMemoryCold(const SparseCopyRequest& request,
+                                            bool allow_non_temporal,
+                                            SparseCopyStats* stats);
+
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
     }
@@ -300,6 +354,9 @@ private:
     PhysHandle FindFmemArea(PAddr target) {
         return std::prev(fmem_map.upper_bound(target));
     }
+
+    template <bool copy>
+    bool WalkBackingLocked(VAddr source, u8* destination, u64 size);
 
     bool HasPhysicalBacking(VirtualMemoryArea vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
@@ -352,6 +409,7 @@ private:
         }
     };
     std::array<PrtArea, 3> prt_areas{};
+    u64 mapping_generation{1};
 
     friend class ::Core::Devtools::Widget::MemoryMapViewer;
 };

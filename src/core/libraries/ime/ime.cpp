@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <queue>
+
 #include "common/logging/log.h"
 #include "core/libraries/ime/ime.h"
 #include "core/libraries/ime/ime_dialog.h"

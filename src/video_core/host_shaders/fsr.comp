@@ -40,8 +40,8 @@ layout (push_constant) uniform const_buffer
 #include "fsr/ffx_a.h"
 
 layout (set = 0, binding = 0) uniform texture2D InputTexture;
-layout (set = 0, binding = 1, rgba16f) uniform image2D OutputTexture;
-layout (set = 0, binding = 2) uniform sampler InputSampler;
+layout (set = 0, binding = 10, rgba16f) uniform image2D OutputTexture;
+layout (set = 0, binding = 9) uniform sampler InputSampler;
 
 #if SAMPLE_EASU
 #define FSR_EASU_H 1
@@ -52,7 +52,7 @@ AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, Input
 
 #if SAMPLE_RCAS
 #define FSR_RCAS_H
-AH4 FsrRcasLoadH(ASW2 p) { return AH4(texelFetch(sampler2D(InputTexture, InputSampler), ASU2(p), 0)); }
+AH4 FsrRcasLoadH(ASW2 p) { return AH4(texelFetch(sampler2D(InputTexture, InputSampler), clamp(ivec2(p), ivec2(0), textureSize(sampler2D(InputTexture, InputSampler), 0) - 1), 0)); }
 void FsrRcasInputH(inout AH1 r, inout AH1 g, inout AH1 b) { }
 #endif// SAMPLE_RCAS
 
@@ -60,6 +60,7 @@ void FsrRcasInputH(inout AH1 r, inout AH1 g, inout AH1 b) { }
 
 void CurrFilter(AU2 pos)
 {
+    if (any(greaterThanEqual(pos, AU2(imageSize(OutputTexture))))) return;
     #if SAMPLE_EASU
     AH3 c;
     FsrEasuH(c, pos, Const0, Const1, Const2, Const3);

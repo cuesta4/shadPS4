@@ -16,7 +16,21 @@ set(SHADER_FILES
     fault_buffer_process.comp
     fs_tri.vert
     fsr.comp
+    postfx_copy.comp
+    psmaa0.comp
+    psmaa1.comp
+    psmaa2.comp
+    psmaa3.comp
+    psmaa4.comp
+    psmaa5.comp
+    psmaa6.comp
+    cmaa2_0.comp
+    cmaa2_1.comp
+    cmaa2_2.comp
+    cmaa2_3.comp
+
     post_process.frag
+    startup_probe.comp
     tiling.comp
 )
 
@@ -26,11 +40,19 @@ set(HOST_SHADERS_INCLUDE ${SHADER_INCLUDE} PARENT_SCOPE)
 
 set(INPUT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/source_shader.h.in)
 set(HEADER_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/StringShaderHeader.cmake)
+set(GLSL_INCLUDES
+    fsr/ffx_a.h
+    fsr/ffx_fsr1.h
+)
 
 foreach(FILENAME IN ITEMS ${SHADER_FILES})
     string(REPLACE "." "_" SHADER_NAME ${FILENAME})
     set(SOURCE_FILE ${CMAKE_CURRENT_SOURCE_DIR}/${FILENAME})
     set(SOURCE_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}.h)
+    set(SHADER_DEPENDS)
+    if(FILENAME STREQUAL "fsr.comp")
+        set(SHADER_DEPENDS ${GLSL_INCLUDES})
+    endif()
     add_custom_command(
         OUTPUT
             ${SOURCE_HEADER_FILE}
@@ -40,6 +62,7 @@ foreach(FILENAME IN ITEMS ${SHADER_FILES})
             ${SOURCE_FILE}
         DEPENDS
             ${INPUT_FILE}
+            ${SHADER_DEPENDS}
             # HEADER_GENERATOR should be included here but msbuild seems to assume it's always modified
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} ${SOURCE_HEADER_FILE})

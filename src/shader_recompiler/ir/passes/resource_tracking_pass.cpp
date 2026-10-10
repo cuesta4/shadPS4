@@ -1,6 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
+#include <algorithm>
+#include <ranges>
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -253,6 +257,7 @@ public:
         buffer.used_types |= desc.used_types;
         buffer.is_written |= desc.is_written;
         buffer.is_formatted |= desc.is_formatted;
+        buffer.is_divergent_read |= desc.is_divergent_read;
         return index;
     }
 
@@ -490,8 +495,90 @@ SharpLocation TrackSharp(const IR::Inst* inst, const IR::Block& current_parent, 
     return SharpLocationFromSource(sources[0]);
 }
 
+using UniformityCache = std::unordered_map<const IR::Inst*, bool>;
+
+/// Whether a value is the same in every lane: derived only from user data, immediates, lane
+/// reductions and loads at such addresses, as values GCN keeps in scalar registers are. Phis are
+/// assumed uniform when their inputs are, even past divergent branches; a wrong positive only
+/// costs speed, as uniform buffers accept an index that varies per lane.
+bool IsLaneUniform(const IR::Value& value, UniformityCache& cache, u32 depth = 0) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    const IR::Inst* inst = value.InstRecursive();
+    if (const auto it = cache.find(inst); it != cache.end()) {
+        return it->second;
+    }
+    if (depth >= 64) {
+        return false;
+    }
+    // Loop phis reach themselves: assume uniform until an input proves otherwise.
+    cache[inst] = true;
+    bool uniform = true;
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+    case IR::Opcode::ReadFirstLane:
+    case IR::Opcode::ReadLane:
+    case IR::Opcode::Ballot:
+    case IR::Opcode::BallotFindLsb:
+    case IR::Opcode::GroupAny:
+    case IR::Opcode::WarpId:
+        break;
+    case IR::Opcode::GetAttributeU32: {
+        const auto attribute = inst->Arg(0).Attribute();
+        uniform = attribute == IR::Attribute::WorkgroupId ||
+                  attribute == IR::Attribute::WorkgroupIndex;
+        break;
+    }
+    case IR::Opcode::GetAttribute:
+    case IR::Opcode::GetPatch:
+    case IR::Opcode::GetTessGenericAttribute:
+    case IR::Opcode::ReadTcsGenericOuputAttribute:
+    case IR::Opcode::GetThreadBitScalarReg:
+    case IR::Opcode::GetMaskLaneVariable:
+    case IR::Opcode::GetVectorRegister:
+    case IR::Opcode::GetExec:
+    case IR::Opcode::GetVcc:
+    case IR::Opcode::GetVccLo:
+    case IR::Opcode::GetVccHi:
+    case IR::Opcode::LaneId:
+    case IR::Opcode::QuadShuffle:
+    case IR::Opcode::WriteLane:
+    case IR::Opcode::CubeFaceIndex:
+        uniform = false;
+        break;
+    default:
+        if (IsImageInstruction(*inst) || IsDataRingInstruction(*inst) || IsBufferAtomic(*inst)) {
+            uniform = false;
+            break;
+        }
+        for (size_t i = 0; i < inst->NumArgs() && uniform; ++i) {
+            uniform = IsLaneUniform(inst->Arg(i), cache, depth + 1);
+        }
+        break;
+    }
+    cache[inst] = uniform;
+    return uniform;
+}
+
+/// Whether a buffer read may load from a different address in each lane. Scalar loads never do;
+/// vector loads do unless their index and offset are lane-uniform.
+bool IsDivergentBufferRead(const IR::Inst& inst, const AmdGpu::Buffer& buffer,
+                           UniformityCache& cache) {
+    if (inst.GetOpcode() == IR::Opcode::ReadConstBuffer || IsBufferStore(inst)) {
+        return false;
+    }
+    if (inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 || buffer.add_tid_enable) {
+        return true;
+    }
+    const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    return (inst_info.index_enable && !IsLaneUniform(IR::GetBufferIndexArg(&inst), cache)) ||
+           (inst_info.voffset_enable && !IsLaneUniform(IR::GetBufferVOffsetArg(&inst), cache)) ||
+           !IsLaneUniform(IR::GetBufferSOffsetArg(&inst), cache);
+}
+
 void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& descriptors,
-                      const Profile& profile) {
+                      const Profile& profile, UniformityCache& uniformity) {
     IR::Inst* handle = inst.Arg(0).InstRecursive();
     u32 buffer_binding = 0;
     if (handle->AreAllArgsImmediates()) {
@@ -514,6 +601,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
             .used_types = BufferDataType(inst, profile, buffer.GetNumberFmt()),
             .inline_cbuf = buffer,
             .buffer_type = BufferType::Guest,
+            .is_divergent_read = IsDivergentBufferRead(inst, buffer, uniformity),
         });
     } else {
         // Normal buffer resource.
@@ -528,6 +616,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
             .is_written = IsBufferStore(inst),
             .is_formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
                             inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32,
+            .is_divergent_read = IsDivergentBufferRead(inst, buffer, uniformity),
         });
     }
 
@@ -611,8 +700,8 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
             inst.ReplaceUsesWith(ir.Imm32(1));
             return;
         case IR::Opcode::ImageQueryDimensions: {
-            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)), // x
-                                                   ir.Imm32(static_cast<u32>(image.width)), // y
+            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)),  // x
+                                                   ir.Imm32(static_cast<u32>(image.height)), // y
                                                    ir.Imm32(1), ir.Imm32(1)); // depth, mip
             inst.ReplaceUsesWith(dims);
 
@@ -677,35 +766,9 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
 
     // For data append/consume operations attempt to deduce the GDS address.
     if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume) {
-        const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
-            if (inst->GetOpcode() == IR::Opcode::GetUserData) {
-                return inst;
-            }
-            return std::nullopt;
-        };
-
-        u32 gds_addr = 0;
-        const IR::Value& gds_offset = inst.Arg(0);
-        if (gds_offset.IsImmediate()) {
-            // Nothing to do, offset is known.
-            gds_addr = gds_offset.U32() & 0xFFFF;
-        } else {
-            const auto result = IR::BreadthFirstSearch(&inst, pred);
-            ASSERT_MSG(result, "Unable to track M0 source");
-
-            // M0 must be set by some user data register.
-            const IR::Inst* prod = gds_offset.InstRecursive();
-            const u32 ud_reg = u32(result.value()->Arg(0).ScalarReg());
-            u32 m0_val = info.user_data[ud_reg] >> 16;
-            if (prod->GetOpcode() == IR::Opcode::IAdd32) {
-                m0_val += prod->Arg(1).U32();
-            }
-            gds_addr = m0_val & 0xFFFF;
-        }
-
         // Patch instruction to GDS buffer atomic increment/decrement.
         const IR::U32 handle = ir.Imm32(binding);
-        const IR::U32 index = ir.Imm32(gds_addr >> 2);
+        const IR::U32 index = ir.ShiftRightLogical(IR::U32{inst.Arg(0)}, ir.Imm32(2));
         const bool is_append = inst.GetOpcode() == IR::Opcode::DataAppend;
         const IR::Value prev = is_append ? ir.BufferAtomicInc(handle, index, {})
                                          : ir.BufferAtomicDec(handle, index, {});
@@ -893,7 +956,9 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     // to convert this to the range [0.0, 1.0] to get correct results.
     const auto fixed_x = ir.FPSub(IR::F32{x}, ir.Imm32(1.f));
     const auto fixed_y = ir.FPSub(IR::F32{y}, ir.Imm32(1.f));
-    return ir.CompositeConstruct(fixed_x, fixed_y, face);
+    const auto fixed_face =
+        ir.FPFma(ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f))), ir.Imm32(-2.f), IR::F32{face});
+    return ir.CompositeConstruct(fixed_x, fixed_y, fixed_face);
 }
 
 void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
@@ -1191,10 +1256,11 @@ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
 
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};
+    UniformityCache uniformity;
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (IsBufferInstruction(inst)) {
-                PatchBufferSharp(*block, inst, info, descriptors, profile);
+                PatchBufferSharp(*block, inst, info, descriptors, profile, uniformity);
             } else if (IsImageInstruction(inst)) {
                 PatchImageSharp(*block, inst, info, descriptors, profile);
             }

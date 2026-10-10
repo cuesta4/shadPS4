@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -24,9 +25,27 @@ enum class BufferType : u32 {
     FaultBuffer,
     GdsBuffer,
     SharedMemory,
+    ClipPlanes,
 };
 
 struct Info;
+
+// The rejections of invalid sharps are out of line so that resolving a valid sharp, done for
+// every resource of every draw, does not carry the logging code.
+[[nodiscard]] SHAD_NO_INLINE inline AmdGpu::Buffer RejectBufferSharp() noexcept {
+    LOG_DEBUG(Render, "Encountered invalid buffer sharp");
+    return AmdGpu::Buffer::Null();
+}
+
+[[nodiscard]] SHAD_NO_INLINE inline AmdGpu::Image RejectImageSharp(bool is_depth) noexcept {
+    LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
+    return AmdGpu::Image::Null(is_depth);
+}
+
+[[nodiscard]] SHAD_NO_INLINE inline AmdGpu::Image RejectDepthImageSharp() noexcept {
+    LOG_DEBUG(Render_Vulkan, "Encountered non-depth image used with depth instruction!");
+    return AmdGpu::Image::Null(true);
+}
 
 struct BufferResource {
     u32 sharp_idx;
@@ -36,20 +55,12 @@ struct BufferResource {
     u8 instance_attrib{};
     bool is_written{};
     bool is_formatted{};
+    /// Read at an address that may differ per lane. Buffers read only at lane-uniform addresses,
+    /// by scalar loads or vector loads with uniform operands, suit a uniform buffer.
+    bool is_divergent_read{};
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;
-    }
-
-    bool IsStorage([[maybe_unused]] const AmdGpu::Buffer buffer) const noexcept {
-        // When using uniform buffers, a size is required at compilation time, so we need to
-        // either compile a lot of shader specializations to handle each size or just force it to
-        // the maximum possible size always. However, for some vendors the shader-supplied size is
-        // used for bounds checking uniform buffer accesses, so the latter would effectively turn
-        // off buffer robustness behavior. Instead, force storage buffers which are bounds checked
-        // using the actual buffer size. We are assuming the performance hit from this is
-        // acceptable.
-        return true; // buffer.GetSize() > profile.max_ubo_size || is_written;
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
@@ -62,9 +73,8 @@ struct BufferResource {
         } else {
             buffer = info.template ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
         }
-        if (!buffer.Valid()) {
-            LOG_DEBUG(Render, "Encountered invalid buffer sharp");
-            return AmdGpu::Buffer::Null();
+        if (!buffer.Valid()) [[unlikely]] {
+            return RejectBufferSharp();
         }
         return buffer;
     }
@@ -92,26 +102,26 @@ struct ImageResource {
             std::memcpy(&image, &raw, sizeof(raw));
             image.pitch = image.width;
         }
-        if (!image.Valid()) {
-            LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
-            image = AmdGpu::Image::Null(is_depth);
+        if (!image.Valid()) [[unlikely]] {
+            image = RejectImageSharp(is_depth);
         } else if (is_depth) {
             const auto data_fmt = image.GetDataFmt();
             if (data_fmt != AmdGpu::DataFormat::Format16 &&
-                data_fmt != AmdGpu::DataFormat::Format32) {
-                LOG_DEBUG(Render_Vulkan,
-                          "Encountered non-depth image used with depth instruction!");
-                image = AmdGpu::Image::Null(true);
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
+                image = RejectDepthImageSharp();
             }
         }
         return image;
     }
 
-    u32 NumBindings(const auto& info) const {
-        const AmdGpu::Image tsharp = GetSharp(info);
+    u32 NumBindings(const AmdGpu::Image& tsharp) const {
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        return NumBindings(GetSharp(info));
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;

@@ -1,0 +1,97 @@
+// SPDX-FileCopyrightText: Copyright Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#version 450
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 4, local_size_y = 32, local_size_z = 1) in;
+
+const ivec2 _68[4] = ivec2[](ivec2(0), ivec2(1, 0), ivec2(0, 1), ivec2(1));
+
+layout(set = 0, binding = 3, std430) buffer type_RWStructuredBuffer_uint
+{
+    uint _m0[];
+} g_workingDeferredBlendLocationList;
+
+layout(set = 0, binding = 4, std430) buffer type_RWStructuredBuffer_v2uint
+{
+    uvec2 _m0[];
+} g_workingDeferredBlendItemList;
+
+layout(set = 0, binding = 6, std430) buffer type_RWByteAddressBuffer
+{
+    uint _m0[];
+} g_workingControlBuffer;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D g_inoutColorWriteonly;
+layout(set = 0, binding = 5, r32ui) uniform readonly uimage2D g_workingDeferredBlendItemListHeads;
+
+#define imageLoad(t,p) (any(lessThan((p),ivec2(0))) || any(greaterThanEqual((p),imageSize(t))) ? uvec4(0) : imageLoad(t,p))
+
+void main()
+{
+    do
+    {
+        if (gl_GlobalInvocationID.y >= g_workingControlBuffer._m0[3u])
+        {
+            break;
+        }
+        uvec2 _87 = uvec2(g_workingDeferredBlendLocationList._m0[gl_GlobalInvocationID.y] >> 16u, g_workingDeferredBlendLocationList._m0[gl_GlobalInvocationID.y] & 65535u);
+        uvec4 _94 = imageLoad(g_workingDeferredBlendItemListHeads, ivec2(_87));
+        uint _95 = _94.x;
+        vec4 _97;
+        _97 = vec4(0.0);
+        uint _103;
+        vec4 _98;
+        uint _100 = 0u;
+        uint _102 = _95;
+        for (;;)
+        {
+            bool _110;
+            if (_102 != 4294967295u)
+            {
+                _110 = _100 < 32u;
+            }
+            else
+            {
+                _110 = false;
+            }
+            if (_110)
+            {
+                uint _117 = _102 & 67108863u;
+                _103 = g_workingDeferredBlendItemList._m0[_117].x;
+                if (((_102 >> 30u) & 3u) == gl_LocalInvocationID.x)
+                {
+                    float _137 = (((_102 >> 26u) & 1u) != 0u) ? 1.7999999523162841796875 : 0.800000011920928955078125;
+                    _98 = _97 + vec4(vec3(unpackHalf2x16((g_workingDeferredBlendItemList._m0[_117].y << 3u) & 16376u).x, unpackHalf2x16((g_workingDeferredBlendItemList._m0[_117].y >> 8u) & 16376u).x, unpackHalf2x16((g_workingDeferredBlendItemList._m0[_117].y >> 18u) & 16368u).x) * _137, _137);
+                }
+                else
+                {
+                    _98 = _97;
+                }
+                _97 = _98;
+                _100++;
+                _102 = _103;
+                continue;
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (_97.w == 0.0)
+        {
+            break;
+        }
+        imageStore(g_inoutColorWriteonly, ivec2((_87 * uvec2(2u)) + uvec2(_68[gl_LocalInvocationID.x])), vec4(_97.xyz / vec3(_97.w), 0.0));
+        break;
+    } while(false);
+}

@@ -43,6 +43,7 @@ struct VkData {
     vk::DeviceSize buffer_memory_alignment = 256;
     vk::PipelineCreateFlags pipeline_create_flags{};
     vk::DescriptorPool descriptor_pool{};
+    std::mutex descriptor_pool_mutex;
     vk::DescriptorSetLayout descriptor_set_layout{};
     vk::PipelineLayout pipeline_layout{};
     vk::Pipeline pipeline{};
@@ -252,7 +253,6 @@ void UploadTextureData::Destroy() {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
 
-    CheckVkErr(v.device.waitIdle());
     RemoveTexture(im_texture);
     im_texture = nullptr;
 
@@ -277,6 +277,7 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
     // Create Descriptor Set:
     vk::DescriptorSet descriptor_set;
     {
+        std::scoped_lock descriptor_lock{bd->descriptor_pool_mutex};
         vk::DescriptorSetAllocateInfo alloc_info{
             .descriptorPool = bd->descriptor_pool,
             .descriptorSetCount = 1,
@@ -313,10 +314,10 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
     ImGuiIO& io = GetIO();
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
+    std::unique_lock command_pool_lock{bd->command_pool_mutex};
 
     UploadTextureData info{};
     {
-        std::unique_lock lk(bd->command_pool_mutex);
         info.command_buffer =
             CheckVkResult(v.device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
                               .commandPool = bd->command_pool,
@@ -471,6 +472,7 @@ void RemoveTexture(ImTextureID texture) {
     IM_ASSERT(texture != nullptr);
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
+    std::scoped_lock descriptor_lock{bd->descriptor_pool_mutex};
     CheckVkErr(v.device.freeDescriptorSets(bd->descriptor_pool, {texture->descriptor_set}));
     delete texture;
 }

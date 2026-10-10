@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
+#include "common/logging/log.h"
 
 #include "common/assert.h"
 #include "common/func_traits.h"
@@ -236,6 +238,12 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
         return spv::ExecutionMode::SpacingFractionalOdd;
     case AmdGpu::TessellationPartitioning::FracEven:
         return spv::ExecutionMode::SpacingFractionalEven;
+    case AmdGpu::TessellationPartitioning::Pow2:
+        // Pow2 rounds tessellation factors to the nearest power of 2, which has no
+        // direct Vulkan equivalent. SpacingEqual (integer) is the closest match.
+        LOG_WARNING(Render_Vulkan, "Tessellation partitioning Pow2 has no Vulkan equivalent, "
+                                   "falling back to SpacingEqual");
+        return spv::ExecutionMode::SpacingEqual;
     default:
         break;
     }
@@ -250,8 +258,18 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     ctx.AddCapability(spv::Capability::Int8);
     ctx.AddCapability(spv::Capability::Int16);
     ctx.AddCapability(spv::Capability::Int64);
-    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer8BitAccess);
-    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer16BitAccess);
+    if (profile.use_raw_access_chains) {
+        ctx.AddExtension("SPV_NV_raw_access_chains");
+        ctx.AddCapability(spv::Capability::RawAccessChainsNV);
+    }
+    ctx.AddCapability(spv::Capability::StorageBuffer8BitAccess);
+    ctx.AddCapability(spv::Capability::StorageBuffer16BitAccess);
+    if (profile.force_uniform_buffers && profile.supports_uniform_buffer_int8) {
+        ctx.AddCapability(spv::Capability::UniformAndStorageBuffer8BitAccess);
+    }
+    if (profile.force_uniform_buffers && profile.supports_uniform_buffer_int16) {
+        ctx.AddCapability(spv::Capability::UniformAndStorageBuffer16BitAccess);
+    }
     if (info.uses_fp16) {
         ctx.AddCapability(spv::Capability::Float16);
     }
@@ -301,14 +319,22 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         } else if (profile.supports_fragment_shader_barycentric) {
             ctx.AddExtension("SPV_KHR_fragment_shader_barycentric");
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
+            ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||
             runtime_info.fs_info.addr_flags.linear_sample_ena ||
-            runtime_info.fs_info.addr_flags.persp_sample_ena) {
+            runtime_info.fs_info.addr_flags.persp_sample_ena ||
+            (!profile.supports_amd_shader_explicit_vertex_parameter &&
+             profile.supports_fragment_shader_barycentric &&
+             info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
             ctx.AddCapability(spv::Capability::SampleRateShading);
         }
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {
             ctx.AddCapability(spv::Capability::Geometry);
+        }
+        if (info.stores.Get(IR::Attribute::StencilRef) && profile.supports_shader_stencil_export) {
+            ctx.AddExtension("SPV_EXT_shader_stencil_export");
+            ctx.AddCapability(spv::Capability::StencilExportEXT);
         }
     }
     if (stage == LogicalStage::TessellationControl || stage == LogicalStage::TessellationEval) {
@@ -549,9 +575,21 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
 
 void SetupInfNanPreserveMode(EmitContext& ctx, const Profile& profile,
                              const RuntimeInfo& runtime_info, Id main_func) {
-    ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-    // universally supported (98.85% on gpuinfo) so no flag checked
-    ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+    if (profile.support_fp16_signed_zero_inf_nan_preserve ||
+        profile.support_fp32_signed_zero_inf_nan_preserve ||
+        profile.support_fp64_signed_zero_inf_nan_preserve) {
+        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
+    }
+
+    if (profile.support_fp32_signed_zero_inf_nan_preserve) {
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+    } else {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_WARNING(Render_Vulkan,
+                        "Float32 signed zero/inf/nan preserve mode is not supported by the GPU");
+        });
+    }
     if (ctx.info.uses_fp16) {
         if (profile.support_fp16_signed_zero_inf_nan_preserve) {
             ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);

@@ -1,0 +1,251 @@
+// SPDX-FileCopyrightText: Copyright 2025 RdenBlaauwen; Jorge Jimenez et al.; NVIDIA Corporation; Derek Brush
+// SPDX-License-Identifier: LicenseRef-PSMAA-ThirdParty
+
+#version 450
+#if defined(GL_EXT_control_flow_attributes)
+#extension GL_EXT_control_flow_attributes : require
+#define SPIRV_CROSS_FLATTEN [[flatten]]
+#define SPIRV_CROSS_BRANCH [[dont_flatten]]
+#define SPIRV_CROSS_UNROLL [[unroll]]
+#define SPIRV_CROSS_LOOP [[dont_unroll]]
+#else
+#define SPIRV_CROSS_FLATTEN
+#define SPIRV_CROSS_BRANCH
+#define SPIRV_CROSS_UNROLL
+#define SPIRV_CROSS_LOOP
+#endif
+#extension GL_EXT_spirv_intrinsics : require
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float _95;
+vec4 _96;
+float _97;
+
+layout(push_constant, std430) uniform type_PushConstant_Constants
+{
+    vec4 metrics;
+    vec4 target;
+    uint conversion;
+} params;
+
+layout(set = 0, binding = 0) uniform texture2D tex0;
+layout(set = 0, binding = 1) uniform texture2D tex1;
+layout(set = 0, binding = 2) uniform texture2D tex2;
+layout(set = 0, binding = 9) uniform sampler linear_sampler;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D output0;
+
+spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec2 spvNMin(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec3 spvNMin(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec4 spvNMin(vec4, vec4);
+spirv_instruction(set = "GLSL.std.450", id = 80) float spvNMax(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
+
+void main()
+{
+    do
+    {
+        if (any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(params.target.zw))))
+        {
+            break;
+        }
+        vec2 _116 = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) * params.metrics.xy;
+        vec4 _121 = vec4(params.metrics.x, params.metrics.y, _95, _95);
+        vec4 _123 = _116.xyxy;
+        precise vec4 _15 = fma(_121.xyxy, vec4(1.0, 0.0, 0.0, 1.0), _123);
+        vec4 _472;
+        do
+        {
+            vec4 _247;
+            do
+            {
+                vec4 _134 = textureLod(sampler2D(tex1, linear_sampler), _15.xy, 0.0);
+                float _135 = _134.w;
+                vec4 _136;
+                _136.x = _135;
+                vec4 _140 = textureLod(sampler2D(tex1, linear_sampler), _15.zw, 0.0);
+                float _141 = _140.y;
+                _136.y = _141;
+                vec4 _145 = textureLod(sampler2D(tex1, linear_sampler), _116, 0.0);
+                vec4 _146 = vec4(_136.x, _136.y, _145.z, _145.x);
+                SPIRV_CROSS_BRANCH
+                if (dot(_146, vec4(1.0)) < 9.9999997473787516355514526367188e-06)
+                {
+                    vec4 _237 = textureLod(sampler2D(tex0, linear_sampler), vec4(_116, 0.0, 0.0).xy, 0.0);
+                    vec3 _238 = _237.xyz;
+                    vec3 _245 = mix(pow(spvNMax((_238 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _238 * vec3(0.077399380505084991455078125), lessThanEqual(_238, vec3(0.040449999272823333740234375)));
+                    _247 = vec4(_245.x, _245.y, _245.z, _237.w);
+                    break;
+                }
+                else
+                {
+                    float _152 = _145.z;
+                    float _154 = _145.x;
+                    bool _156 = spvNMax(_135, _152) > spvNMax(_141, _154);
+                    vec4 _157 = vec4(0.0, _141, 0.0, _154);
+                    vec2 _158 = _146.yw;
+                    vec2 _159 = _157.xy;
+                    vec2 _163;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _162 = _159;
+                        _162.x = _135;
+                        _163 = _162;
+                    }
+                    else
+                    {
+                        _163 = _159;
+                    }
+                    vec2 _167;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _166 = _163;
+                        _166.y = 0.0;
+                        _167 = _166;
+                    }
+                    else
+                    {
+                        _167 = _163;
+                    }
+                    vec2 _168 = _157.zw;
+                    vec2 _172;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _171 = _168;
+                        _171.x = _152;
+                        _172 = _171;
+                    }
+                    else
+                    {
+                        _172 = _168;
+                    }
+                    vec2 _176;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _175 = _172;
+                        _175.y = 0.0;
+                        _176 = _175;
+                    }
+                    else
+                    {
+                        _176 = _172;
+                    }
+                    vec2 _181;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _180 = _158;
+                        _180.x = _135;
+                        _181 = _180;
+                    }
+                    else
+                    {
+                        _181 = _158;
+                    }
+                    vec2 _185;
+                    SPIRV_CROSS_FLATTEN
+                    if (_156)
+                    {
+                        vec2 _184 = _181;
+                        _184.y = _152;
+                        _185 = _184;
+                    }
+                    else
+                    {
+                        _185 = _181;
+                    }
+                    vec2 _188 = _185 / vec2(dot(_185, vec2(1.0)));
+                    precise vec4 _16 = fma(vec4(_167.x, _167.y, _176.x, _176.y), vec4(params.metrics.x, params.metrics.y, -_121.xy), _123);
+                    vec4 _200 = textureLod(sampler2D(tex0, linear_sampler), vec4(_16.xy, 0.0, 0.0).xy, 0.0);
+                    vec3 _201 = _200.xyz;
+                    vec3 _208 = mix(pow(spvNMax((_201 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _201 * vec3(0.077399380505084991455078125), lessThanEqual(_201, vec3(0.040449999272823333740234375)));
+                    vec4 _218 = textureLod(sampler2D(tex0, linear_sampler), vec4(_16.zw, 0.0, 0.0).xy, 0.0);
+                    vec3 _219 = _218.xyz;
+                    vec3 _226 = mix(pow(spvNMax((_219 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _219 * vec3(0.077399380505084991455078125), lessThanEqual(_219, vec3(0.040449999272823333740234375)));
+                    _247 = (vec4(_208.x, _208.y, _208.z, _200.w) * _188.x) + (vec4(_226.x, _226.y, _226.z, _218.w) * _188.y);
+                    break;
+                }
+                break; // unreachable workaround
+            } while(false);
+            vec4 _250 = textureLod(sampler2D(tex2, linear_sampler), _116, 0.0);
+            bool _257;
+            if (!(_250.y < 0.89999997615814208984375))
+            {
+                _257 = _250.x <= 0.14900000393390655517578125;
+            }
+            else
+            {
+                _257 = true;
+            }
+            if (_257)
+            {
+                _472 = _247;
+                break;
+            }
+            vec2 _263 = vec4(_116, _95, _95).xy;
+            vec3 _269 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(-1.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _277 = mix(pow(spvNMax((_269 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _269 * vec3(0.077399380505084991455078125), lessThanEqual(_269, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _283 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(-1.0, 0.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _291 = mix(pow(spvNMax((_283 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _283 * vec3(0.077399380505084991455078125), lessThanEqual(_283, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _297 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(-1.0, 1.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _305 = mix(pow(spvNMax((_297 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _297 * vec3(0.077399380505084991455078125), lessThanEqual(_297, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _311 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(0.0, -1.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _319 = mix(pow(spvNMax((_311 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _311 * vec3(0.077399380505084991455078125), lessThanEqual(_311, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _325 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(0.0, 1.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _333 = mix(pow(spvNMax((_325 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _325 * vec3(0.077399380505084991455078125), lessThanEqual(_325, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _339 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(1.0, -1.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _347 = mix(pow(spvNMax((_339 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _339 * vec3(0.077399380505084991455078125), lessThanEqual(_339, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _353 = textureLod(sampler2D(tex0, linear_sampler), _263 + (vec2(1.0, 0.0) * params.metrics.xy), 0.0).xyz;
+            vec3 _361 = mix(pow(spvNMax((_353 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _353 * vec3(0.077399380505084991455078125), lessThanEqual(_353, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _366 = textureLod(sampler2D(tex0, linear_sampler), _263 + params.metrics.xy, 0.0).xyz;
+            vec3 _374 = mix(pow(spvNMax((_366 + vec3(0.054999999701976776123046875)) * vec3(0.947867333889007568359375), vec3(0.0)), vec3(2.400000095367431640625)), _366 * vec3(0.077399380505084991455078125), lessThanEqual(_366, vec3(0.040449999272823333740234375))).xyz;
+            vec3 _378 = (_277 + _247.xyz) + _374;
+            vec3 _380 = (_305 + _247.xyz) + _347;
+            vec3 _382 = (_291 + _247.xyz) + _361;
+            vec3 _384 = (_319 + _247.xyz) + _333;
+            vec3 _387 = ((_382 + _305) + _333) + _374;
+            vec3 _390 = ((_382 + _319) + _277) + _347;
+            vec3 _393 = ((_277 + _291) + _305) + _384;
+            vec3 _396 = ((_384 + _347) + _361) + _374;
+            vec3 _399 = ((_380 + _319) + _291) + _277;
+            vec3 _402 = ((_380 + _361) + _374) + _333;
+            vec3 _403 = _378 + _347;
+            vec3 _405 = (_403 + _361) + _319;
+            vec3 _408 = ((_378 + _291) + _333) + _305;
+            vec3 _411 = ((_319 + _333) + _382) * 1.2000000476837158203125;
+            vec3 _413 = (_403 + _305) * 1.2000000476837158203125;
+            vec3 _414 = _378 * 2.0;
+            vec3 _415 = _380 * 2.0;
+            vec3 _416 = _382 * 2.0;
+            vec3 _417 = _384 * 2.0;
+            vec3 _426 = spvNMax(spvNMax(spvNMax(_393, _387), spvNMax(spvNMax(_414, _415), spvNMax(_390, _396))), spvNMax(spvNMax(_405, _399), spvNMax(_402, _408)));
+            vec3 _435 = spvNMin(spvNMin(spvNMin(_393, _387), spvNMin(spvNMin(_414, _415), spvNMin(_390, _396))), spvNMin(spvNMin(_405, _399), spvNMin(_402, _408)));
+            vec3 _437 = spvNMax(spvNMax(_416, _417), _426);
+            vec3 _439 = spvNMin(spvNMin(_416, _417), _435);
+            precise float _17 = fma(3.2999999523162841796875, 2.0, -2.0);
+            vec3 _448 = (fma(_426 + _435, vec3(2.0), fma(_437 + _439, vec3(1.2999999523162841796875), (-spvNMax(_411, _413)) - spvNMin(_411, _413))) / vec3(_17)) * vec3(0.16666667163372039794921875);
+            vec2 _452 = vec2(dot(_437, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)), dot(_439, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625))) * vec2(0.16666667163372039794921875);
+            float _453 = dot(_448, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
+            _472 = vec4(mix(_247.xyz, _448 * (1.0 + mix(_452.y - _453, clamp(_452.x - _453, 0.0, 1.0), clamp(fma((0.5 + dot(_247.xyz, vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625))) - _453, 2.0, 0.5), 0.0, 1.0))), vec3(_250.x)), _97);
+            break;
+        } while(false);
+        imageStore(output0, ivec2(gl_GlobalInvocationID.xy), vec4(mix((pow(spvNMax(_472.xyz, vec3(0.0)), vec3(0.4166666567325592041015625)) * 1.05499994754791259765625) - vec3(0.054999999701976776123046875), _472.xyz * 12.9200000762939453125, lessThanEqual(_472.xyz, vec3(0.003130800090730190277099609375))), 1.0));
+        break;
+    } while(false);
+}

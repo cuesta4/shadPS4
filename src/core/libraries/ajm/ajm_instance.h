@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/enum.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/ajm/ajm.h"
 #include "core/libraries/ajm/ajm_batch.h"

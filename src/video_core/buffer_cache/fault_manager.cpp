@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/div_ceil.h"
+#include "common/logging/log.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -52,7 +53,8 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
     std::vector<std::string> defines{{fmt::format("CACHING_PAGEBITS={}", caching_pagebits),
                                       fmt::format("MAX_PAGE_FAULTS={}", MaxPageFaults)}};
     const auto module = Vulkan::Compile(HostShaders::FAULT_BUFFER_PROCESS_COMP,
-                                        vk::ShaderStageFlagBits::eCompute, device, defines);
+                                        vk::ShaderStageFlagBits::eCompute, device, defines,
+                                        instance.UsesRawAccessChains());
     Vulkan::SetObjectName(device, module, "Fault Buffer Parser");
 
     const vk::PipelineShaderStageCreateInfo shader_ci = {
@@ -80,10 +82,14 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
         scheduler.Wait(wait_tick);
-        scheduler.PopPendingOperations();
+        scheduler.PopPendingOperations(true);
     }
 
     const u32 offset = current_area * PageFaultAreaSize;
+    const Vulkan::GpuTimingContext timing{scheduler,
+                                         {.kind = Vulkan::GpuWork::BufferFault,
+                                          .resource0 = Vulkan::GpuHandle(fault_buffer.Handle()),
+                                          .resource1 = Vulkan::GpuHandle(download_buffer.Handle())}};
     u8* mapped = download_buffer.mapped_data.data() + offset;
     std::memset(mapped, 0, PageFaultAreaSize);
 

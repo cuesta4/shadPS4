@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fmt/chrono.h>
@@ -6,6 +6,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/elf_info.h"
+#include "common/io_file.h"
 #include "common/singleton.h"
 #include "common/string_util.h"
 #include "core/file_format/psf.h"
@@ -107,7 +108,16 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
             auto icon_path = dir_path / "sce_sys" / "icon0.png";
             RefCountedTexture icon;
             if (std::filesystem::exists(icon_path)) {
-                icon = RefCountedTexture::DecodePngFile(icon_path);
+                if (mode != SaveDataDialogMode::LIST) {
+                    Common::FS::IOFile icon_file(icon_path, Common::FS::FileAccessMode::Read);
+                    if (icon_file.IsOpen()) {
+                        std::vector<u8> icon_bytes(icon_file.GetSize());
+                        icon_file.Read(icon_bytes);
+                        icon = RefCountedTexture::DecodePngTexture(std::move(icon_bytes));
+                    }
+                } else {
+                    icon = RefCountedTexture::DecodePngFile(icon_path);
+                }
             }
 
             bool is_corrupted = std::filesystem::exists(dir_path / "sce_sys" / "corrupted");
@@ -138,9 +148,8 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
             auto buf = (u8*)new_item->iconBuf;
             icon = RefCountedTexture::DecodePngTexture({buf, buf + new_item->iconSize});
         } else {
-            const auto& src_icon = g_mnt->GetHostPath("/app0/sce_sys/save_data.png");
-            if (std::filesystem::exists(src_icon)) {
-                icon = RefCountedTexture::DecodePngFile(src_icon);
+            if (auto bytes = g_mnt->ReadFile("/app0/sce_sys/save_data.png")) {
+                icon = RefCountedTexture::DecodePngTexture(std::move(*bytes));
             }
         }
         if (new_item->title != nullptr) {
@@ -332,12 +341,12 @@ SaveDialogUi::~SaveDialogUi() {
     Finish(ButtonId::INVALID);
 }
 
-SaveDialogUi::SaveDialogUi(SaveDialogUi&& other) noexcept
-    : Layer(other), state(other.state), status(other.status), result(other.result) {
+SaveDialogUi::SaveDialogUi(SaveDialogUi&& other) noexcept : Layer(other) {
     std::scoped_lock lock(draw_mutex, other.draw_mutex);
-    other.state = nullptr;
-    other.status = nullptr;
-    other.result = nullptr;
+    state = std::exchange(other.state, nullptr);
+    status = std::exchange(other.status, nullptr);
+    result = std::exchange(other.result, nullptr);
+    RemoveLayer(&other);
     if (status && *status == Status::RUNNING) {
         first_render = true;
         AddLayer(this);
@@ -345,14 +354,15 @@ SaveDialogUi::SaveDialogUi(SaveDialogUi&& other) noexcept
 }
 
 SaveDialogUi& SaveDialogUi::operator=(SaveDialogUi&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
     std::scoped_lock lock(draw_mutex, other.draw_mutex);
-    using std::swap;
-    state = other.state;
-    other.state = nullptr;
-    status = other.status;
-    other.status = nullptr;
-    result = other.result;
-    other.result = nullptr;
+    RemoveLayer(this);
+    RemoveLayer(&other);
+    state = std::exchange(other.state, nullptr);
+    status = std::exchange(other.status, nullptr);
+    result = std::exchange(other.result, nullptr);
     if (status && *status == Status::RUNNING) {
         first_render = true;
         AddLayer(this);
@@ -360,14 +370,37 @@ SaveDialogUi& SaveDialogUi::operator=(SaveDialogUi&& other) noexcept {
     return *this;
 }
 
+void SaveDialogUi::Open(SaveDialogState* _state, Status* _status, SaveDialogResult* _result) {
+    std::unique_lock lock(draw_mutex);
+    RemoveLayer(this);
+    this->state = _state;
+    this->status = _status;
+    this->result = _result;
+    if (status && *status == Status::RUNNING) {
+        first_render = true;
+        AddLayer(this);
+    }
+}
+
+void SaveDialogUi::Reset() {
+    std::unique_lock lock(draw_mutex);
+    if (state) {
+        *state = SaveDialogState{};
+    }
+    state = nullptr;
+    status = nullptr;
+    result = nullptr;
+    RemoveLayer(this);
+}
+
 void SaveDialogUi::Finish(ButtonId buttonId, Result r) {
     std::unique_lock lock(draw_mutex);
-    if (result) {
+    if (result && state) {
         result->mode = this->state->mode;
         result->result = r;
         result->button_id = buttonId;
         result->user_data = this->state->user_data;
-        if (state && state->mode != SaveDataDialogMode::LIST && !state->save_list.empty()) {
+        if (state->mode != SaveDataDialogMode::LIST && !state->save_list.empty()) {
             result->dir_name = state->save_list.front().dir_name;
         }
     }
@@ -453,7 +486,7 @@ void SaveDialogUi::Draw() {
     End();
 
     first_render = false;
-    if (*status == Status::FINISHED) {
+    if (status && *status == Status::FINISHED) {
         if (state) {
             *state = SaveDialogState{};
         }

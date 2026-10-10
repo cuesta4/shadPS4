@@ -3,6 +3,7 @@
 
 #ifdef WIN32
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <algorithm>
 #include <Ws2tcpip.h>
 #include <iphlpapi.h>
 #include <winsock2.h>
@@ -16,6 +17,8 @@
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -628,6 +631,11 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         return ORBIS_NET_ERROR_EBADF;
     }
     auto epoll = file->epoll;
+    std::scoped_lock lock{*epoll->mutex};
+    if (epoll->Destroyed()) {
+        *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+        return ORBIS_NET_ERROR_EBADF;
+    }
     LOG_WARNING(Lib_Net, "called, epollid = {} ({}), op = {}, id = {}", epollid, epoll->name,
                 magic_enum::enum_name(op), id);
 
@@ -824,23 +832,71 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
         return ORBIS_NET_ERROR_EBADF;
     }
     auto epoll = file->epoll;
+    std::unique_lock lock{*epoll->mutex};
+    if (epoll->Destroyed()) {
+        *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+        return ORBIS_NET_ERROR_EBADF;
+    }
+    if (maxevents <= 0 || events == nullptr) {
+        *sceNetErrnoLoc() = ORBIS_NET_EINVAL;
+        return ORBIS_NET_ERROR_EINVAL;
+    }
     LOG_DEBUG(Lib_Net, "called, epollid = {} ({}), maxevents = {}, timeout = {}", epollid,
               epoll->name, maxevents, timeout);
 
-    int sockets_waited_on = (epoll->events.size() - epoll->async_resolutions.size()) > 0;
+    bool sockets_waited_on = epoll->events.size() > epoll->async_resolutions.size();
+    if (!sockets_waited_on && epoll->async_resolutions.empty() && timeout != 0) {
+        using namespace std::chrono;
+        const auto deadline = steady_clock::now() + microseconds(std::max(timeout, 0));
+        for (;;) {
+            auto slice = duration_cast<microseconds>(10ms);
+            if (timeout > 0) {
+                const auto left = duration_cast<microseconds>(deadline - steady_clock::now());
+                if (left <= 0us) {
+                    return 0;
+                }
+                slice = std::min(slice, left);
+            }
+            lock.unlock();
+            const bool slept = Common::AccurateSleep(slice, nullptr, true);
+            lock.lock();
+            if (!slept) {
+                *sceNetErrnoLoc() = ORBIS_NET_EINTR;
+                return ORBIS_NET_ERROR_EINTR;
+            }
+            if (epoll->Destroyed()) {
+                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                return ORBIS_NET_ERROR_EBADF;
+            }
+            sockets_waited_on = epoll->events.size() > epoll->async_resolutions.size();
+            if (sockets_waited_on || !epoll->async_resolutions.empty()) {
+                if (timeout > 0) {
+                    timeout = static_cast<int>(std::max<s64>(
+                        0, duration_cast<microseconds>(deadline - steady_clock::now()).count()));
+                }
+                break;
+            }
+        }
+    }
 
-    std::vector<epoll_event> native_events{static_cast<size_t>(maxevents)};
+    std::vector<epoll_event> native_events;
     int result = ORBIS_OK;
     if (sockets_waited_on) {
+        native_events.resize(static_cast<size_t>(maxevents));
+        const auto native_handle = epoll->epoll_fd;
+        lock.unlock();
 #ifdef __linux__
         const timespec epoll_timeout{.tv_sec = timeout / 1000000,
                                      .tv_nsec = (timeout % 1000000) * 1000};
-        result = epoll_pwait2(epoll->epoll_fd, native_events.data(), maxevents,
+        result = epoll_pwait2(native_handle, native_events.data(), maxevents,
                               timeout < 0 ? nullptr : &epoll_timeout, nullptr);
 #else
-        result = epoll_wait(epoll->epoll_fd, native_events.data(), maxevents,
-                            timeout < 0 ? timeout : timeout / 1000);
+        // Rounded up so that a timeout under a millisecond still waits.
+        result = epoll_wait(native_handle, native_events.data(), maxevents,
+                            timeout < 0 ? timeout
+                                        : static_cast<int>((static_cast<s64>(timeout) + 999) / 1000));
 #endif
+        lock.lock();
     }
 
     int i = 0;
@@ -863,13 +919,15 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
     } else if (result == 0) {
         LOG_TRACE(Lib_Net, "timed out");
     } else {
-        for (; i < result; ++i) {
-            const auto& current_event = native_events[i];
+        for (int native_index = 0; native_index < result; ++native_index) {
+            const auto& current_event = native_events[native_index];
             LOG_DEBUG(Lib_Net, "native_event[{}] = ( .events = {}, .data = {:#x} )", i,
                       current_event.events, current_event.data.u64);
             const auto it = std::ranges::find_if(
                 epoll->events, [&](auto& el) { return el.first == current_event.data.fd; });
-            ASSERT(it != epoll->events.end());
+            if (it == epoll->events.end()) {
+                continue;
+            }
             events[i] = {
                 .events = ConvertEpollEventsOut(current_event.events),
                 .ident = static_cast<u64>(current_event.data.fd),
@@ -877,6 +935,7 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
             };
             LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )", i,
                       events[i].events, events[i].ident, events[i].data.data_u64);
+            ++i;
         }
     }
 

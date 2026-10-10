@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include "common/logging/log.h"
 
 #include "common/assert.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/attribute.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -16,6 +22,33 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
+
+namespace {
+
+std::atomic<u64> next_vertex_plan_identity{1};
+
+u64 BuildAuxTessPreviousStageOutputMask(const Shader::Info* vs_info,
+                                        const Shader::FragmentRuntimeInfo& fs_info) {
+    if (!vs_info) {
+        return 0;
+    }
+
+    const u32 num_clip_attrs = Shader::NumClipDistanceAttributes(fs_info.clip_distance_mask);
+    u64 mask = (1ull << num_clip_attrs) - 1;
+
+    for (u32 i = 0; i < Shader::IR::NumParams; ++i) {
+        const auto param = Shader::IR::Attribute::Param0 + static_cast<int>(i);
+        if (!vs_info->stores.GetAny(param)) {
+            continue;
+        }
+        const u32 location =
+            Shader::Backend::SPIRV::AuxTessAttributeLocation(i, num_clip_attrs);
+        mask |= 1ull << location;
+    }
+    return mask;
+}
+
+} // Anonymous namespace
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -26,17 +59,33 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+static SHAD_NO_INLINE void ValidateVertexInputPlanSize(size_t resolved_count,
+                                                       size_t plan_count) {
+    ASSERT_MSG(resolved_count == plan_count,
+               "Resolved vertex buffer count does not match vertex input plan: {} != {}",
+               resolved_count, plan_count);
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
+    std::span<const Shader::Info*, MaxShaderStages> runtime_stages,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
+    std::span<const u64, MaxShaderStages> uniform_masks, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
+    vertex_plan_identity = next_vertex_plan_identity.fetch_add(1, std::memory_order_relaxed);
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    std::ranges::copy(uniform_masks, uniform_buffer_masks.begin());
+    if (fetch_shader) {
+        for (const auto& attribute : fetch_shader->attributes) {
+            vertex_input_plan.emplace_back(attribute);
+        }
+    }
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -117,15 +166,11 @@ GraphicsPipeline::GraphicsPipeline(
         raster_chain.unlink<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>();
     }
 
-    if (!preloading) {
-        const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-        sdata.multisampling = {
-            .rasterizationSamples = LiverpoolToVK::NumSamples(
-                key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
-            .sampleShadingEnable =
-                fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
-        };
-    }
+    sdata.multisampling = {
+        .rasterizationSamples = LiverpoolToVK::NumSamples(
+            key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+        .sampleShadingEnable = false,
+    };
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
@@ -194,7 +239,11 @@ GraphicsPipeline::GraphicsPipeline(
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            const auto* vs_info = infos[u32(Shader::LogicalStage::Vertex)];
+            const u64 previous_stage_output_mask =
+                BuildAuxTessPreviousStageOutputMask(vs_info, fs_info);
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info,
+                                                                       previous_stage_output_mask);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -226,6 +275,16 @@ GraphicsPipeline::GraphicsPipeline(
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
+            .pName = "main",
+        });
+    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_mask) {
+        if (!preloading) {
+            sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(
+                runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_mask);
+        }
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .module = CompileSPV(sdata.fragment, instance.GetDevice()),
             .pName = "main",
         });
     }
@@ -273,33 +332,72 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
+    // Blend state of the second draw, which squares the channels whose MIN/MAX operands are
+    // scaled by themselves and keeps every other channel.
+    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
+    bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend_controls[i];
+        const auto target_format = key.color_buffers[i].num_format;
+        BlendEquation color_equation{
+            .src_factor = control.color_src_factor,
+            .function = control.color_func,
+            .dst_factor = control.color_dst_factor,
+        };
+        BlendEquation alpha_equation{
+            .src_factor =
+                control.separate_alpha_blend ? control.alpha_src_factor : control.color_src_factor,
+            .function = control.separate_alpha_blend ? control.alpha_func : control.color_func,
+            .dst_factor =
+                control.separate_alpha_blend ? control.alpha_dst_factor : control.color_dst_factor,
+        };
 
-        const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
-        const auto color_blend = LiverpoolToVK::BlendOp(control.color_func);
-
-        const auto src_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
-                                   : src_color;
-        const auto dst_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
-                                   : dst_color;
-        const auto alpha_blend =
-            control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
-
-        const auto color_scaled_min_max =
-            (color_blend == vk::BlendOp::eMin || color_blend == vk::BlendOp::eMax) &&
-            (src_color != vk::BlendFactor::eOne || dst_color != vk::BlendFactor::eOne);
-        const auto alpha_scaled_min_max =
-            (alpha_blend == vk::BlendOp::eMin || alpha_blend == vk::BlendOp::eMax) &&
-            (src_alpha != vk::BlendFactor::eOne || dst_alpha != vk::BlendFactor::eOne);
-        if (color_scaled_min_max || alpha_scaled_min_max) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Unimplemented use of min/max blend op with blend factor not equal to one.");
+        const auto color_rewrite =
+            RewriteScaledMinMaxBlend(color_equation, target_format, BlendChannel::Color);
+        const auto alpha_rewrite =
+            RewriteScaledMinMaxBlend(alpha_equation, target_format, BlendChannel::Alpha);
+        const bool writes_color = bool(key.write_masks[i] & (vk::ColorComponentFlagBits::eR |
+                                                             vk::ColorComponentFlagBits::eG |
+                                                             vk::ColorComponentFlagBits::eB));
+        const bool writes_alpha = bool(key.write_masks[i] & vk::ColorComponentFlagBits::eA);
+        if (control.enable &&
+            ((writes_color && color_rewrite == BlendRewriteResult::Unsupported) ||
+             (writes_alpha && alpha_rewrite == BlendRewriteResult::Unsupported))) {
+            LOG_WARNING(Render_Vulkan,
+                        "Scaled MIN/MAX blend for attachment {} cannot be represented by Vulkan "
+                        "fixed-function blending (format={}, color={}/{}/{}, alpha={}/{}/{}, "
+                        "color_written={}, alpha_written={})",
+                        i, static_cast<u32>(target_format),
+                        static_cast<u32>(color_equation.src_factor),
+                        static_cast<u32>(color_equation.function),
+                        static_cast<u32>(color_equation.dst_factor),
+                        static_cast<u32>(alpha_equation.src_factor),
+                        static_cast<u32>(alpha_equation.function),
+                        static_cast<u32>(alpha_equation.dst_factor), writes_color, writes_alpha);
         }
+        const bool square_color =
+            control.enable && writes_color && color_rewrite == BlendRewriteResult::Squared;
+        const bool square_alpha =
+            control.enable && writes_alpha && alpha_rewrite == BlendRewriteResult::Squared;
+        needs_square_pass |= square_color || square_alpha;
+        square_attachments[i] = vk::PipelineColorBlendAttachmentState{
+            .blendEnable = bool(key.write_masks[i]),
+            .srcColorBlendFactor = vk::BlendFactor::eZero,
+            .dstColorBlendFactor =
+                square_color ? vk::BlendFactor::eDstColor : vk::BlendFactor::eOne,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eZero,
+            .dstAlphaBlendFactor =
+                square_alpha ? vk::BlendFactor::eDstAlpha : vk::BlendFactor::eOne,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+        };
+
+        const auto src_color = LiverpoolToVK::BlendFactor(color_equation.src_factor);
+        const auto dst_color = LiverpoolToVK::BlendFactor(color_equation.dst_factor);
+        const auto color_blend = LiverpoolToVK::BlendOp(color_equation.function);
+        const auto src_alpha = LiverpoolToVK::BlendFactor(alpha_equation.src_factor);
+        const auto dst_alpha = LiverpoolToVK::BlendFactor(alpha_equation.dst_factor);
+        const auto alpha_blend = LiverpoolToVK::BlendOp(alpha_equation.function);
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
@@ -315,6 +413,7 @@ GraphicsPipeline::GraphicsPipeline(
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
         };
+        square_attachments[i].colorWriteMask = attachments[i].colorWriteMask;
 
         // On GCN GPU there is an additional mask which allows to control color components exported
         // from a pixel shader. A situation possible, when the game may mask out the alpha channel,
@@ -376,9 +475,83 @@ GraphicsPipeline::GraphicsPipeline(
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+
+    if (needs_square_pass) {
+        CreateSquarePipeline(pipeline_cache, pipeline_info, color_blending, square_attachments,
+                             color_formats, infos, debug_str);
+    }
+    std::ranges::copy(runtime_stages, stages.begin());
+}
+
+void GraphicsPipeline::CreateSquarePipeline(
+    vk::PipelineCache pipeline_cache, const vk::GraphicsPipelineCreateInfo& pipeline_info,
+    const vk::PipelineColorBlendStateCreateInfo& color_blending,
+    std::span<const vk::PipelineColorBlendAttachmentState> square_attachments,
+    std::span<const vk::Format> color_formats,
+    std::span<const Shader::Info*, MaxShaderStages> infos, std::string_view debug_str) {
+    // The second draw repeats every side effect of the first one, and it can only keep the other
+    // attachments intact through blending.
+    const char* reason = nullptr;
+    if (color_blending.logicOpEnable) {
+        reason = "logic op";
+    } else if (std::ranges::any_of(infos, [](const Shader::Info* info) {
+                   return info &&
+                          (std::ranges::any_of(
+                               info->buffers,
+                               [](const Shader::BufferResource& buffer) {
+                                   return buffer.is_written &&
+                                          (buffer.buffer_type == Shader::BufferType::Guest ||
+                                           buffer.buffer_type == Shader::BufferType::GdsBuffer);
+                               }) ||
+                           std::ranges::any_of(info->images,
+                                               [](const Shader::ImageResource& image) {
+                                                   return image.is_written;
+                                               }));
+               })) {
+        reason = "shader memory writes";
+    } else {
+        for (u32 i = 0; i < key.num_color_attachments; ++i) {
+            if (key.write_masks[i] &&
+                !instance.IsFormatSupported(color_formats[i],
+                                            vk::FormatFeatureFlagBits2::eColorAttachmentBlend)) {
+                reason = "attachment without blending support";
+                break;
+            }
+        }
+    }
+    if (reason) {
+        LOG_WARNING(Render_Vulkan,
+                    "Graphics pipeline {} needs its scaled MIN/MAX blend squared, which is not "
+                    "possible with {}; the result keeps the unscaled operands",
+                    debug_str, reason);
+        return;
+    }
+
+    auto square_blending = color_blending;
+    square_blending.pAttachments = square_attachments.data();
+    auto square_info = pipeline_info;
+    square_info.pColorBlendState = &square_blending;
+
+    const vk::Device device = instance.GetDevice();
+    auto [result, pipe] = device.createGraphicsPipelineUnique(pipeline_cache, square_info);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create squaring graphics pipeline: {}",
+               vk::to_string(result));
+    square_pipeline = std::move(pipe);
+    SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
+
+std::span<const AmdGpu::Buffer> GraphicsPipeline::GetVertexBuffers() const {
+    if (vertex_input_plan.empty()) {
+        return {};
+    }
+    const auto& buffers = GetStage(Shader::LogicalStage::Vertex).resolved_vertex_buffers;
+    if (buffers.size() != vertex_input_plan.size()) [[unlikely]] {
+        ValidateVertexInputPlanSize(buffers.size(), vertex_input_plan.size());
+    }
+    return buffers;
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
@@ -386,13 +559,14 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    const auto guest_buffer_plan = GetVertexBuffers();
+    if (guest_buffer_plan.empty()) {
         return;
     }
-    const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
-    for (const auto& attrib : fetch_shader->attributes) {
+    for (u32 attribute_index = 0; attribute_index < vertex_input_plan.size(); ++attribute_index) {
+        const auto& attrib = vertex_input_plan[attribute_index];
         const auto step_rate = attrib.GetStepRate();
-        const auto buffer = attrib.GetSharp(vs_info);
+        const auto buffer = guest_buffer_plan[attribute_index];
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,
@@ -441,20 +615,28 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->l_stage)];
-        for (const auto& buffer : stage->buffers) {
-            const auto sharp =
-                preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+        if (!preloading) {
+            ASSERT_MSG(stage->resolved_buffers.size() == stage->buffers.size(),
+                       "Resolved buffer count does not match shader resources: {} != {}",
+                       stage->resolved_buffers.size(), stage->buffers.size());
+            ASSERT_MSG(stage->resolved_images.size() == stage->images.size(),
+                       "Resolved image count does not match shader resources: {} != {}",
+                       stage->resolved_images.size(), stage->images.size());
+        }
+        for (u32 buffer_index = 0; buffer_index < stage->buffers.size(); ++buffer_index) {
             bindings.push_back({
                 .binding = binding++,
-                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                          : vk::DescriptorType::eUniformBuffer,
+                .descriptorType = (UniformBufferMask(stage->l_stage) >> buffer_index) & 1
+                                      ? vk::DescriptorType::eUniformBuffer
+                                      : vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });
         }
-        for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+        for (u32 image_index = 0; image_index < stage->images.size(); ++image_index) {
+            const auto& image = stage->images[image_index];
+            const u32 num_bindings = image.NumBindings(
+                preloading ? AmdGpu::Image{} : stage->resolved_images[image_index]);
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

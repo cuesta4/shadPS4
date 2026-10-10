@@ -4,6 +4,7 @@
 #pragma once
 
 #include <list>
+#include "common/logging/log.h"
 
 #include <libusb.h>
 

@@ -8,6 +8,7 @@
 #include <toml.hpp>
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "key_manager.h"
 #include "path_util.h"
 
@@ -78,7 +79,6 @@ bool KeyManager::LoadFromFile() {
             SetDefaultKeys();
             TransferTrophyKey();
             SaveToFile();
-            LOG_DEBUG(KeyManager, "Created default key file: {}", keysPath.string());
             return true;
         }
 
@@ -104,8 +104,6 @@ bool KeyManager::LoadFromFile() {
                 SaveToFile();
             }
         }
-
-        LOG_DEBUG(KeyManager, "Successfully loaded keys from: {}", keysPath.string());
         return true;
 
     } catch (const std::exception& e) {
@@ -136,8 +134,6 @@ bool KeyManager::SaveToFile() {
             LOG_ERROR(KeyManager, "Failed to write keys to: {}", keysPath.string());
             return false;
         }
-
-        LOG_DEBUG(KeyManager, "Successfully saved keys to: {}", keysPath.string());
         return true;
 
     } catch (const std::exception& e) {

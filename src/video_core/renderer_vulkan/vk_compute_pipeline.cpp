@@ -14,11 +14,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
+                                 SerializationSupport& sdata, u64 uniform_mask,
+                                 bool preloading /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::LogicalStage::Compute)];
     info = &info_;
+    uniform_buffer_masks[int(Shader::LogicalStage::Compute)] = uniform_mask;
     const auto debug_str = GetDebugString();
 
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
@@ -33,16 +35,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
-    for (const auto& buffer : info->buffers) {
-        // During deserialization, we don't have access to the UD to fetch sharp data. To address
-        // this properly we need to track shaprs or portion of them in `sdata`, but since we're
-        // interested only in "is storage" flag (which is not even effective atm), we can take a
-        // shortcut there.
-        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
+    for (u32 i = 0; i < info->buffers.size(); ++i) {
         bindings.push_back({
             .binding = binding++,
-            .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                      : vk::DescriptorType::eUniformBuffer,
+            .descriptorType = (uniform_mask >> i) & 1 ? vk::DescriptorType::eUniformBuffer
+                                                     : vk::DescriptorType::eStorageBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });

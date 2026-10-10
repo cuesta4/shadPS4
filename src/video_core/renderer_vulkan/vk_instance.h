@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 
@@ -23,6 +25,10 @@ class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
+                      bool enable_validation = false, bool enable_crash_diagnostic = false);
+    /// Creates the device without a window, for self-tests. The overlay renderer is never set
+    /// up on such an instance.
+    explicit Instance(Frontend::WindowSystemType window_type, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
 
@@ -75,8 +81,96 @@ public:
         return present_queue;
     }
 
+    /// True when presentation has its own queue of the graphics family.
+    bool HasSeparatePresentQueue() const {
+        return separate_present_queue;
+    }
+
+    /// Vulkan queues require externally synchronized host access.
+    std::mutex& GetGraphicsQueueMutex() const {
+        return graphics_queue_mutex;
+    }
+
+    std::mutex& GetPresentQueueMutex() const {
+        return separate_present_queue ? present_queue_mutex : graphics_queue_mutex;
+    }
+
+    /// True when the device has a queue family that only transfers, fed by the copy engines.
+    bool HasTransferQueue() const {
+        return transfer_queue_family_index.has_value();
+    }
+
+    u32 GetTransferQueueFamilyIndex() const {
+        return *transfer_queue_family_index;
+    }
+
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+
+    std::mutex& GetTransferQueueMutex() const {
+        return transfer_queue_mutex;
+    }
+
+    bool HasSwapchainMaintenance1() const {
+        return swapchain_maintenance1;
+    }
+
+    /// Present ids and present waits through VK_KHR_present_id2/VK_KHR_present_wait2, which
+    /// the surface must also support.
+    bool HasPresentWait2() const {
+        return present_wait2;
+    }
+
+    /// Present ids and present waits through VK_KHR_present_id/VK_KHR_present_wait.
+    bool HasPresentWait() const {
+        return present_wait;
+    }
+
+    /// Whether the instance can query surface capabilities through their extensible form.
+    bool HasSurfaceCapabilities2() const {
+        return surface_capabilities2;
+    }
+
+    /// VK_NV_low_latency2 (NVIDIA Reflex).
+    bool HasNvLowLatency2() const {
+        return nv_low_latency2;
+    }
+
+    bool UsesRawAccessChains() const {
+        return nv_raw_access_chains;
+    }
+
+    bool UsesUniformBufferShaders() const {
+        return uniform_buffer_shaders;
+    }
+
+    bool SupportsUniformBufferInt8() const {
+        return vk12_features.uniformAndStorageBuffer8BitAccess;
+    }
+
+    bool SupportsUniformBufferInt16() const {
+        return uniform_buffer_int16;
+    }
+
+    const vk::PhysicalDeviceLimits& GetLimits() const {
+        return properties.limits;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
+    }
+
+    [[nodiscard]] double TimestampPeriodNs() const noexcept {
+        return properties.limits.timestampPeriod;
+    }
+
+    [[nodiscard]] u32 TimestampValidBits() const noexcept {
+        return timestamp_valid_bits;
+    }
+
+    [[nodiscard]] u32 TransferTimestampValidBits() const noexcept {
+        return transfer_queue_family_index ? transfer_timestamp_valid_bits : timestamp_valid_bits;
     }
 
     /// Returns true if anisotropic filtering is supported
@@ -165,11 +259,6 @@ public:
         return vertex_input_dynamic_state;
     }
 
-    /// Returns true when the nullDescriptor feature of VK_EXT_robustness2 is supported.
-    bool IsNullDescriptorSupported() const {
-        return robustness2 && robustness2_features.nullDescriptor;
-    }
-
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported.
     bool IsFragmentShaderBarycentricSupported() const {
         return fragment_shader_barycentric;
@@ -180,14 +269,14 @@ public:
         return amd_shader_explicit_vertex_parameter;
     }
 
-    /// Returns true when VK_EXT_primitive_topology_list_restart is supported.
+    /// Returns true when VK_EXT_primitive_topology_list_restart is supported for regular lists.
     bool IsListRestartSupported() const {
-        return list_restart;
+        return list_restart && list_restart_features.primitiveTopologyListRestart;
     }
 
-    /// Returns true when VK_EXT_legacy_vertex_attributes is supported.
-    bool IsLegacyVertexAttributesSupported() const {
-        return legacy_vertex_attributes;
+    /// Returns true when VK_EXT_primitive_topology_list_restart is supported for patch lists.
+    bool IsPatchListRestartSupported() const {
+        return list_restart && list_restart_features.primitiveTopologyPatchListRestart;
     }
 
     /// Returns true when VK_EXT_provoking_vertex is supported.
@@ -265,16 +354,6 @@ public:
         return features.tessellationShader;
     }
 
-    /// Returns true when tessellation isolines are supported by the device
-    bool IsTessellationIsolinesSupported() const {
-        return !portability_subset || portability_features.tessellationIsolines;
-    }
-
-    /// Returns true when tessellation point mode is supported by the device
-    bool IsTessellationPointModeSupported() const {
-        return !portability_subset || portability_features.tessellationPointMode;
-    }
-
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -330,9 +409,9 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
-    ///  Returns the maximum size of uniform buffers.
-    vk::DeviceSize UniformMaxSize() const {
-        return properties.limits.maxUniformBufferRange;
+    /// Returns the granularity of robust uniform buffer bounds checks
+    u32 RobustUniformBufferAlignment() const {
+        return robust_uniform_buffer_alignment;
     }
 
     /// Returns the minimum required alignment for storage buffers
@@ -405,6 +484,17 @@ public:
         return properties.limits.maxFramebufferHeight;
     }
 
+    /// Returns the maximum number of samplers that can be allocated at once.
+    u32 GetMaxSamplerAllocationCount() const {
+        if (driver_id == vk::DriverId::eMesaKosmickrisp) {
+            // FIXME: KosmicKrisp has an internal 1024 unique sampler limit before
+            // vkCreateSampler starts returning VK_ERROR_OUT_OF_HOST_MEMORY. Work
+            // around this for now by reducing the value to 1024.
+            return 1024;
+        }
+        return properties.limits.maxSamplerAllocationCount;
+    }
+
     /// Returns the sample count flags supported by color buffers.
     vk::SampleCountFlags GetColorSampleCounts() const {
         return properties.limits.framebufferColorSampleCounts;
@@ -431,6 +521,11 @@ public:
     bool Is2dViewOf3dSupported() const {
         return image_2d_view_of_3d && image_2d_view_of_3d_features.image2DViewOf3D &&
                image_2d_view_of_3d_features.sampler2DViewOf3D;
+    }
+
+    /// Returns whether VK_EXT_image_view_min_lod is supported.
+    bool IsImageViewMinLodSupported() const {
+        return image_view_min_lod;
     }
 
     /// Returns whether the device can report memory usage.
@@ -478,24 +573,42 @@ private:
     vk::PhysicalDeviceFeatures features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;
-    vk::PhysicalDevicePortabilitySubsetFeaturesKHR portability_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
-    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR
         workgroup_memory_explicit_layout_features;
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
+    vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    bool shutdown_overlay{true};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    mutable std::mutex graphics_queue_mutex;
+    mutable std::mutex present_queue_mutex;
+    bool separate_present_queue{};
+    std::optional<u32> transfer_queue_family_index;
+    vk::Queue transfer_queue;
+    mutable std::mutex transfer_queue_mutex;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 timestamp_valid_bits{};
+    u32 transfer_timestamp_valid_bits{};
+    bool swapchain_maintenance1{};
+    bool present_wait2{};
+    bool present_wait{};
+    bool surface_capabilities2{};
+    bool surface_maintenance1{};
+    bool nv_low_latency2{};
+    bool nv_raw_access_chains{};
+    bool uniform_buffer_shaders{};
+    bool uniform_buffer_int16{};
+    u32 robust_uniform_buffer_alignment{};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
@@ -504,9 +617,7 @@ private:
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
-    bool robustness2{};
     bool list_restart{};
-    bool legacy_vertex_attributes{};
     bool provoking_vertex{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
@@ -517,12 +628,13 @@ private:
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
-    bool portability_subset{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
+    bool image_view_min_lod{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool calibrated_timestamps{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

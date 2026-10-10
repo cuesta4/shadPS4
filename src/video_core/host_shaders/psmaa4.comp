@@ -1,0 +1,545 @@
+// SPDX-FileCopyrightText: Copyright 2025 RdenBlaauwen; Jorge Jimenez et al.; NVIDIA Corporation; Derek Brush
+// SPDX-License-Identifier: LicenseRef-PSMAA-ThirdParty
+
+#version 450
+#if defined(GL_EXT_control_flow_attributes)
+#extension GL_EXT_control_flow_attributes : require
+#define SPIRV_CROSS_FLATTEN [[flatten]]
+#define SPIRV_CROSS_BRANCH [[dont_flatten]]
+#define SPIRV_CROSS_UNROLL [[unroll]]
+#define SPIRV_CROSS_LOOP [[dont_unroll]]
+#else
+#define SPIRV_CROSS_FLATTEN
+#define SPIRV_CROSS_BRANCH
+#define SPIRV_CROSS_UNROLL
+#define SPIRV_CROSS_LOOP
+#endif
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float _145;
+vec4 _146;
+vec2 _147;
+vec4 _148;
+vec2 _149;
+
+layout(push_constant, std430) uniform type_PushConstant_Constants
+{
+    vec4 metrics;
+    vec4 target;
+    uint conversion;
+} params;
+
+layout(set = 0, binding = 1) uniform texture2D tex1;
+layout(set = 0, binding = 6) uniform texture2D tex6;
+layout(set = 0, binding = 7) uniform texture2D tex7;
+layout(set = 0, binding = 9) uniform sampler linear_sampler;
+layout(set = 0, binding = 10, rgba8) uniform writeonly image2D output0;
+
+void main()
+{
+    do
+    {
+        if (any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(params.target.zw))))
+        {
+            break;
+        }
+        vec2 _168 = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) * params.metrics.xy;
+        vec2 _175 = _168 * vec4(_145, _145, params.metrics.z, params.metrics.w).zw;
+        vec4 _180 = vec4(params.metrics.x, params.metrics.y, _145, _145);
+        vec4 _181 = _180.xyxy;
+        vec4 _182 = _168.xyxy;
+        precise vec4 _15 = fma(_181, vec4(-0.25, -0.125, 1.25, -0.125), _182);
+        precise vec4 _16 = fma(_181, vec4(-0.125, -0.25, -0.125, 1.25), _182);
+        float _184 = _15.x;
+        float _186 = _16.y;
+        precise vec4 _17 = fma(_180.xxyy, vec4(-64.0, 64.0, -64.0, 64.0), vec4(_184, _15.z, _186, _16.w));
+        vec4 _194 = textureLod(sampler2D(tex1, linear_sampler), _168, 0.0);
+        vec2 _195 = _194.xy;
+        vec4 _648;
+        vec2 _649;
+        SPIRV_CROSS_BRANCH
+        if (_194.y > 0.0)
+        {
+            vec2 _241;
+            vec4 _242;
+            if (_194.x > 0.0)
+            {
+                vec3 _209 = vec3(params.metrics.x, params.metrics.y, 1.0);
+                vec2 _211;
+                vec4 _214;
+                _211 = _147;
+                _214 = vec4(_168, -1.0, 1.0);
+                float _218;
+                for (;;)
+                {
+                    _218 = _214.z;
+                    bool _224;
+                    if (_218 < 18.0)
+                    {
+                        _224 = _214.w > 0.89999997615814208984375;
+                    }
+                    else
+                    {
+                        _224 = false;
+                    }
+                    if (_224)
+                    {
+                        precise vec3 _24 = fma(_209, vec3(-1.0, 1.0, 1.0), _214.xyz);
+                        vec4 _226 = vec4(_24.x, _24.y, _24.z, _214.w);
+                        vec2 _212 = textureLod(sampler2D(tex1, linear_sampler), vec4(_24.xy, 0.0, 0.0).xy, 0.0).xy;
+                        _226.w = dot(_212, vec2(0.5));
+                        _211 = _212;
+                        _214 = _226;
+                        continue;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                vec4 _235 = vec4(_214.z, _146.y, _214.w, _146.w);
+                _235.x = _218 + float(_211.y > 0.89999997615814208984375);
+                _241 = _211;
+                _242 = _235;
+            }
+            else
+            {
+                _241 = _147;
+                _242 = vec4(vec2(0.0).x, _146.y, vec2(0.0).y, _146.w);
+            }
+            float _243 = _168.x;
+            float _244 = _168.y;
+            vec4 _245 = vec4(_243, _244, -1.0, 1.0);
+            vec3 _246 = vec3(params.metrics.x, params.metrics.y, 1.0);
+            vec2 _248;
+            vec4 _251;
+            _248 = _241;
+            _251 = _245;
+            float _255;
+            for (;;)
+            {
+                _255 = _251.z;
+                bool _261;
+                if (_255 < 18.0)
+                {
+                    _261 = _251.w > 0.89999997615814208984375;
+                }
+                else
+                {
+                    _261 = false;
+                }
+                if (_261)
+                {
+                    precise vec3 _25 = fma(_246, vec3(1.0, -1.0, 1.0), _251.xyz);
+                    vec4 _263 = vec4(_25.x, _25.y, _25.z, _251.w);
+                    vec2 _249 = textureLod(sampler2D(tex1, linear_sampler), vec4(_25.xy, 0.0, 0.0).xy, 0.0).xy;
+                    _263.w = dot(_249, vec2(0.5));
+                    _248 = _249;
+                    _251 = _263;
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            vec2 _332;
+            SPIRV_CROSS_BRANCH
+            if ((_242.x + _255) > 2.0)
+            {
+                precise vec4 _20 = fma(vec4(0.25 - _242.x, _242.x, _255, (-0.25) - _255), _181, _182);
+                vec4 _289 = textureLod(sampler2D(tex1, linear_sampler), vec4(_20.xy, _145, _145).xy + (vec2(-1.0, 0.0) * params.metrics.xy), 0.0);
+                vec4 _298 = textureLod(sampler2D(tex1, linear_sampler), vec4(_20.zw, _145, _145).xy + (vec2(1.0, 0.0) * params.metrics.xy), 0.0);
+                vec4 _299 = vec4(_289.x, _289.y, _298.x, _298.y);
+                vec2 _300 = _299.xz;
+                vec2 _304 = _300 * abs((_300 * 5.0) - vec2(3.75));
+                vec4 _306 = roundEven(vec4(_304.x, _299.y, _304.y, _299.w));
+                precise vec2 _21 = fma(vec2(2.0), _306.yw, _306.xz);
+                bvec2 _311 = notEqual(step(vec2(0.89999997615814208984375), vec4(_242.x, _251.z, _242.z, _251.w).zw), vec2(0.0));
+                vec2 _316;
+                SPIRV_CROSS_FLATTEN
+                if (_311.x)
+                {
+                    vec2 _315 = _21;
+                    _315.x = 0.0;
+                    _316 = _315;
+                }
+                else
+                {
+                    _316 = _21;
+                }
+                vec2 _321;
+                SPIRV_CROSS_FLATTEN
+                if (_311.y)
+                {
+                    vec2 _320 = _316;
+                    _320.y = 0.0;
+                    _321 = _320;
+                }
+                else
+                {
+                    _321 = _316;
+                }
+                precise vec2 _27 = fma(vec2(0.0062500000931322574615478515625, 0.001785714295692741870880126953125), fma(vec2(20.0), _321, vec4(_242.x, _251.z, _242.z, _251.w).xy), vec2(0.00312500004656612873077392578125, 0.0008928571478463709354400634765625));
+                _332 = textureLod(sampler2D(tex6, linear_sampler), vec4(_27.x + 0.5, _27.y, 0.0, 0.0).xy, 0.0).xy;
+            }
+            else
+            {
+                _332 = vec2(0.0);
+            }
+            _245.x = _243 + (0.25 * params.metrics.x);
+            vec2 _337;
+            vec4 _340;
+            _337 = _248;
+            _340 = _245;
+            for (;;)
+            {
+                bool _350;
+                if (_340.z < 18.0)
+                {
+                    _350 = _340.w > 0.89999997615814208984375;
+                }
+                else
+                {
+                    _350 = false;
+                }
+                if (_350)
+                {
+                    precise vec3 _28 = fma(_246, vec3(-1.0, -1.0, 1.0), _340.xyz);
+                    vec4 _352 = vec4(_28.x, _28.y, _28.z, _340.w);
+                    vec4 _359 = textureLod(sampler2D(tex1, linear_sampler), vec4(_28.xy, 0.0, 0.0).xy, 0.0);
+                    vec2 _360 = _359.xy;
+                    float _361 = _359.x;
+                    _360.x = _361 * abs((5.0 * _361) - 3.75);
+                    vec2 _338 = roundEven(_360);
+                    _352.w = dot(_338, vec2(0.5));
+                    _337 = _338;
+                    _340 = _352;
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            vec2 _370 = vec2(1.0, 0.0) * params.metrics.xy;
+            vec4 _419;
+            if (textureLod(sampler2D(tex1, linear_sampler), vec4(_243, _244, _145, _145).xy + _370, 0.0).x > 0.0)
+            {
+                vec2 _382;
+                vec4 _385;
+                _382 = _337;
+                _385 = _245;
+                float _389;
+                for (;;)
+                {
+                    _389 = _385.z;
+                    bool _395;
+                    if (_389 < 18.0)
+                    {
+                        _395 = _385.w > 0.89999997615814208984375;
+                    }
+                    else
+                    {
+                        _395 = false;
+                    }
+                    if (_395)
+                    {
+                        precise vec3 _29 = fma(_246, vec3(1.0), _385.xyz);
+                        vec4 _397 = vec4(_29.x, _29.y, _29.z, _385.w);
+                        vec4 _404 = textureLod(sampler2D(tex1, linear_sampler), vec4(_29.xy, 0.0, 0.0).xy, 0.0);
+                        vec2 _405 = _404.xy;
+                        float _406 = _404.x;
+                        _405.x = _406 * abs((5.0 * _406) - 3.75);
+                        vec2 _383 = roundEven(_405);
+                        _397.w = dot(_383, vec2(0.5));
+                        _382 = _383;
+                        _385 = _397;
+                        continue;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                vec4 _413 = vec4(_340.z, _385.z, _340.w, _385.w);
+                _413.y = _389 + float(_382.y > 0.89999997615814208984375);
+                _419 = _413;
+            }
+            else
+            {
+                _419 = vec4(_340.z, vec2(0.0).x, _340.w, vec2(0.0).y);
+            }
+            vec2 _481;
+            SPIRV_CROSS_BRANCH
+            if ((_419.x + _419.y) > 2.0)
+            {
+                float _426 = -_419.x;
+                precise vec4 _22 = fma(vec4(_426, _426, _419.yy), _181, _182);
+                vec2 _431 = vec4(_22.xy, _145, _145).xy;
+                vec4 _438;
+                _438.x = textureLod(sampler2D(tex1, linear_sampler), _431 + (vec2(-1.0, 0.0) * params.metrics.xy), 0.0).y;
+                _438.y = textureLod(sampler2D(tex1, linear_sampler), _431 + (vec2(0.0, -1.0) * params.metrics.xy), 0.0).x;
+                vec4 _453 = textureLod(sampler2D(tex1, linear_sampler), vec4(_22.zw, _145, _145).xy + _370, 0.0);
+                vec4 _454 = vec4(_438.x, _438.y, _453.y, _453.x);
+                precise vec2 _23 = fma(vec2(2.0), _454.xz, _454.yw);
+                bvec2 _459 = notEqual(step(vec2(0.89999997615814208984375), _419.zw), vec2(0.0));
+                vec2 _464;
+                SPIRV_CROSS_FLATTEN
+                if (_459.x)
+                {
+                    vec2 _463 = _23;
+                    _463.x = 0.0;
+                    _464 = _463;
+                }
+                else
+                {
+                    _464 = _23;
+                }
+                vec2 _469;
+                SPIRV_CROSS_FLATTEN
+                if (_459.y)
+                {
+                    vec2 _468 = _464;
+                    _468.y = 0.0;
+                    _469 = _468;
+                }
+                else
+                {
+                    _469 = _464;
+                }
+                precise vec2 _31 = fma(vec2(0.0062500000931322574615478515625, 0.001785714295692741870880126953125), fma(vec2(20.0), _469, _419.xy), vec2(0.00312500004656612873077392578125, 0.0008928571478463709354400634765625));
+                _481 = _332 + textureLod(sampler2D(tex6, linear_sampler), vec4(_31.x + 0.5, _31.y, 0.0, 0.0).xy, 0.0).yx;
+            }
+            else
+            {
+                _481 = _332;
+            }
+            vec4 _646;
+            vec2 _647;
+            SPIRV_CROSS_BRANCH
+            if (_481.x == (-_481.y))
+            {
+                float _492 = _17.x;
+                vec2 _494;
+                vec2 _497;
+                _494 = vec2(0.0, 1.0);
+                _497 = _15.xy;
+                float _500;
+                for (;;)
+                {
+                    _500 = _497.x;
+                    bool _506;
+                    if (_500 > _492)
+                    {
+                        _506 = _494.y > 0.828100025653839111328125;
+                    }
+                    else
+                    {
+                        _506 = false;
+                    }
+                    bool _511;
+                    if (_506)
+                    {
+                        _511 = _494.x == 0.0;
+                    }
+                    else
+                    {
+                        _511 = false;
+                    }
+                    if (_511)
+                    {
+                        _494 = textureLod(sampler2D(tex1, linear_sampler), vec4(_500, _497.y, 0.0, 0.0).xy, 0.0).xy;
+                        _497 = fma(vec2(-2.0, -0.0), _180.xy, _497);
+                        continue;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                precise float _34 = fma(params.metrics.x, fma(-2.007874011993408203125, textureLod(sampler2D(tex7, linear_sampler), vec4(fma(vec2(0.5, -2.0), _494, vec2(0.0078125, 2.03125)), 0.0, 0.0).xy, 0.0).x, 3.25), _500);
+                float _534 = _17.y;
+                vec2 _536;
+                vec2 _539;
+                _536 = vec2(0.0, 1.0);
+                _539 = _15.zw;
+                float _542;
+                for (;;)
+                {
+                    _542 = _539.x;
+                    bool _548;
+                    if (_542 < _534)
+                    {
+                        _548 = _536.y > 0.828100025653839111328125;
+                    }
+                    else
+                    {
+                        _548 = false;
+                    }
+                    bool _553;
+                    if (_548)
+                    {
+                        _553 = _536.x == 0.0;
+                    }
+                    else
+                    {
+                        _553 = false;
+                    }
+                    if (_553)
+                    {
+                        _536 = textureLod(sampler2D(tex1, linear_sampler), vec4(_542, _539.y, 0.0, 0.0).xy, 0.0).xy;
+                        _539 = fma(vec2(2.0, 0.0), _180.xy, _539);
+                        continue;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                precise float _38 = fma(-params.metrics.x, fma(-2.007874011993408203125, textureLod(sampler2D(tex7, linear_sampler), vec4(fma(vec2(0.5, -2.0), _536, vec2(0.5234375, 2.03125)), 0.0, 0.0).xy, 0.0).x, 3.25), _542);
+                vec2 _576 = abs(roundEven(fma(vec4(_145, _145, params.metrics.z, _145).zz, vec2(_34, _38), -_175.xx)));
+                precise vec2 _41 = fma(vec2(0.0062500000931322574615478515625, 0.001785714295692741870880126953125), fma(vec2(16.0), roundEven(vec2(textureLod(sampler2D(tex1, linear_sampler), vec4(_34, _186, 0.0, 0.0).xy, 0.0).x, textureLod(sampler2D(tex1, linear_sampler), vec4(_38, _186, _145, _145).xy + _370, 0.0).x) * 4.0), sqrt(_576)), vec2(0.00312500004656612873077392578125, 0.0008928571478463709354400634765625));
+                vec2 _597 = step(_576, _576.yx);
+                vec2 _603 = (_597 * 1.0) / vec2(_597.x + _597.y);
+                float _604 = _603.x;
+                vec2 _606 = vec4(_34, _244, _145, _145).xy;
+                float _615 = _603.y;
+                vec2 _617 = vec4(_38, _244, _145, _145).xy;
+                float _632 = 1.0 - (_604 * textureLod(sampler2D(tex1, linear_sampler), _606 + (vec2(0.0, -2.0) * params.metrics.xy), 0.0).x);
+                vec2 _633 = vec2((1.0 - (_604 * textureLod(sampler2D(tex1, linear_sampler), _606 + (vec2(0.0, 1.0) * params.metrics.xy), 0.0).x)) - (_615 * textureLod(sampler2D(tex1, linear_sampler), _617 + params.metrics.xy, 0.0).x), _632);
+                _633.y = _632 - (_615 * textureLod(sampler2D(tex1, linear_sampler), _617 + (vec2(1.0, -2.0) * params.metrics.xy), 0.0).x);
+                vec2 _644 = textureLod(sampler2D(tex6, linear_sampler), vec4(_41.x, fma(0.14285714924335479736328125, 0.0, _41.y), 0.0, 0.0).xy, 0.0).xy * clamp(_633, vec2(0.0), vec2(1.0));
+                _646 = vec4(_644.x, _644.y, vec4(0.0).z, vec4(0.0).w);
+                _647 = _195;
+            }
+            else
+            {
+                vec2 _490;
+                _490.x = 0.0;
+                _646 = vec4(_481.x, _481.y, vec4(0.0).z, vec4(0.0).w);
+                _647 = _490;
+            }
+            _648 = _646;
+            _649 = _647;
+        }
+        else
+        {
+            _648 = vec4(0.0);
+            _649 = _195;
+        }
+        vec4 _813;
+        SPIRV_CROSS_BRANCH
+        if (_649.x > 0.0)
+        {
+            float _655 = _17.z;
+            vec2 _657;
+            vec2 _660;
+            _657 = vec2(1.0, 0.0);
+            _660 = _16.xy;
+            float _663;
+            for (;;)
+            {
+                _663 = _660.y;
+                bool _669;
+                if (_663 > _655)
+                {
+                    _669 = _657.x > 0.828100025653839111328125;
+                }
+                else
+                {
+                    _669 = false;
+                }
+                bool _674;
+                if (_669)
+                {
+                    _674 = _657.y == 0.0;
+                }
+                else
+                {
+                    _674 = false;
+                }
+                if (_674)
+                {
+                    _657 = textureLod(sampler2D(tex1, linear_sampler), vec4(_660.x, _663, 0.0, 0.0).xy, 0.0).xy;
+                    _660 = fma(vec2(-0.0, -2.0), _180.xy, _660);
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            precise float _45 = fma(params.metrics.y, fma(-2.007874011993408203125, textureLod(sampler2D(tex7, linear_sampler), vec4(fma(vec2(0.5, -2.0), _657.yx, vec2(0.0078125, 2.03125)), 0.0, 0.0).xy, 0.0).x, 3.25), _663);
+            float _698 = _17.w;
+            vec2 _700;
+            vec2 _703;
+            _700 = vec2(1.0, 0.0);
+            _703 = _16.zw;
+            float _706;
+            for (;;)
+            {
+                _706 = _703.y;
+                bool _712;
+                if (_706 < _698)
+                {
+                    _712 = _700.x > 0.828100025653839111328125;
+                }
+                else
+                {
+                    _712 = false;
+                }
+                bool _717;
+                if (_712)
+                {
+                    _717 = _700.y == 0.0;
+                }
+                else
+                {
+                    _717 = false;
+                }
+                if (_717)
+                {
+                    _700 = textureLod(sampler2D(tex1, linear_sampler), vec4(_703.x, _706, 0.0, 0.0).xy, 0.0).xy;
+                    _703 = fma(vec2(0.0, 2.0), _180.xy, _703);
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            precise float _49 = fma(-params.metrics.y, fma(-2.007874011993408203125, textureLod(sampler2D(tex7, linear_sampler), vec4(fma(vec2(0.5, -2.0), _700.yx, vec2(0.5234375, 2.03125)), 0.0, 0.0).xy, 0.0).x, 3.25), _706);
+            vec2 _741 = abs(roundEven(fma(vec4(_145, _145, _145, params.metrics.w).ww, vec2(_45, _49), -_175.yy)));
+            precise vec2 _52 = fma(vec2(0.0062500000931322574615478515625, 0.001785714295692741870880126953125), fma(vec2(16.0), roundEven(vec2(textureLod(sampler2D(tex1, linear_sampler), vec4(_184, _45, 0.0, 0.0).xy, 0.0).y, textureLod(sampler2D(tex1, linear_sampler), vec4(_184, _49, _145, _145).xy + (vec2(0.0, 1.0) * params.metrics.xy), 0.0).y) * 4.0), sqrt(_741)), vec2(0.00312500004656612873077392578125, 0.0008928571478463709354400634765625));
+            float _761 = _168.x;
+            vec2 _764 = step(_741, _741.yx);
+            vec2 _770 = (_764 * 1.0) / vec2(_764.x + _764.y);
+            float _771 = _770.x;
+            vec2 _773 = vec4(_761, _45, _145, _145).xy;
+            float _782 = _770.y;
+            vec2 _784 = vec4(_761, _49, _145, _145).xy;
+            float _799 = 1.0 - (_771 * textureLod(sampler2D(tex1, linear_sampler), _773 + (vec2(-2.0, 0.0) * params.metrics.xy), 0.0).y);
+            vec2 _800 = vec2((1.0 - (_771 * textureLod(sampler2D(tex1, linear_sampler), _773 + (vec2(1.0, 0.0) * params.metrics.xy), 0.0).y)) - (_782 * textureLod(sampler2D(tex1, linear_sampler), _784 + params.metrics.xy, 0.0).y), _799);
+            _800.y = _799 - (_782 * textureLod(sampler2D(tex1, linear_sampler), _784 + (vec2(-2.0, 1.0) * params.metrics.xy), 0.0).y);
+            vec2 _811 = textureLod(sampler2D(tex6, linear_sampler), vec4(_52.x, fma(0.14285714924335479736328125, 0.0, _52.y), 0.0, 0.0).xy, 0.0).xy * clamp(_800, vec2(0.0), vec2(1.0));
+            _813 = vec4(_648.x, _648.y, _811.x, _811.y);
+        }
+        else
+        {
+            _813 = _648;
+        }
+        imageStore(output0, ivec2(gl_GlobalInvocationID.xy), _813);
+        break;
+    } while(false);
+}

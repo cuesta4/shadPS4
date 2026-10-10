@@ -6,8 +6,11 @@
 #include <mutex>
 #include <SDL3/SDL_init.h>
 #include <cmrc/cmrc.hpp>
+#include <fmt/format.h>
 #include <imgui.h>
+#include <imgui/imgui_std.h>
 #include <queue>
+#include "common/logging/log.h"
 
 #define MINIMP3_IMPLEMENTATION
 #include <minimp3.h>
@@ -16,7 +19,6 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/np/trophy_ui.h"
-#include "imgui/imgui_std.h"
 
 CMRC_DECLARE(res);
 namespace fs = std::filesystem;
@@ -43,7 +45,7 @@ TrophyUI::TrophyUI(const std::filesystem::path& trophyIconPath, const std::strin
                   fmt::UTF(trophyIconPath.u8string()));
     }
 
-    std::string pathString = "src/images/";
+    std::string pathString = "src/resources/";
 
     if (trophy_type == "P") {
         pathString += "platinum.png";
@@ -151,7 +153,7 @@ TrophyUI::TrophyUI(const std::filesystem::path& trophyIconPath, const std::strin
         file.close();
         PlayWav(sound_data);
     } else {
-        auto soundFile = resource.open("src/images/trophy.wav");
+        auto soundFile = resource.open("src/resources/trophy.wav");
         sound_data = std::vector<unsigned char>(soundFile.begin(), soundFile.end());
         PlayWav(sound_data);
     }

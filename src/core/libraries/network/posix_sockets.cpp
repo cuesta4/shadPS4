@@ -4,6 +4,7 @@
 #include <vector>
 #include <common/assert.h>
 #include "common/error.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
 #include "net.h"

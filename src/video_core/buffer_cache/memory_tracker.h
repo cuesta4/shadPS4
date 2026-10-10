@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
@@ -39,8 +40,10 @@ public:
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
-                std::scoped_lock lk{manager->lock};
-                return manager->template IsRegionModified<Type::GPU>(offset, size);
+                if (!manager->HasAnyGpuModifiedPages()) {
+                    return false;
+                }
+                return IsRegionGpuModifiedLocked(manager, offset, size);
             });
     }
 
@@ -50,6 +53,16 @@ public:
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
                                 manager->template ChangeRegionState<Type::CPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
+    /// Mark region as modified from the host GPU.
+    void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                             });
     }
@@ -88,6 +101,18 @@ public:
             });
     }
 
+    /// Records a CPU write fault and opens the pages after it for writing when it extends a run
+    /// of written pages. Returns the range opened ahead.
+    std::pair<VAddr, u64> OpenWriteRun(VAddr fault_addr, size_t max_pages) {
+        const size_t page_index = fault_addr >> TRACKER_HIGHER_PAGE_BITS;
+        auto* manager = page_index < NUM_HIGH_PAGES ? top_tier[page_index] : nullptr;
+        if (!manager) {
+            return {};
+        }
+        std::scoped_lock lk{manager->lock};
+        return manager->OpenWriteRun(fault_addr, max_pages);
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
@@ -124,6 +149,13 @@ public:
     }
 
 private:
+    /// Out of line so that checking regions without GPU modified pages takes no lock.
+    static SHAD_NO_INLINE bool IsRegionGpuModifiedLocked(RegionManager* manager, u64 offset,
+                                                         size_t size) noexcept {
+        std::scoped_lock lk{manager->lock};
+        return manager->template IsRegionModified<Type::GPU>(offset, size);
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address

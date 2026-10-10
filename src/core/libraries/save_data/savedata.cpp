@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <ranges>
 #include <span>
 #include <thread>
 #include <vector>
@@ -490,7 +492,6 @@ static Error Umount(const OrbisSaveDataMountPoint* mountPoint, bool call_backup 
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
-    LOG_DEBUG(Lib_SaveData, "Umount mountPoint:{}", mountPoint->data.to_view());
 
     std::string mount_point_str = mountPoint->data.to_string();
 
@@ -735,7 +736,6 @@ Error PS4_SYSV_ABI sceSaveDataDelete(const OrbisSaveDataDelete* del) {
         return Error::PARAMETER;
     }
     const std::string_view dirName{del->dirName->data};
-    LOG_DEBUG(Lib_SaveData, "called dirName: {}", dirName);
     if (dirName.empty()) {
         return Error::PARAMETER;
     }
@@ -787,7 +787,6 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
-    LOG_DEBUG(Lib_SaveData, "called");
     const std::string_view title_id{cond->titleId == nullptr
                                         ? std::string_view{g_game_serial}
                                         : std::string_view{cond->titleId->data}};
@@ -1259,7 +1258,7 @@ Error PS4_SYSV_ABI sceSaveDataMount(const OrbisSaveDataMount* mount,
         LOG_INFO(Lib_SaveData, "called without initialize");
         return setNotInitializedError();
     }
-    if (mount == nullptr && mount->dirName != nullptr) {
+    if (mount == nullptr || mount->dirName == nullptr) {
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
@@ -1280,7 +1279,7 @@ Error PS4_SYSV_ABI sceSaveDataMount2(const OrbisSaveDataMount2* mount,
         LOG_INFO(Lib_SaveData, "called without initialize");
         return setNotInitializedError();
     }
-    if (mount == nullptr && mount->dirName != nullptr) {
+    if (mount == nullptr || mount->dirName == nullptr) {
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
@@ -1379,7 +1378,6 @@ Error PS4_SYSV_ABI sceSaveDataSaveIcon(const OrbisSaveDataMountPoint* mountPoint
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
-    LOG_DEBUG(Lib_SaveData, "called");
     fs::path path;
     const std::string_view mount_point_str{mountPoint->data};
     for (const auto& instance : g_mount_slots) {
@@ -1428,7 +1426,6 @@ Error PS4_SYSV_ABI sceSaveDataSetParam(const OrbisSaveDataMountPoint* mountPoint
         LOG_INFO(Lib_SaveData, "called with invalid parameter");
         return Error::PARAMETER;
     }
-    LOG_DEBUG(Lib_SaveData, "called: paramType = {}", magic_enum::enum_name(paramType));
     PSF* param_sfo = nullptr;
     const std::string_view mount_point_str{mountPoint->data};
     for (auto& instance : g_mount_slots) {

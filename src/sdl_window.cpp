@@ -1,14 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "SDL3/SDL_events.h"
-#include "SDL3/SDL_hints.h"
-#include "SDL3/SDL_init.h"
-#include "SDL3/SDL_properties.h"
-#include "SDL3/SDL_timer.h"
-#include "SDL3/SDL_video.h"
+#include <algorithm>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_surface.h>
+#include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_video.h>
+#include <cmrc/cmrc.hpp>
+#include <stb_image.h>
+
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/io_file.h"
+#include "common/logging/formatter.h"
+#include "common/scope_exit.h"
+#include "common/logging/log.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
@@ -16,6 +25,7 @@
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
+#include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
@@ -24,9 +34,12 @@
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
-#include "SDL3/SDL_metal.h"
+#include <SDL3/SDL_metal.h>
 #endif
 #include <core/emulator_settings.h>
+#include "core/libraries/mouse/sdl_mouse.h"
+
+CMRC_DECLARE(res);
 
 namespace Frontend {
 
@@ -73,9 +86,7 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
 
 static Uint32 SDLCALL PollController(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
     auto* controller = reinterpret_cast<Input::GameController*>(userdata);
-    controller->UpdateAxisSmoothing();
-    controller->Gyro(0);
-    controller->Acceleration(0);
+    controller->PollState();
     return interval;
 }
 
@@ -84,6 +95,41 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
     auto* controller = reinterpret_cast<Input::GameController*>(userdata);
     controller->PollLightColour();
     return interval;
+}
+
+void ShowEarlySplash(SDL_Window* window, std::span<const u8> png_data) {
+    if (png_data.empty() || !EmulatorSettings.IsShowSplash()) {
+        return;
+    }
+    // A software blit into the game window covers the Vulkan startup. The framebuffer is
+    // released right away; the pixels stay on screen until the swapchain presents.
+    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+    SDL_SyncWindow(window);
+    int image_width = 0;
+    int image_height = 0;
+    unsigned char* pixels = stbi_load_from_memory(
+        png_data.data(), static_cast<int>(png_data.size()), &image_width, &image_height, nullptr, 4);
+    SDL_Surface* image = pixels ? SDL_CreateSurfaceFrom(image_width, image_height,
+                                                        SDL_PIXELFORMAT_RGBA32, pixels,
+                                                        image_width * 4)
+                                : nullptr;
+    SDL_Surface* output = SDL_GetWindowSurface(window);
+    if (image != nullptr && output != nullptr) {
+        int width = output->w;
+        int height = output->h;
+        const double scale = std::min(static_cast<double>(width) / image_width,
+                                      static_cast<double>(height) / image_height);
+        const int draw_width = std::max(1, static_cast<int>(image_width * scale));
+        const int draw_height = std::max(1, static_cast<int>(image_height * scale));
+        const SDL_Rect rect{(width - draw_width) / 2, (height - draw_height) / 2, draw_width,
+                            draw_height};
+        SDL_FillSurfaceRect(output, nullptr, 0);
+        SDL_BlitSurfaceScaled(image, nullptr, output, &rect, SDL_SCALEMODE_LINEAR);
+        SDL_UpdateWindowSurface(window);
+    }
+    SDL_DestroySurface(image);
+    stbi_image_free(pixels);
+    SDL_DestroyWindowSurface(window);
 }
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
@@ -95,9 +141,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
+    // On macOS, the future Intel compatibility environment does not include camera frameworks.
+    // Just skip initializing it entirely, no point in splitting old vs new OS versions here.
+#ifndef __APPLE__
     if (!SDL_Init(SDL_INIT_CAMERA)) {
         LOG_ERROR(Input, "Failed to initialize SDL camera subsystem: {}", SDL_GetError());
     }
+#endif
     SDL_InitSubSystem(SDL_INIT_AUDIO);
 
     SDL_PropertiesID props = SDL_CreateProperties();
@@ -109,6 +159,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
     SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
+    // transition on startup. SDL sizes the window to the display and keeps the requested
+    // width/height as the windowed size to restore when leaving fullscreen.
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
+                           EmulatorSettings.IsFullScreen());
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -119,7 +174,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
     bool error = false;
     const SDL_DisplayID displayIndex = SDL_GetDisplayForWindow(window);
-    if (displayIndex < 0) {
+    if (displayIndex == 0) {
         LOG_ERROR(Frontend, "Error getting display index: {}", SDL_GetError());
         error = true;
     }
@@ -134,6 +189,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);
+    UpdateDisplayRefreshPeriod();
+    // The window geometry is only final once the fullscreen transition has settled; refresh
+    // the cached size so the first swapchain and the splashscreen use the real drawable size.
+    SDL_GetWindowSizeInPixels(window, &width, &height);
 
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
@@ -163,7 +222,6 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
-    controllers.TryOpenSDLControllers();
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -172,11 +230,24 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
 WindowSDL::~WindowSDL() = default;
 
+void WindowSDL::SetIcon(std::span<const u8> png_data) {
+    if (png_data.empty()) {
+        LOG_WARNING(Core, "No window icon data available, using default icon.");
+        SetDefaultWindowIcon(window);
+        return;
+    }
+    SetWindowIcon(window, std::vector<u8>(png_data.begin(), png_data.end()));
+}
+
 void WindowSDL::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    if (Libraries::Mouse::PushSDLEvent(event)) {
         return;
     }
 
@@ -188,12 +259,18 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_MAXIMIZED:
     case SDL_EVENT_WINDOW_RESTORED:
+    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
         OnResize();
         break;
     case SDL_EVENT_WINDOW_MINIMIZED:
     case SDL_EVENT_WINDOW_EXPOSED:
         is_shown = event.type == SDL_EVENT_WINDOW_EXPOSED;
         OnResize();
+        break;
+    case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+    case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+        UpdateDisplayRefreshPeriod();
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -245,6 +322,9 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();
         break;
+    case SDL_EVENT_TOGGLE_FRIENDS:
+        ImGui::Friends::Toggle();
+        break;
     case SDL_EVENT_RELOAD_INPUTS:
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
         break;
@@ -269,6 +349,7 @@ void WindowSDL::WaitEvent() {
                     break;
                 }
                 controllers[i]->user_id = u->user_id;
+                controllers[i]->ConnectController(controllers[i]->m_sdl_gamepad);
                 UserManagement.LoginUser(u, i + 1);
                 break;
             }
@@ -279,6 +360,7 @@ void WindowSDL::WaitEvent() {
         for (int i = 3; i >= 0; i--) {
             if (controllers[i]->user_id != -1) {
                 UserManagement.LogoutUser(UserManagement.GetUserByID(controllers[i]->user_id));
+                controllers[i]->DisconnectController();
                 controllers[i]->user_id = -1;
                 break;
             }
@@ -327,7 +409,27 @@ void WindowSDL::ReleaseKeyboard() {
 
 void WindowSDL::OnResize() {
     SDL_GetWindowSizeInPixels(window, &width, &height);
+    // Entering or leaving exclusive fullscreen can switch the display mode.
+    UpdateDisplayRefreshPeriod();
     ImGui::Core::OnResize();
+}
+
+void WindowSDL::UpdateDisplayRefreshPeriod() {
+    s64 period_ns = 0;
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    const SDL_DisplayMode* mode = display != 0 ? SDL_GetCurrentDisplayMode(display) : nullptr;
+    if (mode != nullptr) {
+        if (mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0) {
+            period_ns = 1'000'000'000LL * mode->refresh_rate_denominator /
+                        mode->refresh_rate_numerator;
+        } else if (mode->refresh_rate > 0.0f) {
+            period_ns = static_cast<s64>(1'000'000'000.0 / mode->refresh_rate);
+        }
+    }
+    if (display_refresh_period_ns.exchange(period_ns, std::memory_order_acq_rel) != period_ns) {
+        LOG_INFO(Frontend, "Display refresh period: {:.4f} ms",
+                 static_cast<double>(period_ns) / 1'000'000.0);
+    }
 }
 
 Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
@@ -416,6 +518,40 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
         // update bindings
         Input::ActivateOutputsFromInputs();
     }
+}
+
+#ifndef __APPLE__
+void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
+    int imageWidth = 0;
+    int imageHeight = 0;
+    constexpr int numChannels = 4;
+    unsigned char* imageData = stbi_load_from_memory(png.data(), png.size(), &imageWidth,
+                                                     &imageHeight, nullptr, numChannels);
+    if (imageData == nullptr) {
+        LOG_ERROR(Core, "Failed to load window icon image: {}", stbi_failure_reason());
+        return;
+    }
+    SCOPE_EXIT {
+        stbi_image_free(imageData);
+    };
+
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(imageWidth, imageHeight, SDL_PIXELFORMAT_RGBA32,
+                                                 imageData, imageWidth * numChannels);
+    if (surface == nullptr) {
+        LOG_ERROR(Core, "Failed to create SDL surface for window icon: {}", SDL_GetError());
+    }
+    if (!SDL_SetWindowIcon(window, surface)) {
+        LOG_ERROR(Core, "Failed to set SDL window icon: {}", SDL_GetError());
+    }
+    SDL_DestroySurface(surface);
+}
+#endif
+
+void SetDefaultWindowIcon(SDL_Window* window) {
+    const auto resource = cmrc::res::get_filesystem();
+    const auto file = resource.open("src/resources/shadps4.png");
+    const std::vector<u8> texData = std::vector<u8>(file.begin(), file.end());
+    SetWindowIcon(window, texData);
 }
 
 } // namespace Frontend

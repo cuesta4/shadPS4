@@ -1,0 +1,64 @@
+// SPDX-FileCopyrightText: Copyright Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#version 450
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 2, std430) buffer type_RWStructuredBuffer_uint
+{
+    uint _m0[];
+} g_workingShapeCandidates;
+
+layout(set = 0, binding = 3, std430) buffer g_workingDeferredBlendLocationList
+{
+    uint _m0[];
+} g_workingDeferredBlendLocationList_1;
+
+layout(set = 0, binding = 6, std430) buffer type_RWByteAddressBuffer
+{
+    uint _m0[];
+} g_workingControlBuffer;
+
+layout(set = 0, binding = 7, std430) buffer g_workingExecuteIndirectBuffer
+{
+    uint _m0[];
+} g_workingExecuteIndirectBuffer_1;
+
+
+void main()
+{
+    if (gl_WorkGroupID.x == 1u)
+    {
+        uint _39 = g_workingControlBuffer._m0[4u];
+        uint _41 = min(_39, uint(g_workingShapeCandidates._m0.length()));
+        g_workingExecuteIndirectBuffer_1._m0[0u] = (_41 + 127u) / 128u;
+        g_workingExecuteIndirectBuffer_1._m0[1u] = 1u;
+        g_workingExecuteIndirectBuffer_1._m0[2u] = 1u;
+        g_workingControlBuffer._m0[3u] = _41;
+    }
+    else
+    {
+        if (gl_WorkGroupID.y == 1u)
+        {
+            uint _53 = g_workingControlBuffer._m0[8u];
+            uint _55 = min(_53, uint(g_workingDeferredBlendLocationList_1._m0.length()));
+            g_workingExecuteIndirectBuffer_1._m0[0u] = 1u;
+            g_workingExecuteIndirectBuffer_1._m0[1u] = (_55 + 31u) / 32u;
+            g_workingExecuteIndirectBuffer_1._m0[2u] = 1u;
+            g_workingControlBuffer._m0[3u] = _55;
+            g_workingControlBuffer._m0[4u] = 0u;
+            g_workingControlBuffer._m0[8u] = 0u;
+            g_workingControlBuffer._m0[12u] = 0u;
+        }
+    }
+}

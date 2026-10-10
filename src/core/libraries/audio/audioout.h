@@ -124,6 +124,7 @@ struct PortOut {
     void* output_buffer = nullptr;
     std::condition_variable_any output_cv;
     bool output_ready = false;
+    bool closing = false;
     Kernel::Thread output_thread{};
 
     OrbisAudioOutPort type;
@@ -136,6 +137,10 @@ struct PortOut {
     s32 mixLevelPadSpk = ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_DEFAULT;
     bool is_restricted = false;
     bool is_mix_to_main = false;
+
+    [[nodiscard]] OrbisAudioOutPort GetOutputType() const {
+        return type == OrbisAudioOutPort::PadSpk && is_mix_to_main ? OrbisAudioOutPort::Main : type;
+    }
 
     [[nodiscard]] u32 BufferSize() const {
         return buffer_frames * format_info.FrameSize();

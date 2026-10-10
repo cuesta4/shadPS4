@@ -9,7 +9,25 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-set(TEST_TARGETS shadps4_settings_test shadps4_gcn_test)
+set(TEST_TARGETS
+    shadps4_settings_test
+    shadps4_ngs2_test
+    shadps4_gcn_test
+    shadps4_common_test
+    shadps4_cache_storage_test
+    shadps4_video_core_test
+    shadps4_aliasing_test
+    shadps4_presentation_queue_test
+)
+
+set(COMMON_TEST_SOURCES
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+
+    # Tests
+    common/test_bit_array.cpp
+    common/test_logging.cpp
+)
 
 set(SETTINGS_TEST_SOURCES
     # Under test
@@ -21,17 +39,55 @@ set(SETTINGS_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
 
     # Stubs that replace dependencies
     stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
 
     # Tests
     test_emulator_settings.cpp
+    # Windows static guest red-zone protection
+    test_windows_guest_red_zone_protection_settings.cpp
+    test_storage_config.cpp
 )
 
+set(NGS2_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/ngs2/ngs2_impl.cpp
+
+    # Minimal common and kernel support
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/sync/mutex.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+
+    # Tests
+    test_ngs2.cpp
+)
+set(ALIASING_TEST_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/aliasing.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/host_compatibility.cpp
+    test_aliasing.cpp
+)
 set(GCN_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -108,6 +164,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
     ${CMAKE_SOURCE_DIR}/src/common/io_file.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
     ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
 
@@ -115,6 +172,10 @@ set(GCN_TEST_SOURCES
     stubs/common_stub.cpp
     stubs/resource_tracking_pass_stub.cpp
     stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
 
     gcn/gcn_test_runner.hpp
     gcn/gcn_test_runner.cpp
@@ -125,8 +186,25 @@ set(GCN_TEST_SOURCES
     gcn/test_gcn_instructions.cpp
 )
 
+set(VIDEO_CORE_TEST_SOURCES
+    test_blend_rewrite.cpp
+    test_depth_stencil_state.cpp
+)
+
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
+add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
 add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+add_executable(shadps4_common_test ${COMMON_TEST_SOURCES})
+add_executable(shadps4_cache_storage_test
+    ${CMAKE_SOURCE_DIR}/src/video_core/cache_archive.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/host_shader_cache.cpp
+    test_cache_archive.cpp
+    test_host_shader_cache.cpp
+    test_cache_task_queue.cpp
+)
+add_executable(shadps4_video_core_test ${VIDEO_CORE_TEST_SOURCES})
+add_executable(shadps4_aliasing_test ${ALIASING_TEST_SOURCES})
+add_executable(shadps4_presentation_queue_test test_presentation_queue.cpp)
 
 foreach(t ${TEST_TARGETS})
     target_include_directories(${t} PRIVATE
@@ -138,6 +216,15 @@ foreach(t ${TEST_TARGETS})
 endforeach()
 
 target_link_libraries(shadps4_settings_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    Boost::headers
+    SDL3::SDL3
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_ngs2_test PRIVATE
     GTest::gtest_main
     fmt::fmt
     nlohmann_json::nlohmann_json
@@ -158,6 +245,23 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     spdlog::spdlog
     half::half
 )
+target_link_libraries(shadps4_common_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_cache_storage_test PRIVATE GTest::gtest_main miniz::miniz)
+target_link_libraries(shadps4_video_core_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_aliasing_test PRIVATE
+    GTest::gtest_main
+    Vulkan::Headers
+    spdlog::spdlog
+)
+target_link_libraries(shadps4_presentation_queue_test PRIVATE GTest::gtest_main)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
@@ -196,7 +300,7 @@ include(GoogleTest)
 foreach(t ${TEST_TARGETS})
     gtest_discover_tests(${t}
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        PROPERTIES TIMEOUT 60
+        DISCOVERY_TIMEOUT 60
     )
 endforeach()
 
@@ -209,7 +313,6 @@ endforeach()
 set(HTTP_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/libraries/network/http.cpp
-
     # Required to link RegisterLib's LIB_FUNCTION calls and the logger's
     # access to EmulatorSettings.
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -220,6 +323,7 @@ set(HTTP_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
 
     # Stubs that replace dependencies
@@ -227,11 +331,16 @@ set(HTTP_TEST_SOURCES
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
     stubs/loader_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+    stubs/kernel_stub.cpp
 
     # Tests
     network/test_http_uri.cpp
     network/test_http_status_line.cpp
     network/test_http_parse_response_header.cpp
+    network/test_http_lifecycle.cpp
 )
 
 add_executable(shadps4_http_test ${HTTP_TEST_SOURCES})
@@ -285,5 +394,5 @@ endif()
 
 gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    PROPERTIES TIMEOUT 60
+    DISCOVERY_TIMEOUT 60
 )

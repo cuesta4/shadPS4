@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -35,6 +36,20 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
         return vk::StencilOp::eDecrementAndWrap;
     case AmdGpu::StencilFunc::ReplaceOp:
         return vk::StencilOp::eReplace;
+    case AmdGpu::StencilFunc::Ones:
+        LOG_WARNING(Render_Vulkan, "Unsupported stencil op {}, using Replace.",
+                    static_cast<u32>(op));
+        return vk::StencilOp::eReplace;
+    case AmdGpu::StencilFunc::And:
+    case AmdGpu::StencilFunc::Or:
+    case AmdGpu::StencilFunc::Xor:
+    case AmdGpu::StencilFunc::Nand:
+    case AmdGpu::StencilFunc::Nor:
+    case AmdGpu::StencilFunc::Xnor:
+        // Bitwise stencil operations have no Vulkan equivalent; eKeep is the safest fallback.
+        LOG_WARNING(Render_Vulkan, "Unsupported bitwise stencil op {}, using Keep.",
+                    static_cast<u32>(op));
+        return vk::StencilOp::eKeep;
     default:
         UNREACHABLE();
         return vk::StencilOp::eKeep;
@@ -408,7 +423,7 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
     }
 }
 
-vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping) {
+vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping) noexcept {
     return vk::ComponentMapping{
         .r = ComponentSwizzle(comp_mapping.r),
         .g = ComponentSwizzle(comp_mapping.g),
@@ -477,16 +492,19 @@ static constexpr vk::FormatFeatureFlags2 GetDataFormatFeatureFlags(
     case AmdGpu::DataFormat::Format32_As_8_8:
     case AmdGpu::DataFormat::Format32_As_32_32_32_32:
         return ImageRead;
-    case AmdGpu::DataFormat::FormatFmask8_1:
-    case AmdGpu::DataFormat::FormatFmask8_2:
-    case AmdGpu::DataFormat::FormatFmask8_4:
-    case AmdGpu::DataFormat::FormatFmask16_1:
-    case AmdGpu::DataFormat::FormatFmask16_2:
-    case AmdGpu::DataFormat::FormatFmask32_2:
-    case AmdGpu::DataFormat::FormatFmask32_4:
-    case AmdGpu::DataFormat::FormatFmask32_8:
-    case AmdGpu::DataFormat::FormatFmask64_4:
-    case AmdGpu::DataFormat::FormatFmask64_8:
+    case AmdGpu::DataFormat::FormatFmask8_S2_F1:
+    case AmdGpu::DataFormat::FormatFmask8_S4_F1:
+    case AmdGpu::DataFormat::FormatFmask8_S8_F1:
+    case AmdGpu::DataFormat::FormatFmask8_S2_F2:
+    case AmdGpu::DataFormat::FormatFmask8_S4_F2:
+    case AmdGpu::DataFormat::FormatFmask8_S4_F4:
+    case AmdGpu::DataFormat::FormatFmask16_S16_F1:
+    case AmdGpu::DataFormat::FormatFmask16_S8_F2:
+    case AmdGpu::DataFormat::FormatFmask32_S16_F2:
+    case AmdGpu::DataFormat::FormatFmask32_S8_F4:
+    case AmdGpu::DataFormat::FormatFmask32_S8_F8:
+    case AmdGpu::DataFormat::FormatFmask64_S16_F4:
+    case AmdGpu::DataFormat::FormatFmask64_S16_F8:
         return ImageRead | ImageWrite;
     }
     UNREACHABLE_MSG("Missing feature flags for data format {}", static_cast<u32>(data_format));
@@ -755,12 +773,25 @@ static auto surface_format_table = []() constexpr {
     return result;
 }();
 
-vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+static SHAD_NO_INLINE vk::Format InvalidSurfaceFormat(AmdGpu::DataFormat data_format,
+                                                      AmdGpu::NumberFormat num_format) noexcept {
+    ASSERT_MSG(false, "Unknown data_format={} and num_format={}",
+               static_cast<u32>(data_format), static_cast<u32>(num_format));
+    return vk::Format::eUndefined;
+}
+
+SHAD_NO_INLINE void UnexpectedDepthFormat(vk::Format fmt) noexcept {
+    UNREACHABLE_MSG("Unexpected depth format {}", vk::to_string(fmt));
+}
+
+vk::Format SurfaceFormat(AmdGpu::DataFormat data_format,
+                         AmdGpu::NumberFormat num_format) noexcept {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
-    bool found =
+    const bool found =
         result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
-    ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
-               static_cast<u32>(num_format));
+    if (!found) [[unlikely]] {
+        return InvalidSurfaceFormat(data_format, num_format);
+    }
     return result;
 }
 
@@ -794,15 +825,34 @@ std::span<const DepthFormatInfo> DepthFormats() {
     return formats;
 }
 
+static SHAD_NO_INLINE vk::Format InvalidDepthFormat(DepthBuffer::ZFormat z_format,
+                                                    DepthBuffer::StencilFormat stencil_format) {
+    ASSERT_MSG(false, "Unknown z_format={} and stencil_format={}", static_cast<u32>(z_format),
+               static_cast<u32>(stencil_format));
+    return vk::Format::eUndefined;
+}
+
 vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat stencil_format) {
-    const auto& formats = DepthFormats();
-    const auto format =
-        std::find_if(formats.begin(), formats.end(), [&](const DepthFormatInfo& format_info) {
-            return format_info.z_format == z_format && format_info.stencil_format == stencil_format;
-        });
-    ASSERT_MSG(format != formats.end(), "Unknown z_format={} and stencil_format={}",
-               static_cast<u32>(z_format), static_cast<u32>(stencil_format));
-    return format->vk_format;
+    static constexpr std::array FormatTable{
+        vk::Format::eUndefined,
+        vk::Format::eD32SfloatS8Uint,
+        vk::Format::eD16Unorm,
+        vk::Format::eD16UnormS8Uint,
+        vk::Format::eUndefined,
+        vk::Format::eUndefined,
+        vk::Format::eD32Sfloat,
+        vk::Format::eD32SfloatS8Uint,
+    };
+    static constexpr u32 SupportedMask = 0b11001111;
+    const u32 index = (static_cast<u32>(z_format) << 1) | static_cast<u32>(stencil_format);
+    const bool found = index < FormatTable.size() && ((SupportedMask >> index) & 1U) != 0;
+    if (!found) [[unlikely]] {
+#if defined(__clang__)
+        [[clang::musttail]]
+#endif
+        return InvalidDepthFormat(z_format, stencil_format);
+    }
+    return FormatTable[index];
 }
 
 vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {

@@ -147,6 +147,6 @@ u32 GetPipeCount(PipeConfig pipe_cfg);
 u32 CalculateTileSplit(TileMode tile_mode, ArrayMode array_mode, MicroTileMode micro_tile_mode,
                        u32 bpp);
 
-MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_samples);
+MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_samples) noexcept;
 
 } // namespace AmdGpu

@@ -6,11 +6,13 @@
 #include <shared_mutex>
 #include <stop_token>
 #include <thread>
-#include <core/emulator_settings.h>
+#include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/audioout_error.h"
@@ -142,6 +144,17 @@ static int AllocatePort(OrbisAudioOutPort type) {
     return -1;
 }
 
+static void ApplyVolume(PortOut& port) {
+    auto volume = port.volume;
+    if (port.type == OrbisAudioOutPort::PadSpk && port.is_mix_to_main) {
+        for (auto& channel_volume : volume) {
+            channel_volume = static_cast<s64>(channel_volume) * port.mixLevelPadSpk /
+                             ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB;
+        }
+    }
+    port.impl->SetVolume(volume);
+}
+
 void AdjustVol() {
     if (lazy_init.load(std::memory_order_relaxed) == 0 && audio == nullptr) {
         return;
@@ -152,7 +165,7 @@ void AdjustVol() {
         if (auto port = port_table[i]) {
             std::unique_lock lock{port->mutex, std::try_to_lock};
             if (lock.owns_lock()) {
-                port->impl->SetVolume(port->volume);
+                ApplyVolume(*port);
             }
         }
     }
@@ -164,8 +177,11 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         Common::SetCurrentThreadName(thread_name.c_str());
     }
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    // The hardware consumes a block every period, so blocks missed while this thread was late are
+    // still owed to the game. Owing at most a few keeps the host queue latency bounded.
+    constexpr u32 MaxOwedBlocks = 4;
+    const std::chrono::nanoseconds period{1000000000ULL * port->buffer_frames / port->sample_rate};
+    Common::AccurateTimer timer{period, MaxOwedBlocks, Common::MissedTickPolicy::CatchUp};
 
     while (true) {
         timer.Start();
@@ -176,6 +192,21 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                 break;
             }
 
+            // An owed block runs right after the previous one, before the game can mix the next,
+            // so wait up to a period for it instead of letting the owed tick pass empty.
+            if (!port->output_ready && timer.GetTotalWait() < -period / 2) {
+                const bool woken = port->output_cv.wait_for(lock, period, [&] {
+                    return port->output_ready || port->closing || stop.stop_requested();
+                });
+                if (stop.stop_requested()) {
+                    break;
+                }
+                if (!woken) {
+                    // The game had no block either, so the owed ticks played as silence.
+                    timer.Reset();
+                }
+            }
+
             if (port->output_ready) {
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;
@@ -184,7 +215,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             }
         }
 
-        port->output_cv.notify_one();
+        port->output_cv.notify_all();
 
         if (stop.stop_requested()) {
             break;
@@ -192,6 +223,13 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
 
         timer.End();
     }
+
+    {
+        std::unique_lock lock{port->mutex};
+        port->closing = true;
+        port->output_ready = false;
+    }
+    port->output_cv.notify_all();
 }
 
 /*
@@ -307,6 +345,12 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
         // Set attributes
         port->is_restricted = is_restricted;
         port->is_mix_to_main = is_mix_to_main;
+        if (port->type == OrbisAudioOutPort::PadSpk) {
+            const auto device = EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL
+                                    ? EmulatorSettings.GetOpenALPadSpkOutputDevice()
+                                    : EmulatorSettings.GetSDLPadSpkOutputDevice();
+            port->is_mix_to_main = device == "None";
+        }
 
         // Log attributes if present
         if (is_restricted) {
@@ -314,6 +358,9 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
         }
         if (is_mix_to_main) {
             LOG_INFO(Lib_AudioOut, "Audio port opened with MIX_TO_MAIN attribute");
+        }
+        if (port->type == OrbisAudioOutPort::PadSpk && port->is_mix_to_main) {
+            LOG_INFO(Lib_AudioOut, "PADSPK routed to MAIN (mix level: {})", port->mixLevelPadSpk);
         }
 
         // Create backend
@@ -328,12 +375,11 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
             throw std::bad_alloc();
         }
 
-        // Start output thread - pass shared_ptr by value to keep port alive
-        port->output_thread.Run(
-            [port](const std::stop_token& stop) { AudioOutputThread(port, stop); });
-
         // Set initial volume
-        port->impl->SetVolume(port->volume);
+        ApplyVolume(*port);
+
+        // Start output thread - pass shared_ptr by value to keep port alive
+        port->output_thread.Run([port](std::stop_token stop) { AudioOutputThread(port, stop); });
 
     } catch (const std::bad_alloc&) {
         return ORBIS_AUDIO_OUT_ERROR_OUT_OF_MEMORY;
@@ -393,10 +439,22 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
-    // Stop the output thread
+    // Kick out any guest thread blocked in sceAudioOutOutput before joining.
+    {
+        std::unique_lock port_lock{port->mutex};
+        port->closing = true;
+        port->output_ready = false;
+    }
+    port->output_cv.notify_all();
+
+    // Stop the output thread.
     port->output_thread.Stop();
 
-    std::free(port->output_buffer);
+    {
+        std::unique_lock port_lock{port->mutex};
+        std::free(port->output_buffer);
+        port->output_buffer = nullptr;
+    }
 
     LOG_DEBUG(Lib_AudioOut, "Closed audio port {}", port_id);
     return ORBIS_OK;
@@ -479,9 +537,10 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
         state->channel = 1;
         break;
     case OrbisAudioOutPort::PadSpk:
-        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_TERTIARY;
+        state->output = port->is_mix_to_main ? ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_PRIMARY
+                                           : ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_TERTIARY;
         state->channel = 1;
-        state->volume = 127; // max
+        state->volume = port->is_mix_to_main ? -1 : 127;
         break;
     case OrbisAudioOutPort::Aux:
         state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_EXTERNAL;
@@ -548,7 +607,12 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
-        port->output_cv.wait(lock, [&] { return !port->output_ready; });
+        port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
+
+        if (port->closing) {
+            LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
 
         if (ptr != nullptr) {
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
@@ -556,6 +620,8 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
     }
+    // Wakes the output thread when it is waiting for an owed block.
+    port->output_cv.notify_all();
 
     return samples_sent;
 }
@@ -645,7 +711,13 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
 
     // Wait for all ports to be ready
     for (u32 i = 0; i < num; i++) {
-        ports[i]->output_cv.wait(locks[i], [&] { return !ports[i]->output_ready; });
+        ports[i]->output_cv.wait(locks[i],
+                                 [&] { return !ports[i]->output_ready || ports[i]->closing; });
+
+        if (ports[i]->closing) {
+            LOG_DEBUG(Lib_AudioOut, "Port closed while waiting for drain");
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
     }
 
     // Copy data to all ports
@@ -653,6 +725,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+            ports[i]->output_cv.notify_all();
         }
     }
 
@@ -726,13 +799,13 @@ s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
     if (flag & ORBIS_AUDIO_VOLUME_FLAG_RE_CH)
         port->volume[7] = *vol;
 
-    port->impl->SetVolume(port->volume);
+    ApplyVolume(*port);
 
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutSetMixLevelPadSpk(s32 handle, s32 mixLevel) {
-    LOG_INFO(Lib_AudioOut, "(STUBBED) called");
+    LOG_DEBUG(Lib_AudioOut, "called, handle={}, mix_level={}", handle, mixLevel);
     if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
         LOG_ERROR(Lib_AudioOut, "audio is not init");
         return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
@@ -749,7 +822,7 @@ s32 PS4_SYSV_ABI sceAudioOutSetMixLevelPadSpk(s32 handle, s32 mixLevel) {
         return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
     }
 
-    if (mixLevel > ORBIS_AUDIO_OUT_VOLUME_0DB) {
+    if (mixLevel < 0 || mixLevel > ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB) {
         LOG_ERROR(Lib_AudioOut, "Invalid mix level");
         return ORBIS_AUDIO_OUT_ERROR_INVALID_MIXLEVEL;
     }
@@ -767,7 +840,7 @@ s32 PS4_SYSV_ABI sceAudioOutSetMixLevelPadSpk(s32 handle, s32 mixLevel) {
 
     std::unique_lock lock{port->mutex};
     port->mixLevelPadSpk = mixLevel;
-    // TODO: Apply mix level to backend
+    ApplyVolume(*port);
 
     return ORBIS_OK;
 }

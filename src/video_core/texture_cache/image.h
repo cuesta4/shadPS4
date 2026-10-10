@@ -10,8 +10,14 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
@@ -32,27 +38,71 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    Aliased = 1 << 4,     ///< Image shares its guest storage with another compatible image
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+/// Keeps images the GPU is done with for reuse by an image of the same shape, and destroys the
+/// rest on a background thread. Most images get dedicated memory, which the driver allocates and
+/// frees with system calls.
+class ImageRecycler {
+public:
+    explicit ImageRecycler(VmaAllocator allocator);
+    ~ImageRecycler();
+
+    ImageRecycler(const ImageRecycler&) = delete;
+    ImageRecycler& operator=(const ImageRecycler&) = delete;
+
+    /// Takes a free image created from image_ci, if there is one.
+    bool TryTake(const vk::ImageCreateInfo& image_ci, vk::Image& image, VmaAllocation& allocation);
+
+    /// Takes over an image the GPU no longer uses.
+    void Release(const vk::ImageCreateInfo& image_ci, vk::Image image, VmaAllocation allocation);
+
+private:
+    struct FreeImage {
+        vk::ImageCreateInfo image_ci;
+        vk::Image image;
+        VmaAllocation allocation;
+        u64 size;
+        u64 release_ns;
+    };
+
+    void EvictLocked(u64 now_ns);
+    void DestroyLoop(std::stop_token stoken);
+
+    VmaAllocator allocator;
+    std::mutex mutex;
+    std::condition_variable_any destroy_cv;
+    std::vector<FreeImage> free_images; ///< Oldest first.
+    u64 free_bytes{};
+    std::vector<std::pair<vk::Image, VmaAllocation>> doomed;
+    std::jthread destroy_thread;
+};
+
 struct UniqueImage {
     explicit UniqueImage() = default;
-    explicit UniqueImage(vk::Device device, VmaAllocator allocator)
-        : device{device}, allocator{allocator} {}
+    explicit UniqueImage(vk::Device device, VmaAllocator allocator,
+                         ImageRecycler* recycler = nullptr, bool suballocate = false)
+        : device{device}, allocator{allocator}, recycler{recycler}, suballocate{suballocate} {}
     ~UniqueImage();
 
     UniqueImage(const UniqueImage&) = delete;
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+          recycler{std::exchange(other.recycler, nullptr)}, suballocate{other.suballocate},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
     UniqueImage& operator=(UniqueImage&& other) {
         image = std::exchange(other.image, VK_NULL_HANDLE);
+        device = other.device;
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
+        recycler = std::exchange(other.recycler, nullptr);
+        suballocate = other.suballocate;
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
         return *this;
@@ -61,6 +111,8 @@ struct UniqueImage {
     void Create(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
+
+    [[nodiscard]] bool CreateSuballocated();
 
     operator vk::Image() const {
         return image;
@@ -73,18 +125,27 @@ struct UniqueImage {
 public:
     vk::Device device{};
     VmaAllocator allocator{};
+    ImageRecycler* recycler{};
+    /// Places the image in a shared block even when the driver prefers dedicated memory.
+    bool suballocate{};
     VmaAllocation allocation{};
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
 };
 
-constexpr Common::SlotId NULL_IMAGE_ID{0};
-
 class BlitHelper;
+
+struct ImageReadbackToken {
+    explicit ImageReadbackToken(u64 image_uid_) : image_uid{image_uid_} {}
+
+    std::mutex mutex;
+    u64 image_uid;
+};
 
 struct Image {
     Image(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler, BlitHelper& blit_helper,
-          Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+          Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+          ImageRecycler* recycler = nullptr, bool suballocate = false);
     ~Image();
 
     Image(const Image&) = delete;
@@ -125,14 +186,15 @@ struct Image {
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
-    Barriers GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                         vk::PipelineStageFlags2 dst_stage,
-                         std::optional<SubresourceRange> subres_range);
+    /// Records the transition and appends the barriers it needs to barriers.
+    void AppendBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                        vk::PipelineStageFlags2 dst_stage,
+                        std::optional<SubresourceRange> subres_range);
     void Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                 std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
-    void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
+                 std::optional<SubresourceRange> range);
+    void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
-                  u64 offset, u64 download_size);
+                  u64 offset, u64 download_size, bool for_tiling = false);
 
     void CopyImage(Image& src_image);
     void CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset);
@@ -142,13 +204,24 @@ struct Image {
                  const VideoCore::SubresourceRange& mrt1_range);
     void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range);
 
-    void SetBackingSamples(u32 num_samples, bool copy_backing = true);
+    void SetBackingSamples(u32 num_samples, bool copy_backing = true) {
+        if (!backing || backing->num_samples == num_samples) [[likely]] {
+            return;
+        }
+        SwapBackingSamples(num_samples, copy_backing);
+    }
+
+    void MarkWrite() noexcept {
+        ++content_epoch;
+    }
 
 public:
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
     BlitHelper* blit_helper;
     Common::SlotVector<ImageView>* slot_image_views;
+    ImageRecycler* recycler;
+    bool suballocate;
     ImageInfo info;
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
@@ -162,9 +235,12 @@ public:
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
     struct State {
-        vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
+        vk::PipelineStageFlags2 pl_stage{};
         vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        vk::PipelineStageFlags2 write_stage{};
+        vk::AccessFlags2 write_access{};
+        vk::PipelineStageFlags2 read_stages{};
     };
     struct BackingImage {
         UniqueImage image;
@@ -178,9 +254,13 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    std::shared_ptr<ImageReadbackToken> readback_token;
+    u64 alias_generation{};
     u64 lru_id{};
+    u64 lru_tick{};
     u64 tick_accessed_last{};
     u64 hash{};
+    u64 content_epoch{};
 
     struct {
         u32 texture : 1;
@@ -198,6 +278,8 @@ public:
     } binding{};
 
 private:
+    void SwapBackingSamples(u32 num_samples, bool copy_backing);
+
     static Common::IncrementalIdProvider<u64> global_image_uid;
 };
 

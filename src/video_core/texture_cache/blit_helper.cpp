@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -47,6 +48,10 @@ BlitHelper::~BlitHelper() {
 void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
                                            vk::Format src_pixel_format, vk::Format dst_pixel_format,
                                            vk::Image source, vk::Image dest) {
+    const Vulkan::GpuTimingContext timing{scheduler,
+                                         {.kind = Vulkan::GpuWork::ImageBlit,
+                                          .resource0 = Vulkan::GpuHandle(dest),
+                                          .resource1 = Vulkan::GpuHandle(source)}};
     const vk::ImageViewUsageCreateInfo color_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo color_view_ci = {
         .pNext = &color_usage_ci,
@@ -115,6 +120,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     };
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
+    scheduler.NotifyGraphicsPushDescriptorSet();
 
     const MsPipelineKey key{num_samples, dst_pixel_format, false};
     auto it = std::ranges::find(color_to_ms_depth_pl, key, &MsPipeline::first);
@@ -122,7 +128,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         CreateColorToMSDepthPipeline(key);
         it = --color_to_ms_depth_pl.end();
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    scheduler.BindGraphicsPipeline(*it->second);
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -149,6 +155,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
 void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
                                      vk::Format pixel_format, bool src_msaa, vk::Image source,
                                      vk::Image dest) {
+    const Vulkan::GpuTimingContext timing{scheduler,
+                                         {.kind = Vulkan::GpuWork::ImageBlit,
+                                          .resource0 = Vulkan::GpuHandle(dest),
+                                          .resource1 = Vulkan::GpuHandle(source)}};
     const vk::ImageViewUsageCreateInfo src_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo src_view_ci = {
         .pNext = &src_usage_ci,
@@ -216,6 +226,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     };
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
+    scheduler.NotifyGraphicsPushDescriptorSet();
 
     const MsPipelineKey key{num_samples, pixel_format, src_msaa};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
@@ -223,7 +234,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         CreateMsCopyPipeline(key);
         it = --ms_image_copy_pl.end();
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    scheduler.BindGraphicsPipeline(*it->second);
 
     const vk::Viewport viewport = {
         .x = 0,

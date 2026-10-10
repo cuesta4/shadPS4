@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"

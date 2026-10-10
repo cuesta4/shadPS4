@@ -47,6 +47,10 @@ public:
     void DefineBufferProperties();
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();
+    Id EmitBufferAccess(Id scalar_type, Id base, Id index, u32 shift, u32 count = 1,
+                        Id value = {}, u32 max_index = ~u32{0});
+    Id OpRawAccessChainNV(Id result_type, Id base, Id stride, Id index, Id offset,
+                          spv::RawAccessChainOperandsMask operands = spv::RawAccessChainOperandsMask{});
 
     [[nodiscard]] Id DefineInput(Id type, std::optional<u32> location = std::nullopt,
                                  std::optional<spv::BuiltIn> builtin = std::nullopt) {
@@ -185,9 +189,7 @@ public:
         ASSERT(flatbuf_buffer.binding >= 0 && flatbuf_buffer.buffer_type == BufferType::Flatbuf);
         const auto [flatbuf_buffer_id, flatbuf_pointer_type] =
             flatbuf_buffer.aliases[u32(PointerType::U32)];
-        const auto ptr{
-            OpAccessChain(flatbuf_pointer_type, flatbuf_buffer_id, u32_zero_value, flatbuf_offset)};
-        return OpLoad(U32[1], ptr);
+        return EmitBufferAccess(U32[1], flatbuf_buffer_id, flatbuf_offset, 2);
     }
 
     Info& info;
@@ -256,9 +258,12 @@ public:
     Id frag_coord{};
     Id front_facing{};
     Id frag_depth{};
+    Id stencil_ref{};
     Id sample_mask{};
     Id sample_index{};
     Id clip_distances{};
+    std::array<Id, MaxEmulatedClipDistances / 4> emulated_clip_distances{};
+    u8 emulated_clip_distance_mask{};
     Id cull_distances{};
 
     Id patch_vertices{};
@@ -284,10 +289,12 @@ public:
     Id shared_memory_u32_type{};
     Id shared_memory_u64_type{};
 
+    Id bary_coord{};
     Id bary_coord_smooth{};
     Id bary_coord_smooth_centroid{};
     Id bary_coord_smooth_sample{};
     Id bary_coord_nopersp{};
+    Id bary_coord_nopersp_sample{};
 
     struct TextureDefinition {
         const VectorIds* data_types;
@@ -328,6 +335,7 @@ public:
         BufferType buffer_type;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        bool is_uniform{};
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -398,8 +406,8 @@ private:
     SpirvAttribute GetAttributeInfo(AmdGpu::NumberFormat fmt, Id id, u32 num_components,
                                     bool output, bool loaded = false, bool array = false);
 
-    BufferSpv DefineBuffer(bool is_storage, bool is_written, u32 elem_shift, BufferType buffer_type,
-                           Id data_type);
+    BufferSpv DefineBuffer(bool is_uniform, bool is_written, u32 elem_shift,
+                          BufferType buffer_type, Id data_type);
 
     Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);

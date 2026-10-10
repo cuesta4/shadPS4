@@ -292,7 +292,7 @@ constexpr auto hw_pipe_interleave = 256u;
 constexpr std::pair<u32, u32> GetMacroTileExtents(AmdGpu::TileMode tile_mode, u32 bpp,
                                                   u32 num_samples, bool alt) {
     ASSERT(num_samples <= 8);
-    const auto samples_log = static_cast<u32>(std::log2(num_samples));
+    const auto samples_log = static_cast<u32>(std::bit_width(num_samples) - 1);
     const auto row = u32(tile_mode) * 5;
     const auto column = std::bit_width(bpp) - 4; // bpps are 8, 16, 32, 64, 128
     return (alt ? macro_tile_extents_alt : macro_tile_extents)[samples_log][row + column];
@@ -314,7 +314,8 @@ constexpr std::tuple<u32, u32, size_t> ImageSizeLinearAligned(u32 pitch, u32 hei
 
 constexpr std::tuple<u32, u32, size_t> ImageSizeMicroTiled(u32 pitch, u32 height, u32 thickness,
                                                            u32 bpp, u32 num_samples) {
-    const auto& [pitch_align, height_align] = micro_tile_extent;
+    constexpr auto pitch_align = micro_tile_extent.first;
+    constexpr auto height_align = micro_tile_extent.second;
     auto pitch_aligned = (pitch + pitch_align - 1) & ~(pitch_align - 1);
     const auto height_aligned = (height + height_align - 1) & ~(height_align - 1);
     size_t log_sz = (pitch_aligned * height_aligned * bpp * num_samples + 7) / 8;

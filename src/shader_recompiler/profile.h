@@ -8,7 +8,6 @@
 namespace Shader {
 
 struct Profile {
-    u64 max_ubo_size{};
     u32 max_viewport_width{};
     u32 max_viewport_height{};
     u32 max_shared_memory_size{};
@@ -33,7 +32,6 @@ struct Profile {
     bool support_fp16_signed_zero_inf_nan_preserve{};
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
-    bool support_legacy_vertex_attributes{};
     bool supports_image_load_store_lod{};
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
@@ -44,7 +42,6 @@ struct Profile {
     bool supports_workgroup_explicit_memory_layout{};
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
-    bool has_incomplete_fragment_shader_barycentric{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
@@ -52,6 +49,18 @@ struct Profile {
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
+    bool supports_shader_stencil_export{};
+    bool use_raw_access_chains{};
+    bool force_uniform_buffers{};
+    bool supports_uniform_buffer_int8{};
+    bool supports_uniform_buffer_int16{};
+    u32 max_uniform_buffer_size{};
+    u32 uniform_buffer_alignment{};
+    u32 robust_uniform_buffer_alignment{1};
+    u32 max_stage_uniform_buffers{};
+    u32 max_uniform_buffers{};
+
+    bool operator==(const Profile&) const = default;
 };
 
 } // namespace Shader

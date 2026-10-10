@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <ranges>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
+#include "common/logging/log.h"
 
 #include "common/path_util.h"
 #include "core/debug_state.h"
@@ -115,8 +118,10 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         .instance = instance.GetInstance(),
         .physical_device = instance.GetPhysicalDevice(),
         .device = instance.GetDevice(),
-        .queue_family = instance.GetPresentQueueFamilyIndex(),
-        .queue = instance.GetPresentQueue(),
+        .queue_family = instance.GetGraphicsQueueFamilyIndex(),
+        // Texture uploads are submitted from Scheduler::SubmitExecution and share the graphics
+        // queue's host-synchronization domain.
+        .queue = instance.GetGraphicsQueue(),
         .image_count = image_count,
         .min_allocation_size = 1024 * 1024,
         .pipeline_rendering_create_info{
@@ -125,6 +130,8 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         },
         .allocator = allocator,
         .check_vk_result_fn = &CheckVkResult,
+        .present_queue = instance.GetPresentQueue(),
+        .present_queue_mutex = &instance.GetPresentQueueMutex(),
     };
     Vulkan::Init(vk_info);
 
@@ -284,7 +291,9 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
 }
 
 bool MustKeepDrawing() {
-    return layers.size() > 1 || change_layers.size() > 1 || DebugState.IsShowingDebugMenuBar();
+    std::scoped_lock lock{change_layers_mutex};
+    return !change_layers.empty() ||
+           std::ranges::any_of(layers, [](const Layer* layer) { return layer->NeedsRender(); });
 }
 
 } // namespace Core

@@ -9,8 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 if(APPLE)
     list(APPEND ADDITIONAL_LANGUAGES OBJC)
-    # Starting with 15.4, Rosetta 2 has support for all the necessary instruction sets.
-    set(CMAKE_OSX_DEPLOYMENT_TARGET 15.4 CACHE STRING "")
+    # Minimum OS version for KosmicKrisp
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 26.0 CACHE STRING "")
 endif()
 
 if (NOT CMAKE_BUILD_TYPE)
@@ -33,9 +33,14 @@ if(UNIX AND NOT APPLE)
     endif()
 endif()
 
+include(CMakeDependentOption)
+cmake_dependent_option(ENABLE_SYSTEM_VULKAN "Enable the system Vulkan driver" OFF APPLE OFF)
+
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
+option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+option(ENABLE_LLVM_PGO_CAPTURE "Instrument shadps4 for LLVM profiling" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -58,8 +63,13 @@ endif()
 if (ARCHITECTURE STREQUAL "x86_64")
     # Target x86-64-v3 CPU architecture as this is a good balance between supporting performance critical
     # instructions like AVX2 and maintaining support for older CPUs.
-    add_compile_options(-march=x86-64-v3)
+    set(X86_64_MARCH "x86-64-v3" CACHE STRING "CPU the x86-64 build targets (-march), e.g. native")
+    add_compile_options(-march=${X86_64_MARCH})
 endif()
+
+cmake_host_system_information(RESULT PROC_INFO QUERY PROCESSOR_DESCRIPTION)
+
+message(STATUS "${PROC_INFO}")
 
 if (APPLE AND ARCHITECTURE STREQUAL "x86_64" AND CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
     # Exclude ARM homebrew path to avoid conflicts when cross compiling.
@@ -205,12 +215,13 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "16")
+set(EMULATOR_VERSION_MINOR "18")
 set(EMULATOR_VERSION_PATCH "1")
 
-set_source_files_properties(src/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
+set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
 
-set(APP_VERSION "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH} WIP")
+set(APP_VERSION_NUM "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH}")
+set(APP_VERSION "${APP_VERSION_NUM} WIP")
 set(APP_IS_RELEASE false)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
 
@@ -222,44 +233,41 @@ if(NOT (GIT_REMOTE_URL_LOWER MATCHES "shadps4-emu/shadps4" AND (GIT_BRANCH STREQ
     set(ENABLE_UPDATER OFF)
 endif()
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-find_package(Boost 1.84.0 CONFIG)
-find_package(CLI11 2.6.1 CONFIG)
-find_package(FFmpeg 5.1.2 MODULE)
-find_package(fmt 12.0.0 CONFIG)
-find_package(glslang 15 CONFIG)
-find_package(half 1.12.0 MODULE)
-find_package(magic_enum 0.9.7 CONFIG)
-find_package(miniz 3.1 CONFIG)
-find_package(nlohmann_json 3.12 CONFIG)
-find_package(PNG 1.6 MODULE)
-find_package(OpenAL CONFIG)
-find_package(LibreSSL 4.3.1 MODULE)
-find_package(RenderDoc 1.6.0 MODULE)
-find_package(SDL3 3.1.2 CONFIG)
-find_package(stb MODULE)
-find_package(toml11 4.2.0 CONFIG)
-find_package(tsl-robin-map 1.3.0 CONFIG)
-find_package(VulkanHeaders 1.4.329 CONFIG)
-find_package(VulkanMemoryAllocator 3.1.0 CONFIG)
-find_package(xbyak 7.07 CONFIG)
-find_package(xxHash 0.8.2 MODULE)
-find_package(ZLIB 1.3 MODULE)
-find_package(Zydis 5.0.0 MODULE)
-find_package(pugixml 1.14 CONFIG)
-if (APPLE)
-    find_package(date 3.0.1 CONFIG)
-    find_package(epoll-shim 3.14 CONFIG)
-endif()
-list(POP_BACK CMAKE_MODULE_PATH)
-
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    # libc++ requires -fexperimental-library to enable std::jthread and std::stop_token support.
-    include(CheckCXXSymbolExists)
-    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
-    if(LIBCPP)
-        add_compile_options(-fexperimental-library)
+if (ENABLE_SYSTEM_LIBRARIES)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    find_package(Boost 1.84.0 CONFIG)
+    find_package(CLI11 2.6.1 CONFIG)
+    find_package(FFmpeg 5.1.2 MODULE)
+    find_package(fmt 12.0.0 CONFIG)
+    find_package(Freetype 2.14.1 MODULE)
+    find_package(glslang 15 CONFIG)
+    find_package(half 1.12.0 MODULE)
+    find_package(magic_enum 0.9.7 CONFIG)
+    find_package(miniupnpc 2.3.3 MODULE)
+    find_package(miniz 3.1 CONFIG)
+    find_package(nlohmann_json 3.12 CONFIG)
+    find_package(PNG 1.6 MODULE)
+    find_package(OpenAL CONFIG)
+    find_package(LibreSSL 4.3.1 MODULE)
+    find_package(RenderDoc 1.6.0 MODULE)
+    find_package(SDL3 3.1.2 CONFIG)
+    find_package(stb MODULE)
+    find_package(toml11 4.2.0 CONFIG)
+    find_package(tsl-robin-map 1.3.0 CONFIG)
+    find_package(VulkanHeaders 1.4.330 CONFIG)
+    find_package(VulkanMemoryAllocator 3.1.0 CONFIG)
+    find_package(xbyak 7.07 CONFIG)
+    find_package(xxHash 0.8.2 MODULE)
+    find_package(ZArchive 0.1.2 MODULE)
+    find_package(ZLIB 1.3 MODULE)
+    find_package(Zydis 5.0.0 MODULE)
+    find_package(pugixml 1.14 CONFIG)
+    find_package(absl 20250512.1 CONFIG)
+    if (APPLE)
+        find_package(date 3.0.1 CONFIG)
+        find_package(epoll-shim 3.14 CONFIG)
     endif()
+    list(POP_BACK CMAKE_MODULE_PATH)
 endif()
 
 add_subdirectory(externals)
@@ -323,6 +331,7 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
                src/core/libraries/kernel/threads/event_flag.cpp
                src/core/libraries/kernel/threads/exception.cpp
                src/core/libraries/kernel/threads/exception.h
+               src/core/libraries/kernel/threads/exception_codes.h
                src/core/libraries/kernel/threads/mutex.cpp
                src/core/libraries/kernel/threads/pthread_attr.cpp
                src/core/libraries/kernel/threads/pthread_clean.cpp
@@ -333,7 +342,6 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
                src/core/libraries/kernel/threads/sleepq.cpp
                src/core/libraries/kernel/threads/sleepq.h
                src/core/libraries/kernel/threads/stack.cpp
-               src/core/libraries/kernel/threads/stack.S
                src/core/libraries/kernel/threads/tcb.cpp
                src/core/libraries/kernel/threads/pthread.h
                src/core/libraries/kernel/threads/thread_state.cpp
@@ -360,7 +368,9 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
                src/core/libraries/kernel/aio.h
 )
 
-set_source_files_properties(src/core/libraries/kernel/threads/stack.s PROPERTIES COMPILE_OPTIONS -Wno-unused-command-line-argument)
+if (ARCHITECTURE STREQUAL "x86_64" OR ARCHITECTURE STREQUAL "arm64")
+    list(APPEND KERNEL_LIB src/core/libraries/kernel/threads/stack_asm.cpp)
+endif()
 
 set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/http.h
@@ -379,6 +389,8 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/net_epoll.h
                  src/core/libraries/network/net_resolver.cpp
                  src/core/libraries/network/net_resolver.h
+                 src/core/libraries/network/net_upnp.cpp
+                 src/core/libraries/network/net_upnp.h
                  src/core/libraries/network/net_error.h
                  src/core/libraries/network/net.h
                  src/core/libraries/network/ssl.cpp
@@ -397,6 +409,8 @@ set(AVPLAYER_LIB src/core/libraries/avplayer/avplayer_common.cpp
                  src/core/libraries/avplayer/avplayer_common.h
                  src/core/libraries/avplayer/avplayer_file_streamer.cpp
                  src/core/libraries/avplayer/avplayer_file_streamer.h
+                 src/core/libraries/avplayer/avplayer_handle_streamer.cpp
+                 src/core/libraries/avplayer/avplayer_handle_streamer.h
                  src/core/libraries/avplayer/avplayer_impl.cpp
                  src/core/libraries/avplayer/avplayer_impl.h
                  src/core/libraries/avplayer/avplayer_source.cpp
@@ -413,8 +427,6 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/system/msgdialog.cpp
                 src/core/libraries/system/msgdialog.h
                 src/core/libraries/system/msgdialog_ui.cpp
-                src/core/libraries/system/posix.cpp
-                src/core/libraries/system/posix.h
                 src/core/libraries/save_data/save_backup.cpp
                 src/core/libraries/save_data/save_backup.h
                 src/core/libraries/save_data/save_instance.cpp
@@ -488,12 +500,19 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/razor_cpu/razor_cpu.h
                 src/core/libraries/mouse/mouse.cpp
                 src/core/libraries/mouse/mouse.h
+                src/core/libraries/mouse/mouse_error.h
+                src/core/libraries/mouse/sdl_mouse.cpp
+                src/core/libraries/mouse/sdl_mouse.h
                 src/core/libraries/web_browser_dialog/webbrowserdialog.cpp
                 src/core/libraries/web_browser_dialog/webbrowserdialog.h
                 src/core/libraries/font/font.cpp
                 src/core/libraries/font/font.h
+                src/core/libraries/font/font_internal.cpp
+                src/core/libraries/font/font_internal.h
                 src/core/libraries/font/fontft.cpp
                 src/core/libraries/font/fontft.h
+                src/core/libraries/font/fontft_internal.cpp
+                src/core/libraries/font/fontft_internal.h
                 src/core/libraries/font/font_error.h
                 src/core/libraries/content_export/content_export.cpp
                 src/core/libraries/content_export/content_export.h
@@ -501,6 +520,10 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/video_recording/video_recording.cpp
                 src/core/libraries/video_recording/video_recording.h
                 src/core/libraries/video_recording/video_recording_error.h
+                src/core/libraries/invitation_dialog/invitation_dialog.cpp
+                src/core/libraries/invitation_dialog/invitation_dialog.h
+                src/core/libraries/invitation_dialog/invitation_dialog_ui.cpp
+                src/core/libraries/invitation_dialog/invitation_dialog_ui.h
 )
 
 set(VIDEOOUT_LIB src/core/libraries/videoout/buffer.h
@@ -590,15 +613,15 @@ set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/emulated/skylander.h
 )
 
-set(FIBER_LIB src/core/libraries/fiber/fiber_context.s
+set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
               src/core/libraries/fiber/fiber.cpp
               src/core/libraries/fiber/fiber.h
               src/core/libraries/fiber/fiber_error.h
 )
 
-set_source_files_properties(src/core/libraries/fiber/fiber_context.s PROPERTIES COMPILE_OPTIONS -Wno-unused-command-line-argument)
-
-set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
+set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
+             src/core/libraries/videodec/video_utils.h
+             src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
              src/core/libraries/videodec/videodec2.cpp
              src/core/libraries/videodec/videodec2.h
@@ -612,29 +635,26 @@ set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
 
 set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_common.cpp
-            src/core/libraries/np/np_common.h
-            src/core/libraries/np/np_commerce.cpp
-            src/core/libraries/np/np_commerce.h
+            src/core/libraries/np/np_common.h  
             src/core/libraries/np/np_manager.cpp
             src/core/libraries/np/np_manager.h
-            src/core/libraries/np/np_matching2.cpp
-            src/core/libraries/np/np_matching2.h
+            src/core/libraries/np/np_matching2/np_matching2.cpp
+            src/core/libraries/np/np_matching2/np_matching2.h
+            src/core/libraries/np/np_matching2/np_matching2_internal.cpp
+            src/core/libraries/np/np_matching2/np_matching2_internal.h
+            src/core/libraries/np/np_matching2/np_matching2_mm.cpp
+            src/core/libraries/np/np_matching2/np_matching2_mm.h
+            src/core/libraries/np/np_matching2/np_matching2_signaling.cpp
+            src/core/libraries/np/np_matching2/np_matching2_signaling.h
+            src/core/libraries/np/np_types2.h
             src/core/libraries/np/np_trophy.cpp
             src/core/libraries/np/np_trophy.h
-            src/core/libraries/np/np_tus.cpp
-            src/core/libraries/np/np_tus.h
             src/core/libraries/np/trophy_ui.cpp
             src/core/libraries/np/trophy_ui.h
-            src/core/libraries/np/np_web_api2.cpp
-            src/core/libraries/np/np_web_api2.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
             src/core/libraries/np/np_auth.cpp
             src/core/libraries/np/np_auth.h
-            src/core/libraries/np/np_profile_dialog/np_profile_dialog.cpp
-            src/core/libraries/np/np_profile_dialog/np_profile_dialog.h
-            src/core/libraries/np/np_profile_dialog/np_profile_dialog_ui.cpp
-            src/core/libraries/np/np_profile_dialog/np_profile_dialog_ui.h
             src/core/libraries/np/np_sns_facebook_dialog.cpp
             src/core/libraries/np/np_sns_facebook_dialog.h
             src/core/libraries/np/np_partner.cpp
@@ -642,13 +662,40 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/object_manager.h
             src/core/libraries/np/np_handler.cpp
             src/core/libraries/np/np_handler.h
+            src/core/libraries/np/np_commerce/np_commerce.cpp
+            src/core/libraries/np/np_commerce/np_commerce.h
+            src/core/libraries/np/np_commerce/np_commerce_ui.cpp
+            src/core/libraries/np/np_commerce/np_commerce_ui.h
+            src/core/libraries/np/np_profile_dialog/np_profile_dialog.cpp
+            src/core/libraries/np/np_profile_dialog/np_profile_dialog.h
+            src/core/libraries/np/np_profile_dialog/np_profile_dialog_ui.cpp
+            src/core/libraries/np/np_profile_dialog/np_profile_dialog_ui.h
             src/core/libraries/np/np_score/np_score.cpp
             src/core/libraries/np/np_score/np_score.h
             src/core/libraries/np/np_score/np_score_ctx.h
+            src/core/libraries/np/np_signaling/np_signaling.cpp
+            src/core/libraries/np/np_signaling/np_signaling.h
+            src/core/libraries/np/np_signaling/np_signaling_state.cpp
+            src/core/libraries/np/np_signaling/np_signaling_state.h
+            src/core/libraries/np/np_signaling/np_signaling_helpers.cpp
+            src/core/libraries/np/np_signaling/np_signaling_helpers.h
+            src/core/libraries/np/np_signaling/np_signaling_stubs.cpp
+            src/core/libraries/np/np_signaling/np_signaling_stubs.h
             src/core/libraries/np/np_web_api/np_web_api.cpp
             src/core/libraries/np/np_web_api/np_web_api.h
             src/core/libraries/np/np_web_api/np_web_api_internal.cpp
             src/core/libraries/np/np_web_api/np_web_api_internal.h
+            src/core/libraries/np/np_web_api2/np_web_api2.cpp
+            src/core/libraries/np/np_web_api2/np_web_api2.h
+            src/core/libraries/np/np_web_api2/np_web_api2_internal.cpp
+            src/core/libraries/np/np_web_api2/np_web_api2_internal.h
+            src/core/libraries/np/np_web_api2/np_web_api2_context.cpp
+            src/core/libraries/np/np_web_api2/np_web_api2_context.h
+            src/core/libraries/np/np_web_api2/np_web_api2_push_event.cpp
+            src/core/libraries/np/np_web_api2/np_web_api2_push_event.h
+            src/core/libraries/np/np_tus/np_tus.cpp
+            src/core/libraries/np/np_tus/np_tus.h
+            src/core/libraries/np/np_tus/np_tus_ctx.h
 )
 
 set(ZLIB_LIB src/core/libraries/zlib/zlib.cpp
@@ -718,11 +765,12 @@ set(DEV_TOOLS src/core/devtools/layer.cpp
               src/core/devtools/widget/text_editor.h
 )
 
-set(COMMON src/common/logging/classes.h
+set(COMMON src/common/logging/classes.cpp
+           src/common/logging/classes.h
            src/common/logging/formatter.h
            src/common/logging/log.cpp
            src/common/logging/log.h
-           src/common/logging/thread_name_formatter.h
+           src/common/logging/log_file_sink.h
            src/common/aes.h
            src/common/alignment.h
            src/common/arch.h
@@ -796,7 +844,8 @@ if (ENABLE_DISCORD_RPC)
     list(APPEND COMMON src/common/discord_rpc_handler.cpp src/common/discord_rpc_handler.h)
 endif()
 
-set(CORE src/core/aerolib/stubs.cpp
+set(CORE src/core/startup_progress.h
+         src/core/aerolib/stubs.cpp
          src/core/aerolib/stubs.h
          src/core/aerolib/aerolib.cpp
          src/core/aerolib/aerolib.h
@@ -810,8 +859,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_sys/devices/nop_device.h
          src/core/file_sys/devices/console_device.cpp
          src/core/file_sys/devices/console_device.h
-         src/core/file_sys/devices/deci_tty6_device.cpp
-         src/core/file_sys/devices/deci_tty6_device.h
+         src/core/file_sys/devices/deci_tty_device.cpp
+         src/core/file_sys/devices/deci_tty_device.h
          src/core/file_sys/devices/random_device.cpp
          src/core/file_sys/devices/random_device.h
          src/core/file_sys/devices/rng_device.cpp
@@ -820,12 +869,16 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_sys/devices/urandom_device.h
          src/core/file_sys/devices/srandom_device.cpp
          src/core/file_sys/devices/srandom_device.h
+         src/core/file_sys/devices/zero_device.cpp
+         src/core/file_sys/devices/zero_device.h
          src/core/file_sys/directories/base_directory.cpp
          src/core/file_sys/directories/base_directory.h
          src/core/file_sys/directories/normal_directory.cpp
          src/core/file_sys/directories/normal_directory.h
          src/core/file_sys/directories/pfs_directory.cpp
          src/core/file_sys/directories/pfs_directory.h
+         src/core/file_sys/storage_scheduler.cpp
+         src/core/file_sys/storage_scheduler.h
          src/core/file_format/pfs.h
          src/core/file_format/psf.cpp
          src/core/file_format/psf.h
@@ -837,6 +890,12 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_format/npbind.h
          src/core/file_sys/fs.cpp
          src/core/file_sys/fs.h
+         src/core/file_sys/ifile.cpp
+         src/core/file_sys/ifile.h
+         src/core/file_sys/backends/host_fs.cpp
+         src/core/file_sys/backends/host_fs.h
+         src/core/file_sys/backends/zarchive_fs.cpp
+         src/core/file_sys/backends/zarchive_fs.h
          src/core/ipc/ipc.cpp
          src/core/ipc/ipc.h
          src/core/loader/dwarf.cpp
@@ -867,7 +926,6 @@ set(CORE src/core/aerolib/stubs.cpp
          ${ZLIB_LIB}
          ${MISC_LIBS}
          ${IME_LIB}
-         ${FIBER_LIB}
          ${VDEC_LIB}
          ${VR_LIBS}
          ${CAMERA_LIBS}
@@ -890,10 +948,12 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/thread.h
          src/core/tls.cpp
          src/core/tls.h
+         src/core/host_call.h
          src/core/emulator_state.cpp
          src/core/emulator_state.h
          src/core/emulator_settings.cpp
          src/core/emulator_settings.h
+         src/core/emulator_settings_serialization.h
          src/core/user_manager.cpp
          src/core/user_manager.h
          src/core/user_settings.cpp
@@ -903,7 +963,8 @@ set(CORE src/core/aerolib/stubs.cpp
 if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
              src/core/cpu_patches.cpp
-             src/core/cpu_patches.h)
+             src/core/cpu_patches.h
+             ${FIBER_LIB})
 endif()
 
 set(SHADER_RECOMPILER src/shader_recompiler/profile.h
@@ -923,6 +984,8 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_composite.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_convert.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_discard_frag.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_discard_frag.h
                       src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
@@ -937,6 +1000,8 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.h
+                      src/shader_recompiler/backend/spirv/raw_access_chains.cpp
+                      src/shader_recompiler/backend/spirv/raw_access_chains.h
                       src/shader_recompiler/frontend/translate/data_share.cpp
                       src/shader_recompiler/frontend/translate/export.cpp
                       src/shader_recompiler/frontend/translate/scalar_alu.cpp
@@ -966,10 +1031,13 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
                       src/shader_recompiler/ir/passes/hull_shader_transform.cpp
                       src/shader_recompiler/ir/passes/identity_removal_pass.cpp
+                      src/shader_recompiler/ir/passes/coalesce_buffer_loads_pass.cpp
                       src/shader_recompiler/ir/passes/inject_clip_distance_attributes.cpp
+                      src/shader_recompiler/ir/passes/interpolation_elimination_pass.cpp
                       src/shader_recompiler/ir/passes/ir_passes.h
                       src/shader_recompiler/ir/passes/lower_buffer_format_to_raw.cpp
                       src/shader_recompiler/ir/passes/lower_fp64_to_fp32.cpp
+                      src/shader_recompiler/ir/passes/lower_user_clip_planes.cpp
                       src/shader_recompiler/ir/passes/readlane_elimination_pass.cpp
                       src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
                       src/shader_recompiler/ir/passes/ring_access_elimination.cpp
@@ -1036,12 +1104,19 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/flush_epoch.h
+               src/video_core/gpu_authority_tracker.cpp
+               src/video_core/gpu_authority_tracker.h
+               src/video_core/guest_copy_engine.cpp
+               src/video_core/guest_copy_engine.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
+               src/video_core/renderer_vulkan/vk_display_pacer.cpp
+               src/video_core/renderer_vulkan/vk_display_pacer.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
@@ -1060,20 +1135,36 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_record_audit.cpp
+               src/video_core/renderer_vulkan/vk_record_audit.h
+               src/video_core/renderer_vulkan/vk_record_selftest.cpp
+               src/video_core/renderer_vulkan/vk_record_selftest.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
+               src/video_core/renderer_vulkan/vk_command_chunk.h
+               src/video_core/renderer_vulkan/vk_command_recorder.cpp
+               src/video_core/renderer_vulkan/vk_command_recorder.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
+               src/video_core/renderer_vulkan/vk_gpu_timing.cpp
+               src/video_core/renderer_vulkan/vk_gpu_timing.h
                src/video_core/renderer_vulkan/vk_shader_hle.cpp
                src/video_core/renderer_vulkan/vk_shader_hle.h
                src/video_core/renderer_vulkan/vk_shader_util.cpp
                src/video_core/renderer_vulkan/vk_shader_util.h
                src/video_core/renderer_vulkan/vk_swapchain.cpp
                src/video_core/renderer_vulkan/vk_swapchain.h
-               src/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
-               src/video_core/renderer_vulkan/host_passes/fsr_pass.h
+               src/video_core/renderer_vulkan/host_passes/postfx_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/postfx_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
                src/video_core/renderer_vulkan/host_passes/pp_pass.h
+               src/video_core/renderer_vulkan/host_passes/startup_probe.cpp
+               src/video_core/renderer_vulkan/host_passes/startup_probe.h
+               src/video_core/host_shader_cache.cpp
+               src/video_core/host_shader_cache.h
+               src/video_core/host_shaders/host_shader.h
+               src/video_core/texture_cache/aliasing.cpp
+               src/video_core/texture_cache/aliasing.h
                src/video_core/texture_cache/blit_helper.cpp
                src/video_core/texture_cache/blit_helper.h
                src/video_core/texture_cache/host_compatibility.cpp
@@ -1091,8 +1182,11 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/tile_manager.cpp
                src/video_core/texture_cache/tile_manager.h
                src/video_core/texture_cache/types.h
+               src/video_core/cache_archive.cpp
+               src/video_core/cache_archive.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/cache_task_queue.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/multi_level_page_table.h
@@ -1104,8 +1198,16 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/imgui_layer.h
           src/imgui/imgui_std.h
           src/imgui/imgui_texture.h
+          src/imgui/startup_loading.cpp
+          src/imgui/startup_loading.h
           src/imgui/imgui_translations.cpp
           src/imgui/imgui_translations.h
+          src/imgui/friends_layer.cpp
+          src/imgui/friends_layer.h
+          src/imgui/invitation_prompt_layer.cpp
+          src/imgui/invitation_prompt_layer.h
+          src/imgui/shadnet_notifications_layer.cpp
+          src/imgui/shadnet_notifications_layer.h
           src/imgui/notifications_layer.cpp
           src/imgui/notifications_layer.h
           src/imgui/renderer/imgui_core.cpp
@@ -1134,6 +1236,7 @@ set(IMGUI src/imgui/imgui_config.h
 
 set(INPUT src/input/controller.cpp
           src/input/controller.h
+          src/input/controller_state.cpp
           src/input/input_handler.cpp
           src/input/input_handler.h
           src/input/input_mouse.cpp
@@ -1146,6 +1249,33 @@ set(EMULATOR src/emulator.cpp
              src/sdl_window.cpp
 )
 
+# shadNet protobuf generation
+set(SHADNET_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/shadnet_proto_gen")
+file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT}")
+add_custom_command(
+    OUTPUT
+        "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
+        "${SHADNET_PROTO_OUT}/shadnet.pb.h"
+    COMMAND protobuf::protoc
+        "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/src/shadnet"
+        "--cpp_out=${SHADNET_PROTO_OUT}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shadnet/shadnet.proto"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shadnet/shadnet.proto"
+    COMMENT "Generating shadnet protobuf sources"
+    VERBATIM
+)
+
+set(SHADNET src/shadnet/client.cpp
+            src/shadnet/client.h
+            src/shadnet/server_probe.cpp
+            src/shadnet/server_probe.h
+            "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
+)
+if (APPLE)
+    list(APPEND EMULATOR src/sdl_window_apple.mm)
+endif()
+
 if(NOT ENABLE_TESTS)
 
 add_executable(shadps4
@@ -1157,6 +1287,7 @@ add_executable(shadps4
     ${SHADER_RECOMPILER}
     ${VIDEO_CORE}
     ${EMULATOR}
+    ${SHADNET}
     src/main.cpp
     src/emulator.cpp
     src/emulator.h
@@ -1169,7 +1300,11 @@ create_target_directory_groups(shadps4)
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 pugixml::pugixml)
-target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
+target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
+target_link_libraries(shadps4 PRIVATE libprotobuf)
+target_link_libraries(shadps4 PRIVATE ZArchive::zarchive libzstd_static)
+target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}" "${CMAKE_CURRENT_SOURCE_DIR}/externals/zstd/lib")
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     target_link_libraries(shadps4 PRIVATE "/usr/lib/libusb.so")
@@ -1179,6 +1314,26 @@ else()
 endif()
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
+
+set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "shadps4")
+if (ENABLE_LLVM_PGO_CAPTURE)
+    if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "LLVM profiling requires Clang")
+    endif()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles")
+    set_property(SOURCE src/emulator.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+        SHADPS4_ULTRA_PROFILE)
+    target_compile_options(shadps4 PRIVATE
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate=${CMAKE_CURRENT_BINARY_DIR}/profiles/shadps4-%p.profraw>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-fcoverage-mapping>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-update=atomic>")
+    if (WIN32)
+        target_link_libraries(shadps4 PRIVATE clang_rt.profile-x86_64.lib)
+    else()
+        target_link_options(shadps4 PRIVATE -fprofile-instr-generate)
+    endif()
+    set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "shadps4-pgo")
+endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
 if (ENABLE_DISCORD_RPC)
@@ -1195,25 +1350,30 @@ if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
 endif()
 
 if (APPLE)
-    # Include MoltenVK, along with an ICD file so it can be found by the system Vulkan loader if used for loading layers.
-    set_property(TARGET shadps4 APPEND PROPERTY BUILD_RPATH "@executable_path")
-    set(MVK_DST ${CMAKE_CURRENT_BINARY_DIR})
-    set(MVK_DYLIB_SRC ${CMAKE_CURRENT_BINARY_DIR}/externals/MoltenVK/MoltenVK/libMoltenVK.dylib)
-    set(MVK_DYLIB_DST ${MVK_DST}/libMoltenVK.dylib)
-    set(MVK_ICD_SRC ${CMAKE_CURRENT_SOURCE_DIR}/externals/MoltenVK/MoltenVK/icd/MoltenVK_icd.json)
-    set(MVK_ICD_DST ${MVK_DST}/MoltenVK_icd.json)
+    if (NOT ENABLE_SYSTEM_VULKAN)
+        # Bundle Vulkan loader and KosmicKrisp driver with the emulator.
+        set_property(TARGET shadps4 APPEND PROPERTY BUILD_RPATH "@executable_path")
 
-    add_custom_command(
-        OUTPUT ${MVK_ICD_DST}
-        DEPENDS ${MVK_ICD_SRC} ${MVK_DST}
-        COMMAND ${CMAKE_COMMAND} -E copy ${MVK_ICD_SRC} ${MVK_ICD_DST})
-    add_custom_command(
-        OUTPUT ${MVK_DYLIB_DST}
-        DEPENDS ${MVK_DYLIB_SRC} ${MVK_DST}
-        COMMAND ${CMAKE_COMMAND} -E copy ${MVK_DYLIB_SRC} ${MVK_DYLIB_DST})
-    add_custom_target(CopyMoltenVK DEPENDS ${MVK_ICD_DST} ${MVK_DYLIB_DST})
-    add_dependencies(CopyMoltenVK MoltenVK)
-    add_dependencies(shadps4 CopyMoltenVK)
+        set(LOADER_DEST "${CMAKE_CURRENT_BINARY_DIR}/libvulkan.dylib")
+        set(DRIVER_DEST "${CMAKE_CURRENT_BINARY_DIR}/libvulkan_kosmickrisp.dylib")
+        set(ICD_DEST "${CMAKE_CURRENT_BINARY_DIR}/kosmickrisp_mesa_icd.json")
+
+        add_custom_command(
+            OUTPUT ${LOADER_DEST}
+            DEPENDS ${VULKAN_LOADER_PATH} vulkan
+            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_LOADER_PATH} ${LOADER_DEST})
+        add_custom_command(
+            OUTPUT ${DRIVER_DEST}
+            DEPENDS ${VULKAN_DRIVER_PATH} kosmickrisp
+            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_DRIVER_PATH} ${DRIVER_DEST})
+        add_custom_command(
+            OUTPUT ${ICD_DEST}
+            DEPENDS ${VULKAN_ICD_PATH} kosmickrisp
+            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_ICD_PATH} ${ICD_DEST})
+
+        add_custom_target(CopyVulkanDriver DEPENDS ${LOADER_DEST} ${DRIVER_DEST} ${ICD_DEST})
+        add_dependencies(shadps4 CopyVulkanDriver)
+    endif()
 
     if (ARCHITECTURE STREQUAL "x86_64")
         # Reserve system-managed memory space.
@@ -1222,6 +1382,11 @@ if (APPLE)
 
     # Replacement for std::chrono::time_zone
     target_link_libraries(shadps4 PRIVATE date::date-tz epoll-shim)
+
+    # Create and embed Info.plist
+    set(INFO_PLIST_PATH ${CMAKE_CURRENT_BINARY_DIR}/src/dist/Info.plist)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/dist/MacOSBundleInfo.plist.in ${INFO_PLIST_PATH})
+    target_link_options(shadps4 PRIVATE LINKER:-sectcreate,__TEXT,__info_plist,${INFO_PLIST_PATH})
 elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     target_link_libraries(shadps4 PRIVATE date::date-tz epoll-shim)
 endif()
@@ -1271,7 +1436,11 @@ if (WIN32)
 endif()
 
 if (WIN32)
-    target_sources(shadps4 PRIVATE src/shadps4.rc)
+    target_sources(shadps4 PRIVATE src/dist/shadps4.rc)
+endif()
+
+if (NOT MSVC)
+    target_compile_options(shadps4 PRIVATE -Wno-invalid-offsetof)
 endif()
 
 add_compile_definitions(BOOST_ASIO_STANDALONE)
@@ -1291,20 +1460,20 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
 cmrc_add_resource_library(embedded-resources
         ALIAS res::embedded
         NAMESPACE res
-        src/images/shadps4.png
-        src/images/big_picture/folder.png
-        src/images/big_picture/settings.png
-        src/images/big_picture/experimental.png
-        src/images/big_picture/graphics.png
-        src/images/big_picture/controller.png
-        src/images/big_picture/trophy.png
-        src/images/big_picture/log.png
-        src/images/big_picture/profiles.png
-	src/images/trophy.wav
-        src/images/bronze.png
-        src/images/gold.png
-        src/images/platinum.png
-        src/images/silver.png)
+        src/resources/big_picture/controller.png
+        src/resources/big_picture/experimental.png
+        src/resources/big_picture/folder.png
+        src/resources/big_picture/graphics.png
+        src/resources/big_picture/log.png
+        src/resources/big_picture/profiles.png
+        src/resources/big_picture/settings.png
+        src/resources/big_picture/trophy.png
+        src/resources/bronze.png
+        src/resources/gold.png
+        src/resources/platinum.png
+        src/resources/shadps4.png
+        src/resources/silver.png
+        src/resources/trophy.wav)
 target_link_libraries(shadps4 PRIVATE res::embedded)
 
 # ImGui resources

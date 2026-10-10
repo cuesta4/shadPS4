@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <deque>
 #include <utility>
+#include "common/logging/log.h"
 
 #include <imgui.h>
 #include "common/assert.h"
@@ -13,13 +15,14 @@
 #include "core/emulator_settings.h"
 #include "imgui_impl_vulkan.h"
 #include "texture_manager.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace ImGui {
 
 namespace Core::TextureManager {
 struct Inner {
     std::atomic_int count = 0;
-    ImTextureID texture_id = nullptr;
+    std::atomic<ImTextureID> texture_id = nullptr;
     u32 width = 0;
     u32 height = 0;
 
@@ -31,20 +34,22 @@ struct Inner {
 
 using namespace Core::TextureManager;
 
+static thread_local std::vector<RefCountedTexture> frame_textures;
+
 RefCountedTexture::RefCountedTexture(Inner* inner) : inner(inner) {
     ++inner->count;
 }
 
 RefCountedTexture RefCountedTexture::DecodePngTexture(std::vector<u8> data) {
-    const auto core = new Inner;
-    Core::TextureManager::DecodePngTexture(std::move(data), core);
-    return RefCountedTexture(core);
+    RefCountedTexture texture(new Inner);
+    Core::TextureManager::DecodePngTexture(std::move(data), texture.inner);
+    return texture;
 }
 
 RefCountedTexture RefCountedTexture::DecodePngFile(std::filesystem::path path) {
-    const auto core = new Inner;
-    Core::TextureManager::DecodePngFile(std::move(path), core);
-    return RefCountedTexture(core);
+    RefCountedTexture texture(new Inner);
+    Core::TextureManager::DecodePngFile(std::move(path), texture.inner);
+    return texture;
 }
 
 RefCountedTexture::RefCountedTexture() : inner(nullptr) {}
@@ -62,10 +67,8 @@ RefCountedTexture::RefCountedTexture(RefCountedTexture&& other) noexcept : inner
 RefCountedTexture& RefCountedTexture::operator=(const RefCountedTexture& other) {
     if (this == &other)
         return *this;
-    inner = other.inner;
-    if (inner != nullptr) {
-        ++inner->count;
-    }
+    RefCountedTexture copy(other);
+    std::swap(inner, copy.inner);
     return *this;
 }
 
@@ -88,15 +91,20 @@ RefCountedTexture::Image RefCountedTexture::GetTexture() const {
     if (inner == nullptr) {
         return {};
     }
+    const auto texture_id = inner->texture_id.load(std::memory_order_acquire);
+    if (texture_id == nullptr) {
+        return {};
+    }
+    frame_textures.push_back(*this);
     return Image{
-        .im_id = inner->texture_id,
+        .im_id = texture_id,
         .width = inner->width,
         .height = inner->height,
     };
 }
 
 RefCountedTexture::operator bool() const {
-    return inner != nullptr && inner->texture_id != nullptr;
+    return inner != nullptr && inner->texture_id.load(std::memory_order_acquire) != nullptr;
 }
 
 struct Job {
@@ -108,7 +116,6 @@ struct Job {
 struct UploadJob {
     Inner* core = nullptr;
     Vulkan::UploadTextureData data;
-    int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
 };
 
 static bool g_is_worker_running = false;
@@ -128,20 +135,19 @@ Inner::~Inner() {
         std::unique_lock lk{g_upload_mtx};
         g_upload_list.emplace_back(UploadJob{
             .data = this->upload_data,
-            .tick = 2,
         });
     }
 }
 
 void WorkerLoop() {
     Common::SetCurrentThreadName("shadPS4:ImGuiTextureManager");
-    std::mutex mtx;
-    while (g_is_worker_running) {
-        std::unique_lock lk{mtx};
-        g_worker_cv.wait(lk);
-        if (!g_is_worker_running) {
+    while (true) {
+        std::unique_lock lk{g_job_list_mtx};
+        g_worker_cv.wait(lk, [] { return !g_is_worker_running || !g_job_list.empty(); });
+        if (g_job_list.empty()) {
             break;
         }
+        lk.unlock();
         while (true) {
             g_job_list_mtx.lock();
             if (g_job_list.empty()) {
@@ -152,8 +158,15 @@ void WorkerLoop() {
             g_job_list.pop_front();
             g_job_list_mtx.unlock();
 
+            const auto release_core = [core] {
+                if (core->count.fetch_sub(1) == 1) {
+                    delete core;
+                }
+            };
+
             if (EmulatorSettings.IsVkCrashDiagnosticEnabled()) {
                 // FIXME: Crash diagnostic hangs when building the command buffer here
+                release_core();
                 continue;
             }
 
@@ -161,6 +174,7 @@ void WorkerLoop() {
                 Common::FS::IOFile file(path, Common::FS::FileAccessMode::Read);
                 if (!file.IsOpen()) {
                     LOG_ERROR(ImGui, "Failed to open PNG file: {}", path.string());
+                    release_core();
                     continue;
                 }
                 png_raw.resize(file.GetSize());
@@ -169,9 +183,14 @@ void WorkerLoop() {
                 file.Close();
             }
 
-            int width, height;
+            int width = 0, height = 0;
             const stbi_uc* pixels =
                 stbi_load_from_memory(png_raw.data(), png_raw.size(), &width, &height, nullptr, 4);
+            if (pixels == nullptr) {
+                LOG_ERROR(ImGui, "Failed to decode PNG texture");
+                release_core();
+                continue;
+            }
 
             auto texture = Vulkan::UploadTexture(pixels, vk::Format::eR8G8B8A8Unorm, width, height,
                                                  width * height * 4 * sizeof(stbi_uc));
@@ -190,15 +209,20 @@ void WorkerLoop() {
 }
 
 void StartWorker() {
+    std::scoped_lock lk{g_job_list_mtx};
     ASSERT(!g_is_worker_running);
-    g_worker_thread = std::jthread(WorkerLoop);
     g_is_worker_running = true;
+    g_worker_thread = std::jthread(WorkerLoop);
 }
 
 void StopWorker() {
-    ASSERT(g_is_worker_running);
-    g_is_worker_running = false;
+    {
+        std::scoped_lock lk{g_job_list_mtx};
+        ASSERT(g_is_worker_running);
+        g_is_worker_running = false;
+    }
     g_worker_cv.notify_one();
+    g_worker_thread.join();
 }
 
 void DecodePngTexture(std::vector<u8> data, Inner* core) {
@@ -233,20 +257,24 @@ void Submit() {
         // Upload one texture at a time to avoid slow down
         upload = g_upload_list.front();
         g_upload_list.pop_front();
-        if (upload.tick > 0) {
-            --upload.tick;
-            g_upload_list.emplace_back(upload);
-            return;
-        }
     }
     if (upload.core != nullptr) {
         upload.core->upload_data.Upload();
-        upload.core->texture_id = upload.core->upload_data.im_texture;
+        upload.core->texture_id.store(upload.core->upload_data.im_texture,
+                                      std::memory_order_release);
         if (upload.core->count.fetch_sub(1) == 1) {
             delete upload.core;
         }
     } else {
         upload.data.Destroy();
+    }
+}
+
+void EndFrame(::Vulkan::Scheduler& scheduler) {
+    if (!frame_textures.empty()) {
+        scheduler.DeferOperation([textures = std::exchange(frame_textures, {})]() mutable {
+            textures.clear();
+        });
     }
 }
 } // namespace Core::TextureManager

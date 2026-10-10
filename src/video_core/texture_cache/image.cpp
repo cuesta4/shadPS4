@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <ranges>
 #include "common/assert.h"
+#include "common/thread.h"
+#include "video_core/gpu_authority_tracker.h"
+#include <algorithm>
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -35,6 +40,11 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
             // flag is also used.
             usage |= vk::ImageUsageFlagBits::eStorage;
         }
+    } else {
+        // Similarly to above, we specify storage usage. This is typically not supported by
+        // compressed formats, but may be used for uncompressed views. In order to satisfy this,
+        // we will also specify the extended usage bit.
+        usage |= vk::ImageUsageFlagBits::eStorage;
     }
 
     return usage;
@@ -78,15 +88,133 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
-UniqueImage::~UniqueImage() {
-    if (image) {
+namespace {
+
+constexpr u64 MaxFreeImageBytes = 128_MB;
+constexpr size_t MaxFreeImages = 32;
+constexpr u64 FreeImageLifetimeNs = 2'000'000'000;
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+bool SameShape(const vk::ImageCreateInfo& a, const vk::ImageCreateInfo& b) {
+    return a.pNext == nullptr && b.pNext == nullptr && a.flags == b.flags &&
+           a.imageType == b.imageType && a.format == b.format && a.extent == b.extent &&
+           a.mipLevels == b.mipLevels && a.arrayLayers == b.arrayLayers &&
+           a.samples == b.samples && a.tiling == b.tiling && a.usage == b.usage &&
+           a.sharingMode == b.sharingMode;
+}
+
+} // Anonymous namespace
+
+ImageRecycler::ImageRecycler(VmaAllocator allocator_) : allocator{allocator_} {
+    destroy_thread = std::jthread{[this](std::stop_token stoken) { DestroyLoop(stoken); }};
+}
+
+ImageRecycler::~ImageRecycler() {
+    destroy_thread.request_stop();
+    destroy_thread.join();
+    for (const auto& free_image : free_images) {
+        vmaDestroyImage(allocator, free_image.image, free_image.allocation);
+    }
+    for (const auto& [image, allocation] : doomed) {
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
+bool ImageRecycler::TryTake(const vk::ImageCreateInfo& image_ci, vk::Image& image,
+                            VmaAllocation& allocation) {
+    std::scoped_lock lock{mutex};
+    EvictLocked(NowNs());
+    // The latest release of a shape is the likeliest to be taken again.
+    for (auto it = free_images.rbegin(); it != free_images.rend(); ++it) {
+        if (SameShape(it->image_ci, image_ci)) {
+            image = it->image;
+            allocation = it->allocation;
+            free_bytes -= it->size;
+            free_images.erase(std::next(it).base());
+            return true;
+        }
+    }
+    return false;
+}
+
+void ImageRecycler::Release(const vk::ImageCreateInfo& image_ci, vk::Image image,
+                            VmaAllocation allocation) {
+    VmaAllocationInfo allocation_info{};
+    vmaGetAllocationInfo(allocator, allocation, &allocation_info);
+    const u64 now_ns = NowNs();
+    bool destroy{};
+    {
+        std::scoped_lock lock{mutex};
+        if (image_ci.pNext == nullptr && allocation_info.size <= MaxFreeImageBytes / 2) {
+            free_images.push_back({
+                .image_ci = image_ci,
+                .image = image,
+                .allocation = allocation,
+                .size = allocation_info.size,
+                .release_ns = now_ns,
+            });
+            free_bytes += allocation_info.size;
+        } else {
+            doomed.emplace_back(image, allocation);
+        }
+        EvictLocked(now_ns);
+        destroy = !doomed.empty();
+    }
+    if (destroy) {
+        destroy_cv.notify_one();
+    }
+}
+
+void ImageRecycler::EvictLocked(u64 now_ns) {
+    size_t evicted = 0;
+    while (evicted < free_images.size()) {
+        const FreeImage& oldest = free_images[evicted];
+        const size_t remaining = free_images.size() - evicted;
+        if (free_bytes <= MaxFreeImageBytes && remaining <= MaxFreeImages &&
+            now_ns - oldest.release_ns <= FreeImageLifetimeNs) {
+            break;
+        }
+        free_bytes -= oldest.size;
+        doomed.emplace_back(oldest.image, oldest.allocation);
+        ++evicted;
+    }
+    free_images.erase(free_images.begin(), free_images.begin() + evicted);
+}
+
+void ImageRecycler::DestroyLoop(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:ImageRecycler");
+    std::vector<std::pair<vk::Image, VmaAllocation>> batch;
+    for (;;) {
+        {
+            std::unique_lock lock{mutex};
+            if (!destroy_cv.wait(lock, stoken, [this] { return !doomed.empty(); })) {
+                return;
+            }
+            batch.swap(doomed);
+        }
+        for (const auto& [image, allocation] : batch) {
+            vmaDestroyImage(allocator, image, allocation);
+        }
+        batch.clear();
+    }
+}
+
+UniqueImage::~UniqueImage() {
+    Destroy();
+}
+
 void UniqueImage::Destroy() {
     if (image) {
-        vmaDestroyImage(allocator, image, allocation);
+        if (recycler) {
+            recycler->Release(image_ci, image, allocation);
+        } else {
+            vmaDestroyImage(allocator, image, allocation);
+        }
         image = vk::Image{};
         allocation = {};
     }
@@ -95,6 +223,16 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
+    if (recycler) {
+        vk::Image free_image{};
+        if (recycler->TryTake(image_ci, free_image, allocation)) {
+            image = free_image;
+            return;
+        }
+    }
+    if (suballocate && CreateSuballocated()) {
+        return;
+    }
     const VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -113,15 +251,56 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     image = vk::Image{unsafe_image};
 }
 
+bool UniqueImage::CreateSuballocated() {
+    // Dedicated memory costs a driver allocation, which can stall behind presentation.
+    const auto [result, new_image] = device.createImage(image_ci);
+    if (result != vk::Result::eSuccess) {
+        return false;
+    }
+    const VkMemoryRequirements requirements = device.getImageMemoryRequirements(new_image);
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    u32 device_types = 0;
+    for (u32 i = 0; i < properties->memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags flags = properties->memoryTypes[i].propertyFlags;
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+            (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+            device_types |= 1u << i;
+        }
+    }
+    const VmaAllocationCreateInfo alloc_info = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_UNKNOWN,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .memoryTypeBits = device_types,
+    };
+    VmaAllocation new_allocation{};
+    if (vmaAllocateMemory(allocator, &requirements, &alloc_info, &new_allocation, nullptr) !=
+        VK_SUCCESS) {
+        device.destroyImage(new_image);
+        return false;
+    }
+    if (vmaBindImageMemory(allocator, new_allocation, new_image) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, new_allocation);
+        device.destroyImage(new_image);
+        return false;
+    }
+    image = new_image;
+    allocation = new_allocation;
+    return true;
+}
+
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
              BlitHelper& blit_helper_, Common::SlotVector<ImageView>& slot_image_views_,
-             const ImageInfo& info_)
+             const ImageInfo& info_, ImageRecycler* recycler_, bool suballocate_)
     : instance{&instance_}, scheduler{&scheduler_}, blit_helper{&blit_helper_},
-      slot_image_views{&slot_image_views_}, info{info_} {
+      slot_image_views{&slot_image_views_}, recycler{recycler_}, suballocate{suballocate_},
+      info{info_} {
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
     image_uid = global_image_uid.Next();
+    readback_token = std::make_shared<ImageReadbackToken>(image_uid);
     mip_hashes.resize(info.resources.levels);
     // Here we force `eExtendedUsage` as don't know all image usage cases beforehand. In normal case
     // the texture cache should re-create the resource with the usage requested
@@ -185,7 +364,8 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
-    backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
+    backing->image =
+        UniqueImage{instance->GetDevice(), instance->GetAllocator(), recycler, suballocate};
     backing->image.Create(image_ci);
 
     Vulkan::SetObjectName(instance->GetDevice(), GetImage(),
@@ -213,188 +393,257 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                                   vk::PipelineStageFlags2 dst_stage,
-                                   std::optional<SubresourceRange> subres_range) {
-    auto& last_state = backing->state;
-    auto& subresource_states = backing->subresource_states;
+static bool IsStateTransitionRedundant(const Image::State& state, vk::ImageLayout dst_layout,
+                                       vk::AccessFlags2 dst_mask,
+                                       vk::PipelineStageFlags2 dst_stage) {
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    const bool stage_visible = (state.pl_stage & vk::PipelineStageFlagBits2::eAllCommands) ||
+                              (state.pl_stage & dst_stage) == dst_stage;
+    return state.layout == dst_layout && state.access_mask == dst_mask && stage_visible &&
+           !(state.access_mask & write_flags);
+}
 
-    const bool needs_partial_transition =
-        subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+static void RecordImageAccess(Image::State& state, vk::ImageLayout dst_layout,
+                              vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage) {
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite |
+                                 vk::AccessFlagBits2::eColorAttachmentWrite |
+                                 vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    if (dst_mask & write_flags) {
+        if (state.layout == dst_layout &&
+            (dst_layout == vk::ImageLayout::eGeneral ||
+             dst_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT)) {
+            state.write_stage |= dst_stage;
+            state.write_access |= dst_mask & write_flags;
+        } else {
+            state.write_stage = dst_stage;
+            state.write_access = dst_mask & write_flags;
+        }
+        state.read_stages = {};
+    } else {
+        state.read_stages |= dst_stage;
+    }
+    state.pl_stage = state.layout == dst_layout && state.access_mask == dst_mask
+                         ? state.pl_stage | dst_stage
+                         : dst_stage;
+    state.layout = dst_layout;
+    state.access_mask = dst_mask;
+}
+
+static SHAD_NO_INLINE void AppendBarriersSlow(
+    Image::Barriers& barriers, Image& image, const vk::ImageLayout dst_layout,
+    const vk::AccessFlags2 dst_mask, const vk::PipelineStageFlags2 dst_stage,
+    const std::optional<SubresourceRange> subres_range, const bool needs_partial_transition) {
+    auto& last_state = image.backing->state;
+    auto& subresource_states = image.backing->subresource_states;
     const bool partially_transited = !subresource_states.empty();
 
-    Barriers barriers;
+    // Only barriers of this transition merge with each other.
+    const size_t first_barrier = barriers.size();
+    const auto transition = [&](Image::State& state, vk::ImageSubresourceRange range) {
+        if (!IsStateTransitionRedundant(state, dst_layout, dst_mask, dst_stage)) {
+            const vk::ImageMemoryBarrier2 barrier{
+                .srcStageMask = state.write_stage | state.read_stages | state.pl_stage,
+                .srcAccessMask = state.write_access,
+                .dstStageMask = dst_stage,
+                .dstAccessMask = dst_mask,
+                .oldLayout = state.layout,
+                .newLayout = dst_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image.GetImage(),
+                .subresourceRange = range,
+            };
+            if (barriers.size() > first_barrier) {
+                auto merged = barriers.back();
+                merged.subresourceRange = range;
+                if (merged == barrier &&
+                    barriers.back().subresourceRange.baseMipLevel == range.baseMipLevel &&
+                    barriers.back().subresourceRange.baseArrayLayer +
+                            barriers.back().subresourceRange.layerCount == range.baseArrayLayer) {
+                    barriers.back().subresourceRange.layerCount += range.layerCount;
+                } else {
+                    barriers.push_back(barrier);
+                }
+            } else {
+                barriers.push_back(barrier);
+            }
+        }
+        RecordImageAccess(state, dst_layout, dst_mask, dst_stage);
+    };
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
+            subresource_states.resize(image.info.resources.levels * image.info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
         }
 
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
         // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
+        const u32 first_mip = needs_partial_transition ? subres_range->base.level : 0;
+        const u32 last_mip = first_mip + (needs_partial_transition ? subres_range->extent.levels
+                                                                  : image.info.resources.levels);
+        const u32 first_layer = needs_partial_transition ? subres_range->base.layer : 0;
+        const u32 last_layer = first_layer + (needs_partial_transition
+                                                  ? subres_range->extent.layers
+                                                  : image.info.resources.layers);
+        const u32 resource_layers = image.info.resources.layers;
 
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
-                // NOTE: these loops may produce a lot of small barriers.
-                // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
+        for (u32 mip = first_mip; mip < last_mip; ++mip) {
+            u32 subres_idx = mip * resource_layers + first_layer;
+            for (u32 layer = first_layer; layer < last_layer; ++layer, ++subres_idx) {
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
-
-                constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                             vk::AccessFlagBits2::eShaderWrite |
-                                             vk::AccessFlagBits2::eMemoryWrite;
-                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
-                    barriers.emplace_back(vk::ImageMemoryBarrier2{
-                        .srcStageMask = state.pl_stage,
-                        .srcAccessMask = state.access_mask,
-                        .dstStageMask = dst_stage,
-                        .dstAccessMask = dst_mask,
-                        .oldLayout = state.layout,
-                        .newLayout = dst_layout,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
-                        .subresourceRange{
-                            .aspectMask = aspect_mask,
-                            .baseMipLevel = mip,
-                            .levelCount = 1,
-                            .baseArrayLayer = layer,
-                            .layerCount = 1,
-                        },
-                    });
-                    state.layout = dst_layout;
-                    state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
-                }
+                transition(state, vk::ImageSubresourceRange{
+                    .aspectMask = image.aspect_mask,
+                    .baseMipLevel = mip,
+                    .levelCount = 1,
+                    .baseArrayLayer = layer,
+                    .layerCount = 1,
+                });
             }
         }
 
         if (!needs_partial_transition) {
+            last_state = subresource_states.front();
+            for (const auto& state : subresource_states) {
+                last_state.write_stage |= state.write_stage;
+                last_state.write_access |= state.write_access;
+                last_state.read_stages |= state.read_stages;
+            }
+            last_state.pl_stage = dst_stage;
             subresource_states.clear();
+        } else {
+            last_state.layout = dst_layout;
+            last_state.access_mask = dst_mask;
+            last_state.pl_stage = dst_stage;
         }
     } else { // Full resource transition
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
-            return {};
-        }
-
-        barriers.emplace_back(vk::ImageMemoryBarrier2{
-            .srcStageMask = last_state.pl_stage,
-            .srcAccessMask = last_state.access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_mask,
-            .oldLayout = last_state.layout,
-            .newLayout = dst_layout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
-            .subresourceRange{
-                .aspectMask = aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
+        transition(last_state, vk::ImageSubresourceRange{
+            .aspectMask = image.aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
         });
     }
-
-    last_state.layout = dst_layout;
-    last_state.access_mask = dst_mask;
-    last_state.pl_stage = dst_stage;
-
-    return barriers;
 }
 
-void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
-    // Adjust pipieline stage
-    const vk::PipelineStageFlags2 dst_pl_stage =
-        (dst_mask == vk::AccessFlagBits2::eTransferRead ||
-         dst_mask == vk::AccessFlagBits2::eTransferWrite)
-            ? vk::PipelineStageFlagBits2::eTransfer
-            : vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+/// Whether a transition of the whole image already in dst_layout with dst_mask, and not
+/// written, needs no barrier: the case AppendBarriers answers without building barriers.
+static bool IsTransitionRedundant(const Image& image, const vk::ImageLayout dst_layout,
+                                  const vk::AccessFlags2 dst_mask,
+                                  const vk::PipelineStageFlags2 dst_stage,
+                                  const bool needs_partial_transition) {
+    if (needs_partial_transition || !image.backing->subresource_states.empty()) {
+        return false;
+    }
+    return IsStateTransitionRedundant(image.backing->state, dst_layout, dst_mask, dst_stage);
+}
 
-    const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range);
+static bool NeedsPartialTransition(const Image& image,
+                                   const std::optional<SubresourceRange>& subres_range) {
+    return subres_range && (subres_range->base != SubresourceBase{} ||
+                            subres_range->extent != image.info.resources);
+}
+
+void Image::AppendBarriers(Barriers& barriers, vk::ImageLayout dst_layout,
+                           vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
+                           std::optional<SubresourceRange> subres_range) {
+    const bool needs_partial_transition = NeedsPartialTransition(*this, subres_range);
+    if (IsTransitionRedundant(*this, dst_layout, dst_mask, dst_stage, needs_partial_transition)) {
+        RecordImageAccess(backing->state, dst_layout, dst_mask, dst_stage);
+        return;
+    }
+    AppendBarriersSlow(barriers, *this, dst_layout, dst_mask, dst_stage, subres_range,
+                       needs_partial_transition);
+}
+
+/// The part of Transit that builds and records barriers, out of line so that a redundant
+/// transition does not set up the barrier list.
+static SHAD_NO_INLINE void TransitSlow(Image& image, const vk::ImageLayout dst_layout,
+                                       const vk::AccessFlags2 dst_mask,
+                                       const vk::PipelineStageFlags2 dst_pl_stage,
+                                       const std::optional<SubresourceRange> range,
+                                       const bool needs_partial_transition) {
+    Image::Barriers barriers;
+    AppendBarriersSlow(barriers, image, dst_layout, dst_mask, dst_pl_stage, range,
+                       needs_partial_transition);
     if (barriers.empty()) {
         return;
     }
 
-    if (!cmdbuf) {
-        // When using external cmdbuf you are responsible for ending rp.
-        scheduler->EndRendering();
-        cmdbuf = scheduler->CommandBuffer();
-    }
+    image.scheduler->EndRendering();
+    const auto cmdbuf = image.scheduler->CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
     });
 }
 
-void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
-                   u64 offset) {
+void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                    std::optional<SubresourceRange> range) {
+    vk::PipelineStageFlags2 dst_pl_stage{};
+    if (dst_mask & (vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite)) {
+        dst_pl_stage |= vk::PipelineStageFlagBits2::eTransfer;
+    }
+    if (dst_mask & (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite)) {
+        dst_pl_stage |= vk::PipelineStageFlagBits2::eVertexShader |
+                        vk::PipelineStageFlagBits2::eTessellationControlShader |
+                        vk::PipelineStageFlagBits2::eTessellationEvaluationShader |
+                        vk::PipelineStageFlagBits2::eGeometryShader |
+                        vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader;
+    }
+    if (dst_mask & (vk::AccessFlagBits2::eColorAttachmentRead |
+                    vk::AccessFlagBits2::eColorAttachmentWrite)) {
+        dst_pl_stage |= vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    }
+    if (dst_mask & (vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite)) {
+        dst_pl_stage |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                        vk::PipelineStageFlagBits2::eLateFragmentTests;
+    }
+    if (dst_mask & (vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite)) {
+        dst_pl_stage |= vk::PipelineStageFlagBits2::eAllCommands;
+    }
+    const bool needs_partial_transition = NeedsPartialTransition(*this, range);
+    if (IsTransitionRedundant(*this, dst_layout, dst_mask, dst_pl_stage, needs_partial_transition)) {
+        RecordImageAccess(backing->state, dst_layout, dst_mask, dst_pl_stage);
+        return;
+    }
+    TransitSlow(*this, dst_layout, dst_mask, dst_pl_stage, range, needs_partial_transition);
+}
+
+void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer) {
     SetBackingSamples(info.num_samples, false);
     scheduler->EndRendering();
 
-    const vk::BufferMemoryBarrier2 pre_barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        .buffer = buffer,
-        .offset = offset,
-        .size = info.guest_size,
-    };
-    const vk::BufferMemoryBarrier2 post_barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .buffer = buffer,
-        .offset = offset,
-        .size = info.guest_size,
-    };
-    const auto image_barriers =
-        GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-                    vk::PipelineStageFlagBits2::eCopy, {});
+    Barriers image_barriers;
+    for (const auto& copy : upload_copies) {
+        AppendBarriers(
+            image_barriers, vk::ImageLayout::eTransferDstOptimal,
+            vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy,
+            SubresourceRange{{copy.imageSubresource.mipLevel, copy.imageSubresource.baseArrayLayer},
+                             {1, copy.imageSubresource.layerCount}});
+    }
     const auto cmdbuf = scheduler->CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &pre_barrier,
         .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
         .pImageMemoryBarriers = image_barriers.data(),
     });
     cmdbuf.copyBufferToImage(buffer, GetImage(), vk::ImageLayout::eTransferDstOptimal,
                              upload_copies);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &post_barrier,
-    });
-    Transit(vk::ImageLayout::eGeneral,
-            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
     flags &= ~ImageFlagBits::Dirty;
+    MarkWrite();
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
-                     u64 offset, u64 download_size) {
+                     u64 offset, u64 download_size, bool for_tiling) {
     SetBackingSamples(info.num_samples);
     scheduler->EndRendering();
 
@@ -410,19 +659,26 @@ void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::B
     const vk::BufferMemoryBarrier2 post_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .dstStageMask = for_tiling ? vk::PipelineStageFlagBits2::eComputeShader
+                                  : vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = for_tiling ? vk::AccessFlagBits2::eShaderStorageRead
+                                   : vk::AccessFlagBits2::eMemoryRead,
         .buffer = buffer,
         .offset = offset,
         .size = download_size,
     };
-    const auto image_barriers =
-        GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
-                    vk::PipelineStageFlagBits2::eCopy, {});
+    Barriers image_barriers;
+    for (const auto& copy : download_copies) {
+        AppendBarriers(
+            image_barriers, vk::ImageLayout::eTransferSrcOptimal,
+            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eCopy,
+            SubresourceRange{{copy.imageSubresource.mipLevel, copy.imageSubresource.baseArrayLayer},
+                             {1, copy.imageSubresource.layerCount}});
+    }
     auto cmdbuf = scheduler->CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
+        .bufferMemoryBarrierCount = for_tiling ? 0U : 1U,
         .pBufferMemoryBarriers = &pre_barrier,
         .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
         .pImageMemoryBarriers = image_barriers.data(),
@@ -583,6 +839,7 @@ void Image::CopyImage(Image& src_image) {
 
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite();
 }
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
     const auto& src_info = src_image.info;
@@ -662,18 +919,23 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
                              buffer_copies);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite();
 }
 
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
     const auto& src_info = src_image.info;
 
-    const auto mip_w = std::max(info.size.width >> mip, 1u);
-    const auto mip_h = std::max(info.size.height >> mip, 1u);
-    const auto mip_d = std::max(info.size.depth >> mip, 1u);
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, mip_d);
+    const auto dst_dim = info.props.is_block ? 2 : 0;
+    const auto mip_block_w = std::max(info.size.width >> (mip + dst_dim), 1u);
+    const auto mip_block_h = std::max(info.size.height >> (mip + dst_dim), 1u);
+    const auto mip_block_p = std::max(info.mips_layout[mip].pitch >> dst_dim, 1u);
 
-    ASSERT(mip_w == src_info.size.width);
-    ASSERT(mip_h == src_info.size.height);
+    const auto src_dim = src_info.props.is_block ? 2 : 0;
+    ASSERT(mip_block_w == (src_info.size.width >> src_dim));
+    ASSERT(mip_block_h == (src_info.size.height >> src_dim));
+    ASSERT(mip_block_p == (src_info.pitch >> src_dim));
+
+    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, src_info.size.depth);
 
     const vk::ImageCopy image_copy{
         .srcSubresource{
@@ -688,7 +950,7 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
             .baseArrayLayer = slice,
             .layerCount = dst_layers,
         },
-        .extent = {mip_w, mip_h, mip_d},
+        .extent = {src_info.size.width, src_info.size.height, src_info.size.depth},
     };
 
     SetBackingSamples(info.num_samples);
@@ -703,6 +965,7 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
                      backing->state.layout, image_copy);
     Transit(vk::ImageLayout::eGeneral,
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+    MarkWrite();
 }
 
 void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
@@ -761,6 +1024,7 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
 
     flags |= VideoCore::ImageFlagBits::GpuModified;
     flags &= ~VideoCore::ImageFlagBits::Dirty;
+    MarkWrite();
 }
 
 void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {
@@ -776,12 +1040,10 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
     const auto cmdbuf = scheduler->CommandBuffer();
     cmdbuf.clearColorImage(GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
+    MarkWrite();
 }
 
-void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
-    if (!backing || backing->num_samples == num_samples) {
-        return;
-    }
+SHAD_NO_INLINE void Image::SwapBackingSamples(u32 num_samples, bool copy_backing) {
     ASSERT_MSG(!info.props.is_depth, "Swapping samples is only valid for color images");
     BackingImage* new_backing;
     auto it = std::ranges::find(backing_images, num_samples, &BackingImage::num_samples);
@@ -791,7 +1053,8 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
 
         new_backing = &backing_images.emplace_back();
         new_backing->num_samples = num_samples;
-        new_backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
+        new_backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator(),
+                                         recycler, suballocate};
         new_backing->image.Create(new_image_ci);
 
         Vulkan::SetObjectName(instance->GetDevice(), new_backing->image.image,
@@ -809,9 +1072,10 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         ASSERT(info.resources.levels == 1 && info.resources.layers == 1);
 
         // Transition current backing to shader read layout
-        auto barriers =
-            GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
-                        vk::PipelineStageFlagBits2::eFragmentShader, std::nullopt);
+        Barriers barriers;
+        AppendBarriers(barriers, vk::ImageLayout::eShaderReadOnlyOptimal,
+                       vk::AccessFlagBits2::eShaderRead,
+                       vk::PipelineStageFlagBits2::eFragmentShader, std::nullopt);
 
         // Transition dest backing to color attachment layout, not caring of previous contents
         constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
@@ -847,9 +1111,8 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
             backing->num_samples > 1, backing->image, new_backing->image);
 
         // Update current layout in tracker to new backings layout
-        new_backing->state.layout = dst_layout;
-        new_backing->state.access_mask = dst_access;
-        new_backing->state.pl_stage = dst_stage;
+        new_backing->subresource_states.clear();
+        RecordImageAccess(new_backing->state, dst_layout, dst_access, dst_stage);
     }
 
     backing = new_backing;

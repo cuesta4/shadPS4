@@ -51,7 +51,7 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color);
 
 vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle);
 
-vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping);
+vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping) noexcept;
 
 struct SurfaceFormatInfo {
     AmdGpu::DataFormat data_format;
@@ -61,7 +61,7 @@ struct SurfaceFormatInfo {
 };
 std::span<const SurfaceFormatInfo> SurfaceFormats();
 
-vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format);
+vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) noexcept;
 
 struct DepthFormatInfo {
     AmdGpu::DepthBuffer::ZFormat z_format;
@@ -105,13 +105,16 @@ static inline bool IsFormatStencilCompatible(vk::Format fmt) {
     }
 }
 
-static inline vk::Format PromoteFormatToDepth(vk::Format fmt) {
+/// Out of line so vk::to_string stays out of the image info constructors.
+[[noreturn]] void UnexpectedDepthFormat(vk::Format fmt) noexcept;
+
+static inline vk::Format PromoteFormatToDepth(vk::Format fmt) noexcept {
     if (fmt == vk::Format::eR32Sfloat || fmt == vk::Format::eR32Uint) {
         return vk::Format::eD32Sfloat;
     } else if (fmt == vk::Format::eR16Unorm) {
         return vk::Format::eD16Unorm;
     }
-    UNREACHABLE_MSG("Unexpected depth format {}", vk::to_string(fmt));
+    UnexpectedDepthFormat(fmt);
 }
 
 } // namespace Vulkan::LiverpoolToVK

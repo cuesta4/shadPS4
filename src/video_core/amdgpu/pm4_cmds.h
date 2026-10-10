@@ -344,7 +344,8 @@ static u64 GetGpuClock64() {
     return static_cast<u64>(ticks);
 }
 
-static u64 GetGpuPerfCounter() {
+/// Out of line: the SysV calls clobber xmm6-15, which every fence signal would save.
+static SHAD_NOINLINE u64 GetGpuPerfCounter() noexcept {
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
     const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
 
@@ -681,29 +682,29 @@ struct PM4CmdWaitRegMem {
         return reg.Value();
     }
 
-    bool Test(std::span<const u32> regs) const {
-        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
-        switch (function.Value()) {
+    [[nodiscard]] static bool TestValue(u32 value, Function function, u32 mask,
+                                        u32 reference) noexcept {
+        switch (function) {
         case Function::Always: {
             return true;
         }
         case Function::LessThan: {
-            return (value & mask) < ref;
+            return (value & mask) < reference;
         }
         case Function::LessThanEqual: {
-            return (value & mask) <= ref;
+            return (value & mask) <= reference;
         }
         case Function::Equal: {
-            return (value & mask) == ref;
+            return (value & mask) == reference;
         }
         case Function::NotEqual: {
-            return (value & mask) != ref;
+            return (value & mask) != reference;
         }
         case Function::GreaterThanEqual: {
-            return (value & mask) >= ref;
+            return (value & mask) >= reference;
         }
         case Function::GreaterThan: {
-            return (value & mask) > ref;
+            return (value & mask) > reference;
         }
         case Function::Reserved:
             [[fallthrough]];
@@ -711,6 +712,11 @@ struct PM4CmdWaitRegMem {
             UNREACHABLE();
         }
         }
+    }
+
+    [[nodiscard]] bool Test(std::span<const u32> regs) const {
+        const u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(value, function.Value(), mask, ref);
     }
 };
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <common/assert.h>
+#include "common/logging/log.h"
 #include "core/libraries/kernel/kernel.h"
 #include "net.h"
 #include "net_error.h"
@@ -83,6 +84,46 @@ int P2PSocket::GetPeerName(OrbisNetSockaddr* addr, u32* namelen) {
 int P2PSocket::fstat(Libraries::Kernel::OrbisKernelStat* stat) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return 0;
+}
+
+u16 GetP2PConfiguredPort() {
+    return 0;
+}
+
+u32 GetP2PAdvertisedAddr() {
+    return 0;
+}
+
+bool EnsureP2PTransport() {
+    return false;
+}
+
+bool P2PTransportIsReady() {
+    return false;
+}
+
+int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+    return -1;
+}
+
+int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+    return -1;
+}
+
+int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+    return -1;
+}
+
+int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+    return -1;
+}
+
+int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+    return -1;
+}
+
+int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+    return -1;
 }
 
 } // namespace Libraries::Net

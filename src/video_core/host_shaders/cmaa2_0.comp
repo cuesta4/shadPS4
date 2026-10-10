@@ -1,0 +1,168 @@
+// SPDX-FileCopyrightText: Copyright Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#if defined(GL_EXT_control_flow_attributes)
+#extension GL_EXT_control_flow_attributes : require
+#define SPIRV_CROSS_FLATTEN [[flatten]]
+#define SPIRV_CROSS_BRANCH [[dont_flatten]]
+#define SPIRV_CROSS_UNROLL [[unroll]]
+#define SPIRV_CROSS_LOOP [[dont_unroll]]
+#else
+#define SPIRV_CROSS_FLATTEN
+#define SPIRV_CROSS_BRANCH
+#define SPIRV_CROSS_UNROLL
+#define SPIRV_CROSS_LOOP
+#endif
+#extension GL_EXT_spirv_intrinsics : require
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 2, std430) buffer type_RWStructuredBuffer_uint
+{
+    uint _m0[];
+} g_workingShapeCandidates;
+
+layout(set = 0, binding = 6, std430) buffer type_RWByteAddressBuffer
+{
+    uint _m0[];
+} g_workingControlBuffer;
+
+layout(set = 0, binding = 1, CMAA_EDGE_FORMAT) uniform writeonly uimage2D g_workingEdges;
+layout(set = 0, binding = 5, r32ui) uniform writeonly uimage2D g_workingDeferredBlendItemListHeads;
+layout(set = 0, binding = 0) uniform texture2D g_inoutColorReadonly;
+
+shared vec4 g_groupShared2x2FracEdgesH[256];
+shared vec4 g_groupShared2x2FracEdgesV[256];
+
+spirv_instruction(set = "GLSL.std.450", id = 80) float spvNMax(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
+
+vec4 SafeFetch(texture2D t, ivec2 p, int lod) {
+    ivec2 size = textureSize(t, lod);
+    return any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, size))
+        ? vec4(0) : texelFetch(t, p, lod);
+}
+#define texelFetch SafeFetch
+
+void main()
+{
+    uvec2 _91 = (((gl_WorkGroupID.xy * uvec2(14u)) + gl_LocalInvocationID.xy) - uvec2(1u)) * uvec2(2u);
+    uint _97 = gl_LocalInvocationID.x + (gl_LocalInvocationID.y * 16u);
+    bool _104 = !any(bvec4(gl_LocalInvocationID.x == 15u, gl_LocalInvocationID.x == 0u, gl_LocalInvocationID.y == 15u, gl_LocalInvocationID.y == 0u));
+    ivec2 _105 = ivec2(_91);
+    float _114 = dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105, 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
+    float _124 = dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(1, 0), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
+    float _144 = dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(0, 1), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
+    float _154 = dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(1), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625));
+    float _186 = abs(_114 - _124);
+    float _188 = abs(_114 - _144);
+    float _190 = abs(_124 - dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(2, 0), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)));
+    float _192 = abs(_124 - _154);
+    float _194 = abs(_144 - _154);
+    float _196 = abs(_144 - dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(0, 2), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)));
+    float _198 = abs(_154 - dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(2, 1), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)));
+    float _200 = abs(_154 - dot(sqrt(texelFetch(g_inoutColorReadonly, ivec3(_105 + ivec2(1, 2), 0).xy, 0).xyz), vec3(0.2989999949932098388671875, 0.58700001239776611328125, 0.114000000059604644775390625)));
+    g_groupShared2x2FracEdgesV[_97] = vec4(_186, _190, _194, _198);
+    g_groupShared2x2FracEdgesH[_97] = vec4(_188, _192, _196, _200);
+    barrier();
+    uvec4 _418;
+    SPIRV_CROSS_BRANCH
+    if (_104)
+    {
+        uint _207 = _97 - 16u;
+        vec4 _209 = g_groupShared2x2FracEdgesH[_207];
+        uint _210 = _97 - 1u;
+        vec4 _212 = g_groupShared2x2FracEdgesV[_210];
+        uvec4 _417;
+        SPIRV_CROSS_BRANCH
+        if (any(notEqual((vec4(_186, _188, _190, _192) + vec4(_194, _196, _198, _200)) + vec4(_209.zw, _212.yw), vec4(0.0))))
+        {
+            imageStore(g_workingDeferredBlendItemListHeads, ivec2(_91 / uvec2(2u)), uvec4(4294967295u));
+            uint _228 = _97 - 17u;
+            vec4 _230 = g_groupShared2x2FracEdgesH[_228];
+            vec4 _233 = g_groupShared2x2FracEdgesV[_228];
+            vec4 _236 = g_groupShared2x2FracEdgesV[_207];
+            vec4 _241 = g_groupShared2x2FracEdgesH[_97 + 4294967281u];
+            vec4 _244 = g_groupShared2x2FracEdgesH[_210];
+            uint _247 = _97 + 1u;
+            vec4 _249 = g_groupShared2x2FracEdgesH[_247];
+            vec4 _254 = g_groupShared2x2FracEdgesV[_97 + 15u];
+            uint _256 = _97 + 16u;
+            vec4 _258 = g_groupShared2x2FracEdgesV[_256];
+            float _262 = spvNMax(_212.y, _186);
+            float _267 = float((_209.z - (spvNMax(spvNMax(_233.w, _236.z), _262) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _269 = spvNMax(_186, _190);
+            float _274 = float((_209.w - (spvNMax(spvNMax(_236.z, _236.w), _269) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _276 = spvNMax(_209.z, _188);
+            float _281 = float((_212.y - (spvNMax(spvNMax(_230.w, _244.y), _276) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _283 = spvNMax(_188, _196);
+            float _288 = float((_212.w - (spvNMax(spvNMax(_244.y, _244.w), _283) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _289 = spvNMax(_209.w, _192);
+            float _294 = float((_186 - (spvNMax(_276, _289) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _295 = spvNMax(_212.w, _194);
+            float _300 = float((_188 - (spvNMax(_262, _295) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _306 = float((_190 - (spvNMax(_289, spvNMax(_241.z, _249.x)) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _307 = spvNMax(_194, _198);
+            float _312 = float((_192 - (spvNMax(_269, _307) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _313 = spvNMax(_192, _200);
+            float _318 = float((_194 - (spvNMax(_283, _313) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _324 = float((_196 - (spvNMax(_295, spvNMax(_254.y, _258.x)) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _330 = float((_198 - (spvNMax(_313, spvNMax(_249.x, _249.z)) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            float _336 = float((_200 - (spvNMax(_307, spvNMax(_258.x, _258.y)) * 0.100000001490116119384765625)) > 0.070000000298023223876953125);
+            if ((((_300 * (_294 + _281)) + (_281 * _267)) + (_267 * _294)) != 0.0)
+            {
+                uint _351 = atomicAdd(g_workingControlBuffer._m0[4u], 1u);
+                g_workingShapeCandidates._m0[_351] = (_91.x << 18u) | _91.y;
+            }
+            uvec2 _359 = _91 + uvec2(1u, 0u);
+            if ((((_312 * (_306 + _294)) + (_294 * _274)) + (_274 * _306)) != 0.0)
+            {
+                uint _370 = atomicAdd(g_workingControlBuffer._m0[4u], 1u);
+                g_workingShapeCandidates._m0[_370] = (_359.x << 18u) | _359.y;
+            }
+            uvec2 _378 = _91 + uvec2(0u, 1u);
+            if ((((_324 * (_318 + _288)) + (_288 * _300)) + (_300 * _318)) != 0.0)
+            {
+                uint _389 = atomicAdd(g_workingControlBuffer._m0[4u], 1u);
+                g_workingShapeCandidates._m0[_389] = (_378.x << 18u) | _378.y;
+            }
+            uvec2 _397 = _91 + uvec2(1u);
+            if ((((_336 * (_330 + _318)) + (_318 * _312)) + (_312 * _330)) != 0.0)
+            {
+                uint _408 = atomicAdd(g_workingControlBuffer._m0[4u], 1u);
+                g_workingShapeCandidates._m0[_408] = (_397.x << 18u) | _397.y;
+            }
+            _417 = uvec4(uint(dot(vec4(_294, _300, _281, _267), vec4(1.0, 2.0, 4.0, 8.0))), uint(dot(vec4(_306, _312, _294, _274), vec4(1.0, 2.0, 4.0, 8.0))), uint(dot(vec4(_318, _324, _288, _300), vec4(1.0, 2.0, 4.0, 8.0))), uint(dot(vec4(_330, _336, _318, _312), vec4(1.0, 2.0, 4.0, 8.0))));
+        }
+        else
+        {
+            _417 = uvec4(0u);
+        }
+        _418 = _417;
+    }
+    else
+    {
+        _418 = uvec4(0u);
+    }
+    SPIRV_CROSS_BRANCH
+    if (_104)
+    {
+        int _427 = int(_91.x / 2u);
+        uint _428 = _91.y;
+        imageStore(g_workingEdges, ivec2(uvec2(ivec2(_427, int(_428)))), uvec4((_418.y << 4u) | _418.x));
+        imageStore(g_workingEdges, ivec2(uvec2(ivec2(_427, int(_428 + 1u)))), uvec4((_418.w << 4u) | _418.z));
+    }
+}

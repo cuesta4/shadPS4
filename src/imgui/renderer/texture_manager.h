@@ -13,6 +13,10 @@ namespace vk {
 class CommandBuffer;
 }
 
+namespace Vulkan {
+class Scheduler;
+}
+
 namespace ImGui::Core::TextureManager {
 
 struct Inner;
@@ -26,5 +30,7 @@ void DecodePngTexture(std::vector<u8> data, Inner* core);
 void DecodePngFile(std::filesystem::path path, Inner* core);
 
 void Submit();
+
+void EndFrame(::Vulkan::Scheduler& scheduler);
 
 }; // namespace ImGui::Core::TextureManager

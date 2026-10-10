@@ -3,34 +3,29 @@
 
 #pragma once
 
-#include "core/loader/elf.h"
-#include "core/loader/symbols_resolver.h"
-#include "core/tls.h"
+#include "core/host_call.h"
 
 #define LIB_FUNCTION(nid, lib, libversion, mod, function)                                          \
-    {                                                                                              \
-        Core::Loader::SymbolResolver sr{};                                                         \
-        sr.name = nid;                                                                             \
-        sr.library = lib;                                                                          \
-        sr.library_version = libversion;                                                           \
-        sr.module = mod;                                                                           \
-        sr.type = Core::Loader::SymbolType::Function;                                              \
-        auto func = reinterpret_cast<u64>(HOST_CALL(function));                                    \
-        sym->AddSymbol(sr, func);                                                                  \
-    }
+    do {                                                                                              \
+        Libraries::RegisterHLEFunction(sym, nid, lib, libversion, mod,                             \
+                                       reinterpret_cast<u64>(HOST_CALL(function)));                \
+    } while (0)
 
 #define LIB_OBJ(nid, lib, libversion, mod, obj)                                                    \
-    {                                                                                              \
-        Core::Loader::SymbolResolver sr{};                                                         \
-        sr.name = nid;                                                                             \
-        sr.library = lib;                                                                          \
-        sr.library_version = libversion;                                                           \
-        sr.module = mod;                                                                           \
-        sr.type = Core::Loader::SymbolType::Object;                                                \
-        sym->AddSymbol(sr, reinterpret_cast<u64>(obj));                                            \
-    }
+    do {                                                                                              \
+        Libraries::RegisterHLEObject(sym, nid, lib, libversion, mod, reinterpret_cast<u64>(obj));  \
+    } while (0)
+
+namespace Core::Loader {
+class SymbolsResolver;
+}
 
 namespace Libraries {
+
+void RegisterHLEFunction(Core::Loader::SymbolsResolver* sym, const char* nid, const char* library,
+                         u16 library_version, const char* module, u64 address);
+void RegisterHLEObject(Core::Loader::SymbolsResolver* sym, const char* nid, const char* library,
+                       u16 library_version, const char* module, u64 address);
 
 void InitHLELibs(Core::Loader::SymbolsResolver* sym);
 

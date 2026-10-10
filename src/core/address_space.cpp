@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#include "common/logging/log.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -190,7 +192,8 @@ struct AddressSpace::Impl {
         user_size = supported_user_max - USER_MIN - 1;
 
         // Increase BackingSize to account for config options.
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
@@ -629,7 +632,8 @@ enum PosixPageProtection {
 
 struct AddressSpace::Impl {
     Impl() {
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
         // Allocate virtual address placeholder for our address space.
         system_managed_size = SystemManagedSize;
         system_reserved_size = SystemReservedSize;

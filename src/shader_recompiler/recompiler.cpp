@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
@@ -88,6 +89,17 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::IdentityRemovalPass(program.blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
+    if (profile.use_raw_access_chains) {
+        Shader::Optimization::CoalesceBufferLoadsPass(program);
+        Shader::Optimization::IdentityRemovalPass(program.blocks);
+        Shader::Optimization::DeadCodeEliminationPass(program);
+    }
+    if (profile.needs_manual_interpolation && info.l_stage == LogicalStage::Fragment) {
+        Shader::Optimization::InterpolationEliminationPass(program);
+        Shader::Optimization::IdentityRemovalPass(program.blocks);
+        Shader::Optimization::DeadCodeEliminationPass(program);
+    }
     Shader::Optimization::CollectShaderInfoPass(program, profile);
 
     Shader::IR::DumpProgram(program, info);

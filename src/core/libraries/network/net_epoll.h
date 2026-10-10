@@ -7,6 +7,7 @@
 #include "core/libraries/network/net.h"
 
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -29,6 +30,7 @@ using epoll_handle = int;
 #endif
 
 struct Epoll {
+    std::unique_ptr<std::mutex> mutex{std::make_unique<std::mutex>()};
     std::vector<std::pair<u32 /*netId*/, OrbisNetEpollEvent>> events{};
     std::string name;
     epoll_handle epoll_fd;
@@ -50,7 +52,9 @@ struct Epoll {
     }
 
     void Destroy() noexcept {
+        std::scoped_lock lock{*mutex};
         events.clear();
+        async_resolutions.clear();
 #ifdef _WIN32
         epoll_close(epoll_fd);
         epoll_fd = nullptr;

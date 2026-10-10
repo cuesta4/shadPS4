@@ -28,6 +28,8 @@ struct Tcb {
     Tcb* tcb_self;
     DtvEntry* tcb_dtv;
     void* tcb_thread;
+    void* tcb_spare[2];
+    u64 tcb_canary;
     ::Libraries::Fiber::OrbisFiberContext* tcb_fiber;
 };
 
@@ -44,17 +46,5 @@ Tcb* GetTcbBase();
 
 /// Makes sure TLS is initialized for the thread before entering guest.
 void InitializeTLS();
-
-template <auto f>
-struct HostCallWrapperImpl;
-
-template <class ReturnType, class... Args, PS4_SYSV_ABI ReturnType (*func)(Args...)>
-struct HostCallWrapperImpl<func> {
-    static ReturnType PS4_SYSV_ABI wrap(Args... args) {
-        return func(args...);
-    }
-};
-
-#define HOST_CALL(func) (Core::HostCallWrapperImpl<func>::wrap)
 
 } // namespace Core

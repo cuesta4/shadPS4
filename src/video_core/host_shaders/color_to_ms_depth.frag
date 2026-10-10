@@ -11,5 +11,6 @@ layout (location = 0) in vec2 uv;
 void main()
 {
     ivec2 coord = ivec2(uv * vec2(textureSize(color, 0).xy));
-    gl_FragDepth = texelFetch(color, coord, 0)[gl_SampleID];
+    vec4 val = texelFetch(color, coord, 0);
+    gl_FragDepth = (gl_SampleID == 0 || val[gl_SampleID] != 0.0) ? val[gl_SampleID] : val.r;
 }

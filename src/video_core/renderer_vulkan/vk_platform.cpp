@@ -13,6 +13,8 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <algorithm>
+#include <string_view>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -36,23 +38,23 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type,
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* user_data) {
 
-    spdlog::level level{};
+    Common::Log::Level level{};
     switch (severity) {
     case vk::DebugUtilsMessageSeverityFlagBitsEXT::eError:
-        level = spdlog::level::err;
+        level = Common::Log::Level::Error;
         break;
     case vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning:
-        level = spdlog::level::info;
+        level = Common::Log::Level::Info;
         break;
     case vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo:
     case vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose:
-        level = spdlog::level::debug;
+        level = Common::Log::Level::Debug;
         break;
     default:
-        level = spdlog::level::info;
+        level = Common::Log::Level::Info;
     }
 
-    LOG_GENERIC(Common::Log::Class::Render_Vulkan, level, "{}: {}",
+    LOG_GENERIC(Render_Vulkan, level, "{}: {}",
                 callback_data->pMessageIdName ? callback_data->pMessageIdName : "<null>",
                 callback_data->pMessage ? callback_data->pMessage : "<null>");
 
@@ -166,7 +168,7 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     // Add the windowing system specific extension
     std::vector<const char*> extensions;
-    extensions.reserve(7);
+    extensions.reserve(8);
 
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
@@ -192,12 +194,12 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
         break;
     }
 
-#ifdef __APPLE__
-    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-#endif
-
     if (window_type != Frontend::WindowSystemType::Headless) {
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        // Surface support for present ids and present waits is queried through it.
+        extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        // The device swapchain maintenance extension requires it.
+        extensions.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
     }
 
     if (EmulatorSettings.IsHdrAllowed()) {
@@ -223,6 +225,13 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     });
 
     return extensions;
+}
+
+bool IsInstanceExtensionEnabled(Frontend::WindowSystemType window_type,
+                                std::string_view extension) {
+    const auto extensions = GetInstanceExtensions(window_type, true);
+    return std::ranges::any_of(extensions,
+                               [extension](const char* name) { return extension == name; });
 }
 
 std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_crash_diagnostic) {
@@ -262,14 +271,14 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
-#if defined(__APPLE__) && !defined(ENABLE_QT_GUI)
-    // Initialize the environment with the path to the MoltenVK ICD, so that the loader will
+#if defined(__APPLE__)
+    // Initialize the environment with the path to the included ICD, so that the loader will
     // find it.
     static const auto icd_path = [] {
         char path[PATH_MAX];
         u32 length = PATH_MAX;
         _NSGetExecutablePath(path, &length);
-        return std::filesystem::path(path).parent_path() / "MoltenVK_icd.json";
+        return std::filesystem::path(path).parent_path();
     }();
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
@@ -315,9 +324,6 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         Common::FS::GetUserPathString(Common::FS::PathType::LogDir);
     const char* log_path = crash_diagnostic_path.c_str();
     vk::Bool32 enable_force_barriers = vk::True;
-#ifdef __APPLE__
-    const vk::Bool32 mvk_debug_mode = enable_crash_diagnostic ? vk::True : vk::False;
-#endif
 
     const std::array layer_setings = {
         vk::LayerSettingEXT{
@@ -404,24 +410,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
             .valueCount = 1,
             .pValues = &enable_force_barriers,
         },
-#ifdef __APPLE__
-        // MoltenVK debug mode turns on additional device loss error details, so
-        // use the crash diagnostic setting as an indicator of whether to turn it on.
-        vk::LayerSettingEXT{
-            .pLayerName = "MoltenVK",
-            .pSettingName = "MVK_CONFIG_DEBUG",
-            .type = vk::LayerSettingTypeEXT::eBool32,
-            .valueCount = 1,
-            .pValues = &mvk_debug_mode,
-        },
-#endif
     };
 
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
-#ifdef __APPLE__
-            .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
-#endif
             .pApplicationInfo = &application_info,
             .enabledLayerCount = static_cast<u32>(layers.size()),
             .ppEnabledLayerNames = layers.data(),

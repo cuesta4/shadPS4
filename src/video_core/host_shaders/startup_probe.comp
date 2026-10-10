@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Flags whether any pixel of the frame is brighter than near black.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform texture2D frame;
+layout(set = 0, binding = 1) writeonly buffer Result { uint visible; };
+layout(push_constant) uniform Constants { float threshold; };
+
+void main() {
+    const ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(pos, textureSize(frame, 0))) &&
+        any(greaterThan(texelFetch(frame, pos, 0).rgb, vec3(threshold)))) {
+        visible = 1u;
+    }
+}

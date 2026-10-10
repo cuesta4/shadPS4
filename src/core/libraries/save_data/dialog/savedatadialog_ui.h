@@ -303,7 +303,13 @@ public:
     SaveDialogUi& operator=(SaveDialogUi& other) = delete;
     SaveDialogUi& operator=(SaveDialogUi&& other) noexcept;
 
+    void Open(SaveDialogState* state, CommonDialog::Status* status, SaveDialogResult* result);
+    void Reset();
     void Finish(ButtonId buttonId, CommonDialog::Result r = CommonDialog::Result::OK);
+
+    [[nodiscard]] std::recursive_mutex& GetMutex() {
+        return draw_mutex;
+    }
 
     void Draw() override;
 

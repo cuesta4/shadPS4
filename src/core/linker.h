@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <ranges>
 #include <vector>
 #include "core/libraries/kernel/threads.h"
 #include "core/module.h"
@@ -128,6 +129,14 @@ public:
         std::scoped_lock lk{mutex};
         for (auto& module : m_modules) {
             Relocate(module.get());
+        }
+    }
+
+    void LoadLibcInternal() {
+        for (auto& module : m_modules) {
+            if (module->name.contains("libSceLibcInternal")) {
+                module->Start(0, nullptr, nullptr);
+            }
         }
     }
 

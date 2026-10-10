@@ -5,30 +5,51 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
+#include <fmt/ranges.h>
 
-#include <core/emulator_settings.h>
-#include <core/emulator_state.h>
+#include "common/arch.h"
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "core/debugger.h"
+#include "core/emulator_settings.h"
+#include "core/emulator_state.h"
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
+#include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
+#include "video_core/guest_copy_engine.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_record_selftest.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
-#include <core/user_settings.h>
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
+
+#if defined(__APPLE__) && defined(ARCH_X86_64)
+    // KosmicKrisp only supports Apple Silicon. Check that we are not running on an Intel Mac.
+    int sysctl_ret = 0;
+    size_t sysctl_size = sizeof(sysctl_ret);
+    sysctlbyname("sysctl.proc_translated", &sysctl_ret, &sysctl_size, nullptr, 0);
+    if (sysctl_ret != 1) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
+                                 "shadPS4 only supports Apple Silicon Macs.", nullptr);
+        std::cout << "shadPS4 only supports Apple Silicon Macs." << std::endl;
+        return -1;
+    }
 #endif
 
     CLI::App app{"shadPS4 Emulator CLI"};
@@ -46,20 +67,27 @@ int main(int argc, char* argv[]) {
     bool configClean = false;
     bool configGlobal = false;
     bool bigPicture = false;
+    bool sameProcess = false;
+    bool append_log{};
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
     std::optional<std::string> patchFile;
 
+    std::vector<std::pair<std::filesystem::path, std::string>> mounts;
+    static std::vector<std::string> env_vars;
+
     // ---- Options ----
+    app.add_option("guest_arg", gamePath, "Game path or ID"); // positional
     app.add_option("-g,--game", gamePath, "Game path or ID");
     app.add_option("-p,--patch", patchFile, "Patch file to apply");
     app.add_flag("-i,--ignore-game-patch", ignoreGamePatch,
                  "Disable automatic loading of game patches");
 
     app.add_flag("-b,--big-picture", bigPicture, "Start in Big Picture Mode");
+    app.add_flag("--same-process", sameProcess,
+                 "Launch the game in the same process when using Big Picture Mode");
 
-    // FULLSCREEN: behavior-identical
     app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
 
     app.add_option("--override-root", overrideRoot)->check(CLI::ExistingDirectory);
@@ -70,24 +98,30 @@ int main(int argc, char* argv[]) {
     app.add_flag("--show-fps", showFps);
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
-    app.add_flag("--log-append", Common::Log::g_should_append);
+    app.add_flag("--log-append", append_log);
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
+    app.add_option("--mount", mounts, "Mount source to destination");
+    app.add_option("-e,--env", env_vars, "Environment variables to pass to the guest");
+    std::optional<u32> guestCopySelfTest;
+    app.add_option("--guest-copy-selftest", guestCopySelfTest,
+                   "Stress-test the guest copy engine with N workers and exit");
+    std::optional<u32> vkRecordSelfTest;
+    app.add_option("--vk-record-selftest", vkRecordSelfTest,
+                   "Check N rounds of Vulkan commands recorded on the recording thread and exit");
+    std::optional<u32> stageShapeSelfTest;
+    app.add_option("--stage-shape-selftest", stageShapeSelfTest,
+                   "Check N rounds of shader specialization shape keys and exit");
 
     // ---- Capture args after `--` verbatim ----
     app.allow_extras();
-    app.parse_complete_callback([&]() {
-        const auto& extras = app.remaining();
-        if (!extras.empty()) {
-            gameArgs = extras;
-        }
-    });
 
     // ---- No-args behavior ----
     if (argc == 1) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
-                                 "This is a CLI application. Please use the QTLauncher for a GUI:\n"
+                                 "This is a CLI application. Please use the '-b' flag for Big "
+                                 "Picture mode, or QTLauncher for a standalone GUI:\n"
                                  "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
                                  nullptr);
         std::cout << app.help();
@@ -95,7 +129,24 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        app.parse(argc, argv);
+        bool double_dash_found = false;
+        int double_dash_index;
+        for (int i = 0; i < argc; i++) {
+            if (double_dash_found) {
+                gameArgs.emplace_back(argv[i]);
+            }
+            if (!double_dash_found && std::string(argv[i]) == "--") {
+                double_dash_found = true;
+                double_dash_index = i;
+            }
+        }
+
+        // If the -- arg is present, only parse args before it
+        if (double_dash_found) {
+            app.parse(double_dash_index, argv);
+        } else {
+            app.parse(argc, argv);
+        }
     } catch (const CLI::ParseError& e) {
         return app.exit(e);
     }
@@ -103,8 +154,34 @@ int main(int argc, char* argv[]) {
     if (waitPid)
         Core::Debugger::WaitForPid(*waitPid);
 
-    // Start default log
-    Common::Log::Setup("shad_log.txt");
+    // Initialize main log with default config
+    Common::Log::Setup("shadps4.log");
+
+    LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
+
+    if (guestCopySelfTest) {
+        auto& copy_engine = VideoCore::GuestCopyEngine::Instance();
+        copy_engine.Start(*guestCopySelfTest);
+        const bool passed = copy_engine.RunSelfTest();
+        copy_engine.Stop();
+        std::cout << "guest copy self-test " << (passed ? "passed" : "FAILED") << std::endl;
+        Common::Log::Flush();
+        return passed ? 0 : 3;
+    }
+
+    if (vkRecordSelfTest) {
+        const bool passed = Vulkan::RunRecordSelfTest(*vkRecordSelfTest);
+        std::cout << "Vulkan record self-test " << (passed ? "passed" : "FAILED") << std::endl;
+        Common::Log::Flush();
+        return passed ? 0 : 4;
+    }
+
+    if (stageShapeSelfTest) {
+        const bool passed = Vulkan::RunSpecializationShapeSelfTest(*stageShapeSelfTest);
+        std::cout << "stage shape self-test " << (passed ? "passed" : "FAILED") << std::endl;
+        Common::Log::Flush();
+        return passed ? 0 : 5;
+    }
 
     IPC::Instance().Init();
 
@@ -121,13 +198,8 @@ int main(int argc, char* argv[]) {
     EmulatorSettingsImpl::SetInstance(emu_settings);
     emu_settings->Load();
 
-    Common::Log::Shutdown();
-    // Start configured log
-    Common::Log::g_should_append |= EmulatorSettings.IsLogAppend();
-    Common::Log::Setup("shad_log.txt");
-
     if (bigPicture) {
-        BigPictureMode::Launch(argv[0]);
+        BigPictureMode::Launch(argv[0], sameProcess);
         return 0;
     }
 
@@ -135,14 +207,14 @@ int main(int argc, char* argv[]) {
     if (addGameFolder) {
         EmulatorSettings.AddGameInstallDir(*addGameFolder);
         EmulatorSettings.Save();
-        std::cout << "Game folder successfully saved.\n";
+        LOG_INFO(Config, "Game folder successfully saved.");
         return 0;
     }
 
     if (setAddonFolder) {
         EmulatorSettings.SetAddonInstallDir(*setAddonFolder);
         EmulatorSettings.Save();
-        std::cout << "Addon folder successfully saved.\n";
+        LOG_INFO(Config, "Addon folder successfully saved.");
         return 0;
     }
 
@@ -151,15 +223,7 @@ int main(int argc, char* argv[]) {
             gamePath = gameArgs.front();
             gameArgs.erase(gameArgs.begin());
         } else {
-            std::cerr << "Error: Please provide a game path or ID.\n";
-            return 1;
-        }
-    }
-    if (!gameArgs.empty()) {
-        if (gameArgs.front() == "--") {
-            gameArgs.erase(gameArgs.begin());
-        } else {
-            std::cerr << "Error: unhandled flags\n";
+            LOG_ERROR(Debug, "Please provide a game path or ID.");
             return 1;
         }
     }
@@ -177,7 +241,7 @@ int main(int argc, char* argv[]) {
         } else if (*fullscreenStr == "false") {
             EmulatorSettings.SetFullScreen(false);
         } else {
-            std::cerr << "Error: Invalid argument for --fullscreen (use true|false)\n";
+            LOG_ERROR(Debug, "Invalid argument for --fullscreen (use true|false)");
             return 1;
         }
     }
@@ -193,7 +257,17 @@ int main(int argc, char* argv[]) {
 
     // ---- Resolve game path or ID ----
     std::filesystem::path ebootPath(*gamePath);
-    if (!std::filesystem::exists(ebootPath)) {
+    const auto archive_component_exists = [](const std::filesystem::path& p) -> bool {
+        std::filesystem::path accum;
+        for (const auto& comp : p) {
+            accum /= comp;
+            if (comp.extension() == ".zar") {
+                return std::filesystem::is_regular_file(accum);
+            }
+        }
+        return false;
+    };
+    if (!std::filesystem::exists(ebootPath) && !archive_component_exists(ebootPath)) {
         bool found = false;
         constexpr int maxDepth = 5;
         for (const auto& installDir : EmulatorSettings.GetGameInstallDirs()) {
@@ -204,7 +278,7 @@ int main(int argc, char* argv[]) {
             }
         }
         if (!found) {
-            std::cerr << "Error: Game ID or file path not found: " << *gamePath << "\n";
+            LOG_ERROR(Debug, "Game ID or file path not found: {}", *gamePath);
             return 1;
         }
     }
@@ -212,7 +286,7 @@ int main(int argc, char* argv[]) {
     auto* emulator = Common::Singleton<Core::Emulator>::Instance();
     emulator->executableName = argv[0];
     emulator->waitForDebuggerBeforeRun = waitForDebugger;
-    emulator->Run(ebootPath, gameArgs, overrideRoot);
+    emulator->Run(ebootPath, gameArgs, overrideRoot, mounts, env_vars, append_log);
 
     return 0;
 }

@@ -1,0 +1,414 @@
+// SPDX-FileCopyrightText: Copyright Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#if defined(GL_EXT_control_flow_attributes)
+#extension GL_EXT_control_flow_attributes : require
+#define SPIRV_CROSS_FLATTEN [[flatten]]
+#define SPIRV_CROSS_BRANCH [[dont_flatten]]
+#define SPIRV_CROSS_UNROLL [[unroll]]
+#define SPIRV_CROSS_LOOP [[dont_unroll]]
+#else
+#define SPIRV_CROSS_FLATTEN
+#define SPIRV_CROSS_BRANCH
+#define SPIRV_CROSS_UNROLL
+#define SPIRV_CROSS_LOOP
+#endif
+#extension GL_EXT_spirv_intrinsics : require
+#ifndef PSMAA_LUMA_FORMAT
+#define PSMAA_LUMA_FORMAT r16f
+#endif
+#ifndef PSMAA_VECTOR_FORMAT
+#define PSMAA_VECTOR_FORMAT rg16f
+#endif
+#ifndef CMAA_EDGE_FORMAT
+#define CMAA_EDGE_FORMAT r8ui
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+float _119;
+
+layout(set = 0, binding = 2, std430) buffer type_RWStructuredBuffer_uint
+{
+    uint _m0[];
+} g_workingShapeCandidates;
+
+layout(set = 0, binding = 3, std430) buffer g_workingDeferredBlendLocationList
+{
+    uint _m0[];
+} g_workingDeferredBlendLocationList_1;
+
+layout(set = 0, binding = 4, std430) buffer type_RWStructuredBuffer_v2uint
+{
+    uvec2 _m0[];
+} g_workingDeferredBlendItemList;
+
+layout(set = 0, binding = 6, std430) buffer type_RWByteAddressBuffer
+{
+    uint _m0[];
+} g_workingControlBuffer;
+
+layout(set = 0, binding = 1, CMAA_EDGE_FORMAT) uniform readonly uimage2D g_workingEdges;
+layout(set = 0, binding = 5, r32ui) uniform uimage2D g_workingDeferredBlendItemListHeads;
+layout(set = 0, binding = 0) uniform texture2D g_inoutColorReadonly;
+
+shared uint g_groupSharedBlendItemCount;
+shared uvec2 g_groupSharedBlendItems[768];
+
+spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec2 spvNMin(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec3 spvNMin(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 79) vec4 spvNMin(vec4, vec4);
+spirv_instruction(set = "GLSL.std.450", id = 80) float spvNMax(float, float);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
+spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
+
+vec4 SafeFetch(texture2D t, ivec2 p, int lod) {
+    ivec2 size = textureSize(t, lod);
+    return any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, size))
+        ? vec4(0) : texelFetch(t, p, lod);
+}
+#define texelFetch SafeFetch
+#define imageLoad(t,p) (any(lessThan((p),ivec2(0))) || any(greaterThanEqual((p),imageSize(t))) ? uvec4(0) : imageLoad(t,p))
+
+void main()
+{
+    if (gl_LocalInvocationID.x == 0u)
+    {
+        g_groupSharedBlendItemCount = 0u;
+    }
+    barrier();
+    if (gl_GlobalInvocationID.x < g_workingControlBuffer._m0[3u])
+    {
+        uint _135 = g_workingShapeCandidates._m0[gl_GlobalInvocationID.x];
+        uint _136 = _135 >> 18u;
+        uint _137 = _135 & 16383u;
+        uvec2 _138 = uvec2(_136, _137);
+        ivec2 _139 = ivec2(_138);
+        int _140 = _139.x;
+        uint _141 = uint(_140);
+        uint _143 = _141 / 2u;
+        int _144 = _139.y;
+        uint _145 = uint(_144);
+        uvec4 _149 = imageLoad(g_workingEdges, ivec2(uvec2(_143, _145)));
+        uint _152 = ((_141 % 2u) * 4u) & 31u;
+        uint _153 = _149.x >> _152;
+        float _156 = float((_153 & 1u) != 0u);
+        float _159 = float((_153 & 2u) != 0u);
+        float _162 = float((_153 & 4u) != 0u);
+        float _165 = float((_153 & 8u) != 0u);
+        uint _168 = uint(_140 + (-1));
+        uvec4 _174 = imageLoad(g_workingEdges, ivec2(uvec2(_168 / 2u, _145)));
+        uint _178 = _174.x >> (((_168 % 2u) * 4u) & 31u);
+        bool _180 = (_178 & 2u) != 0u;
+        float _181 = float(_180);
+        bool _186 = (_178 & 8u) != 0u;
+        float _187 = float(_186);
+        uint _190 = uint(_140 + 1);
+        uvec4 _196 = imageLoad(g_workingEdges, ivec2(uvec2(_190 / 2u, _145)));
+        uint _200 = _196.x >> (((_190 % 2u) * 4u) & 31u);
+        float _203 = float((_200 & 1u) != 0u);
+        bool _205 = (_200 & 2u) != 0u;
+        float _206 = float(_205);
+        bool _208 = (_200 & 8u) != 0u;
+        float _209 = float(_208);
+        uvec4 _216 = imageLoad(g_workingEdges, ivec2(uvec2(_143, uint(_144 + 1))));
+        uint _218 = _216.x >> _152;
+        bool _220 = (_218 & 1u) != 0u;
+        float _221 = float(_220);
+        bool _226 = (_218 & 4u) != 0u;
+        float _227 = float(_226);
+        uvec4 _234 = imageLoad(g_workingEdges, ivec2(uvec2(_143, uint(_144 + (-1)))));
+        uint _236 = _234.x >> _152;
+        bool _238 = (_236 & 1u) != 0u;
+        float _239 = float(_238);
+        bool _241 = (_236 & 4u) != 0u;
+        float _242 = float(_241);
+        float _245 = float((_236 & 8u) != 0u);
+        bool _256 = dot(vec4(_156, _159, _162, _165), vec4(1.0)) == 2.0;
+        float _295;
+        float _296;
+        float _297;
+        float _298;
+        if (_256)
+        {
+            _295 = _159 + (0.89999997615814208984375 * (((_162 * _206) * (_241 ? 0.0 : 1.0)) + ((_156 * _181) * (_238 ? 0.0 : 1.0))));
+            _296 = _156 + (0.89999997615814208984375 * (((_159 * _239) * (_180 ? 0.0 : 1.0)) + ((_165 * _221) * (_186 ? 0.0 : 1.0))));
+            _297 = _165 + (0.89999997615814208984375 * (((_156 * _187) * (_220 ? 0.0 : 1.0)) + ((_162 * _209) * (_226 ? 0.0 : 1.0))));
+            _298 = _162 + (0.89999997615814208984375 * (((_165 * _227) * (_208 ? 0.0 : 1.0)) + ((_159 * _242) * (_205 ? 0.0 : 1.0))));
+        }
+        else
+        {
+            _295 = _159;
+            _296 = _156;
+            _297 = _165;
+            _298 = _162;
+        }
+        vec4 _305 = vec4(_298, _297, _296, _295) * ((_256 ? 0.07500000298023223876953125 : 0.100000001490116119384765625) * clamp(1.2999999523162841796875 - (dot(((vec4(_119, _181, float((_178 & 4u) != 0u), _187).zyw + vec4(_203, _206, _119, _209).xyw) + vec4(_239, _119, _242, _245).xzw) + vec4(_221, float((_218 & 2u) != 0u), _227, _119).xyz, vec3(1.0)) * 0.100000001490116119384765625), 0.0, 1.0));
+        vec3 _313 = texelFetch(g_inoutColorReadonly, ivec3(_140, _144, 0).xy, 0).xyz * (1.0 - dot(_305, vec4(1.0)));
+        float _314 = _305.x;
+        vec3 _328;
+        SPIRV_CROSS_FLATTEN
+        if (_314 > 0.0)
+        {
+            _328 = _313 + (texelFetch(g_inoutColorReadonly, ivec3(_139 + ivec2(-1, 0), 0).xy, 0).xyz * _314);
+        }
+        else
+        {
+            _328 = _313;
+        }
+        float _329 = _305.y;
+        vec3 _343;
+        SPIRV_CROSS_FLATTEN
+        if (_329 > 0.0)
+        {
+            _343 = _328 + (texelFetch(g_inoutColorReadonly, ivec3(_139 + ivec2(0, -1), 0).xy, 0).xyz * _329);
+        }
+        else
+        {
+            _343 = _328;
+        }
+        float _344 = _305.z;
+        vec3 _358;
+        SPIRV_CROSS_FLATTEN
+        if (_344 > 0.0)
+        {
+            _358 = _343 + (texelFetch(g_inoutColorReadonly, ivec3(_139 + ivec2(1, 0), 0).xy, 0).xyz * _344);
+        }
+        else
+        {
+            _358 = _343;
+        }
+        float _359 = _305.w;
+        vec3 _373;
+        SPIRV_CROSS_FLATTEN
+        if (_359 > 0.0)
+        {
+            _373 = _358 + (texelFetch(g_inoutColorReadonly, ivec3(_139 + ivec2(0, 1), 0).xy, 0).xyz * _359);
+        }
+        else
+        {
+            _373 = _358;
+        }
+        uint _375 = atomicAdd(g_workingControlBuffer._m0[12u], 1u);
+        uvec2 _376 = _138 / uvec2(2u);
+        uint _384 = imageAtomicExchange(g_workingDeferredBlendItemListHeads, ivec2(_376), _375 | ((((_137 % 2u) * 2u) + (_136 % 2u)) << 30u));
+        vec3 _385 = clamp(_373, vec3(0.0), vec3(1.99999988079071044921875));
+        g_workingDeferredBlendItemList._m0[_375] = uvec2(_384, ((((packHalf2x16(vec2(_385.x, 0.0)) + 4u) >> 3u) & 2047u) | (((packHalf2x16(vec2(_385.y, 0.0)) + 4u) << 8u) & 4192256u)) | (((packHalf2x16(vec2(_385.z, 0.0)) + 8u) << 18u) & 4290772992u));
+        if (_384 == 4294967295u)
+        {
+            uint _412 = atomicAdd(g_workingControlBuffer._m0[8u], 1u);
+            g_workingDeferredBlendLocationList_1._m0[_412] = (_376.x << 16u) | _376.y;
+        }
+        uint _419 = uint(_140 + 2);
+        uint _429 = imageLoad(g_workingEdges, ivec2(uvec2(_419 / 2u, _145))).x >> (((_419 % 2u) * 4u) & 31u);
+        float _438 = _181 + float((_429 & 8u) != 0u);
+        float _442 = float((_429 & 2u) != 0u) + _187;
+        float _447 = ((_156 * _159) * _209) * (((2.0 + _438) - (_165 + _206)) - (0.699999988079071044921875 * ((_442 + _162) + _203)));
+        float _448 = _156 * _165;
+        float _457 = (_448 * _206) * (((2.0 + _442) - (_159 + _209)) - (0.699999988079071044921875 * ((_438 + _162) + _203)));
+        float _458 = spvNMax(_447, _457);
+        bool _463;
+        if (_458 > 0.0)
+        {
+            _463 = _447 > _457;
+        }
+        else
+        {
+            _463 = false;
+        }
+        uint _471 = imageLoad(g_workingEdges, ivec2(uvec2(_143, uint(_144 + (-2))))).x >> _152;
+        float _479 = _221 + float((_471 & 4u) != 0u);
+        float _483 = float((_471 & 1u) != 0u) + _227;
+        float _488 = (_448 * _242) * (((2.0 + _479) - (_162 + _239)) - (0.699999988079071044921875 * ((_483 + _159) + _245)));
+        float _498 = ((_165 * _162) * _239) * (((2.0 + _483) - (_156 + _242)) - (0.699999988079071044921875 * ((_479 + _159) + _245)));
+        float _499 = spvNMax(_488, _498);
+        bool _500 = _499 > _458;
+        bool _504;
+        if (_500)
+        {
+            _504 = _488 > _498;
+        }
+        else
+        {
+            _504 = _463;
+        }
+        bool _505 = !_500;
+        float _506 = _500 ? _499 : _458;
+        if (_506 > 0.0)
+        {
+            float _512 = floor(clamp(4.0 - _506, 0.0, 3.0));
+            bvec2 _513 = bvec2(_505);
+            vec2 _514 = mix(vec2(0.0, -1.0), vec2(1.0, 0.0), _513);
+            uint _515 = _505 ? 2u : 1u;
+            uint _516 = _505 ? 8u : 4u;
+            uint _517 = _504 ? _516 : _515;
+            uint _518 = _504 ? _515 : _516;
+            float _526;
+            float _528;
+            vec2 _531;
+            bool _521;
+            bool _524;
+            bool _520 = true;
+            bool _523 = true;
+            float _525 = 1.0;
+            float _527 = 1.0;
+            SPIRV_CROSS_LOOP
+            for (;;)
+            {
+                _531 = vec2(_138);
+                ivec2 _534 = ivec2(_531 - (_514 * _527));
+                uint _536 = uint(_534.x);
+                ivec2 _553 = ivec2(_531 + (_514 * (_525 + 1.0)));
+                uint _555 = uint(_553.x);
+                if (_523)
+                {
+                    _524 = (((imageLoad(g_workingEdges, ivec2(uvec2(_536 / 2u, uint(_534.y)))).x >> (((_536 % 2u) * 4u) & 31u)) & 15u) & _518) == _518;
+                }
+                else
+                {
+                    _524 = false;
+                }
+                if (_520)
+                {
+                    _521 = (((imageLoad(g_workingEdges, ivec2(uvec2(_555 / 2u, uint(_553.y)))).x >> (((_555 % 2u) * 4u) & 31u)) & 15u) & _517) == _517;
+                }
+                else
+                {
+                    _521 = false;
+                }
+                _528 = _527 + float(_524);
+                _526 = _525 + float(_521);
+                bool _584;
+                if (!_524)
+                {
+                    _584 = !_521;
+                }
+                else
+                {
+                    _584 = false;
+                }
+                if ((_584 ? 86.0 : spvNMax(_526, _528)) >= spvNMin(86.0, (1.25 * spvNMin(_526, _528)) - 0.25))
+                {
+                    break;
+                }
+                _520 = _521;
+                _523 = _524;
+                _525 = _526;
+                _527 = _528;
+                continue;
+            }
+            float _592 = _528 - _512;
+            float _593 = _526 - _512;
+            float _594 = _592 + _593;
+            if (_594 >= 5.0)
+            {
+                float _601;
+                float _603;
+                float _606;
+                float _609;
+                float _610;
+                float _613;
+                float _615;
+                bool _667;
+                do
+                {
+                    _601 = 0.2199999988079071044921875 * (_592 - 2.0 * trunc(_592 / 2.0));
+                    _603 = 0.2199999988079071044921875 * (_593 - 2.0 * trunc(_593 / 2.0));
+                    _606 = clamp((_594 - _512) * 0.1500000059604644775390625, 0.0, 1.0);
+                    _609 = floor((_592 + 1.0) * 0.5);
+                    _610 = 1.0 - _609;
+                    _613 = floor((_593 + 1.0) * 0.5);
+                    _615 = (_613 - _610) + 1.0;
+                    uint _616 = uint(_615);
+                    uint _617 = atomicAdd(g_groupSharedBlendItemCount, _616);
+                    if ((_617 + _616) > 768u)
+                    {
+                        _667 = false;
+                        break;
+                    }
+                    float _624 = 1.0 / ((_615 - _601) - _603);
+                    float _626 = (-0.5) + (_609 - _601);
+                    uint _628 = (_136 << 18u) | _137;
+                    uint _632 = uint((_505 ? int(0x80000000) : 0) | (_504 ? 1073741824 : 0));
+                    uint _634 = _617;
+                    float _637 = _610;
+                    for (; _637 <= _613; )
+                    {
+                        bool _641 = _637 > 0.0;
+                        g_groupSharedBlendItems[_634] = uvec2(ivec2(int(_628), int(((_632 | (uint(_637 + 256.0) << 20u)) | (uint(_641 ? 255.0 : 257.0) << 10u)) | uint((clamp((((_624 * (_637 + _626)) * (_641 ? (-1.0) : 1.0)) + float(_641)) * _606, 0.0, 1.0) * 1023.0) + 0.5))));
+                        _634++;
+                        _637 += 1.0;
+                        continue;
+                    }
+                    _667 = true;
+                    break;
+                } while(false);
+                if (!_667)
+                {
+                    vec2 _671 = mix(vec2(-1.0, 0.0), vec2(0.0, -1.0), _513);
+                    vec2 _675;
+                    if (_504)
+                    {
+                        _675 = -_671;
+                    }
+                    else
+                    {
+                        _675 = _671;
+                    }
+                    float _678 = 1.0 / ((_615 - _601) - _603);
+                    float _680 = (-0.5) + (_609 - _601);
+                    for (float _682 = _610; _682 <= _613; _682 += 1.0)
+                    {
+                        bool _688 = _682 > 0.0;
+                        float _690 = _688 ? (-1.0) : 1.0;
+                        vec2 _697 = _531 + (_514 * _682);
+                        uvec2 _698 = uvec2(_697);
+                        uint _721 = atomicAdd(g_workingControlBuffer._m0[12u], 1u);
+                        uvec2 _722 = _698 / uvec2(2u);
+                        uint _733 = imageAtomicExchange(g_workingDeferredBlendItemListHeads, ivec2(_722), _721 | (((((_698.y % 2u) * 2u) + (_698.x % 2u)) << 30u) | 67108864u));
+                        vec3 _734 = clamp(mix(texelFetch(g_inoutColorReadonly, ivec3(ivec2(_698), 0).xy, 0).xyz, texelFetch(g_inoutColorReadonly, ivec3(ivec2(uvec2(_697 + (_675 * vec2(_690)))), 0).xy, 0).xyz, vec3((((_678 * (_682 + _680)) * _690) + float(_688)) * _606)), vec3(0.0), vec3(1.99999988079071044921875));
+                        g_workingDeferredBlendItemList._m0[_721] = uvec2(_733, ((((packHalf2x16(vec2(_734.x, 0.0)) + 4u) >> 3u) & 2047u) | (((packHalf2x16(vec2(_734.y, 0.0)) + 4u) << 8u) & 4192256u)) | (((packHalf2x16(vec2(_734.z, 0.0)) + 8u) << 18u) & 4290772992u));
+                        if (_733 == 4294967295u)
+                        {
+                            uint _761 = atomicAdd(g_workingControlBuffer._m0[8u], 1u);
+                            g_workingDeferredBlendLocationList_1._m0[_761] = (_722.x << 16u) | _722.y;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+    uint _771 = ((min(768u, g_groupSharedBlendItemCount) + 127u) - gl_LocalInvocationID.x) / 128u;
+    for (uint _773 = 0u; _773 < _771; _773++)
+    {
+        uint _780 = (_773 * 128u) + gl_LocalInvocationID.x;
+        uvec2 _782 = g_groupSharedBlendItems[_780];
+        bvec2 _805 = bvec2(((_782.y >> 31u) & 1u) != 0u);
+        vec2 _807 = mix(vec2(-1.0, 0.0), vec2(0.0, -1.0), _805);
+        vec2 _811;
+        if (((_782.y >> 30u) & 1u) != 0u)
+        {
+            _811 = -_807;
+        }
+        else
+        {
+            _811 = _807;
+        }
+        uvec2 _815 = uvec2(vec2(uvec2(_782.x >> 18u, _782.x & 16383u)) + (mix(vec2(0.0, -1.0), vec2(1.0, 0.0), _805) * (float((_782.y >> 20u) & 1023u) - 256.0)));
+        uint _840 = atomicAdd(g_workingControlBuffer._m0[12u], 1u);
+        uvec2 _841 = _815 / uvec2(2u);
+        uint _852 = imageAtomicExchange(g_workingDeferredBlendItemListHeads, ivec2(_841), _840 | (((((_815.y % 2u) * 2u) + (_815.x % 2u)) << 30u) | 67108864u));
+        vec3 _853 = clamp(mix(texelFetch(g_inoutColorReadonly, ivec3(ivec2(_815), 0).xy, 0).xyz, texelFetch(g_inoutColorReadonly, ivec3(ivec2(uvec2(vec2(_815) + (_811 * vec2(float((_782.y >> 10u) & 1023u) - 256.0)))), 0).xy, 0).xyz, vec3(float(_782.y & 1023u) * 0.000977517105638980865478515625)), vec3(0.0), vec3(1.99999988079071044921875));
+        g_workingDeferredBlendItemList._m0[_840] = uvec2(_852, ((((packHalf2x16(vec2(_853.x, 0.0)) + 4u) >> 3u) & 2047u) | (((packHalf2x16(vec2(_853.y, 0.0)) + 4u) << 8u) & 4192256u)) | (((packHalf2x16(vec2(_853.z, 0.0)) + 8u) << 18u) & 4290772992u));
+        if (_852 == 4294967295u)
+        {
+            uint _880 = atomicAdd(g_workingControlBuffer._m0[8u], 1u);
+            g_workingDeferredBlendLocationList_1._m0[_880] = (_841.x << 16u) | _841.y;
+        }
+    }
+}

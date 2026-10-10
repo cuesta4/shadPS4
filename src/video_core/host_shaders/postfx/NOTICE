@@ -1,0 +1,31 @@
+Post-processing sources and modifications (2026 shadPS4 Emulator Project)
+
+CMAA2: https://github.com/GameTechDev/CMAA2
+Revision 071c6b0857559f4e36f614362e6d2aab1b61938a, Projects/CMAA2/CMAA2/CMAA2.hlsl.
+Copyright 2018 Intel Corporation; author Filip Strugar.
+Apache-2.0; see CMAA2-LICENSE and the retained Microsoft helper notice in cmaa2.hlsl.
+A dynamic Load offset is added to the coordinates for DXC. GLSL storage formats,
+bindings and zero-returning out-of-bounds loads are adapted for Vulkan. Candidate
+processing and deferred color application retain the original indirect dispatches.
+
+PSMAA: https://github.com/RdenBlaauwen/PSMAA
+Revision 39eb74da55c0663cef22a0f1d4a746ebf33f9e10; bundled dependencies from
+the v1.0.0-beta release. Copyright 2025 Robert den Blaauwen. Original code is
+MIT; see psmaa/LICENSE and psmaa/reshade-shared/LICENSE. Third-party SMAA,
+FidelityFX CAS and BeanSmoothing/TSMAA notices remain in their source headers.
+Seven compute passes replace ReShade passes, preserving discarded pixels and
+sRGB operations. Depth modulation is disabled. Optional CAS sharpening is not
+enabled; the separate host sharpening selector controls RCAS.
+The BeanSmoothing/TSMAA permission remains unresolved. LicenseRef-PSMAA-ThirdParty
+identifies this uncertainty; it does not grant a new redistribution permission.
+This experimental integration is for the requested personal build until the
+third-party permission is clarified before publication.
+
+SMAA lookup textures: https://github.com/iryoku/smaa
+Revision 71c806a838bdd7d517df19192a20f0c61b3ca29d, Textures/AreaTex.h and SearchTex.h.
+MIT; copyright and full permission notices are retained in areatex.h/searchtex.h.
+
+The generated *.comp shaders come from the retained HLSL sources. Regenerate
+and validate them with Python 3 and the Vulkan SDK:
+python src/video_core/host_shaders/postfx/convert.py --tools <VulkanSDK/Bin>
+Normal emulator builds embed the GLSL sources and need no DXC or Python runtime.

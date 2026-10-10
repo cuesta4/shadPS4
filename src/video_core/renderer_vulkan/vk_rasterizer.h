@@ -3,8 +3,14 @@
 
 #pragma once
 
+#include <bit>
+#include <limits>
+#include <memory>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
+#include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -59,12 +65,41 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
-    bool ReadMemory(VAddr addr, u64 size);
+    /// Called after InvalidateMemory handled a CPU write fault.
+    void OnCpuWriteFault(VAddr addr);
+    bool ReadMemory(VAddr addr, u64 size, void* context = nullptr);
+    bool HandleWriteFaultOnReadWatchedPage(VAddr addr, u64 size, void* context);
+    void ArmSemanticReadWatch(VAddr addr, u64 size);
+    void DisarmSemanticReadWatch(VAddr addr, u64 size);
+    VideoCore::MemoryWriteNotifyResult NotifyMemoryWrite(VAddr addr, u64 size,
+                                                         VideoCore::MemoryWriteSource source);
+    [[nodiscard]] VideoCore::MemoryWriteWatch ArmMemoryWriteWatch(
+        VAddr addr, VideoCore::MemoryWriteCallback callback, void* user_data) {
+        return page_manager.ArmWriteWatch(addr, callback, user_data);
+    }
+    bool CancelMemoryWriteWatch(VideoCore::MemoryWriteWatch watch) {
+        return page_manager.CancelWriteWatch(watch);
+    }
+    bool ProcessDownloadImages(const VideoCore::TextureCache::DownloadContext& context,
+                               bool* gpu_resident = nullptr);
+    void WaitTick(u64 tick);
+    void DeferGpuCompletion(Common::UniqueFunction<void>&& callback);
+    /// Runs callback once the GPU completes the work recorded up to gpu_tick.
+    void DeferGpuCompletionAt(u64 gpu_tick, Common::UniqueFunction<void>&& callback);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
+    void AcquireMemory(u32 cp_coher_cntl, VAddr base_address, u64 size);
+    void FlushCaches(AmdGpu::EventType event_type);
+
     void CpSync();
+    void GpuFenceWait();
+    void FullGpuBarrier();
+    [[nodiscard]] u64 CurrentTick() const noexcept;
+    [[nodiscard]] u64 KnownGpuTick() const noexcept;
+    /// Returns true on the command processor thread, the only one that records GPU work.
+    [[nodiscard]] bool IsGpuThread() const noexcept;
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -84,6 +119,10 @@ public:
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
+    /// Finds the image of a render target whose cached image cannot be reused, rebuilding the
+    /// description when the registers changed.
+    VideoCore::ImageId FindColorTarget(u32 cb, bool same_desc);
+    VideoCore::ImageId FindDepthTarget(VAddr htile_address, bool same_desc);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
@@ -97,11 +136,22 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    bool BindSquarePass(const GraphicsPipeline& pipeline);
 
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
+    void PrepareBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                        u64 uniform_mask);
+    void FinalizeBuffers(Shader::PushData& push_data, bool stream_only, u32 first_binding = 0);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    void SynchronizeDmaBuffers();
+    /// Records a guest cache flush without a barrier (see FlushEpoch).
+    void AccumulateFlush(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
+                         vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access);
+    /// Global barrier for the accesses resource tracking cannot see, through device addresses.
+    void EmitPendingGlobalBarrier();
+    void BindPipelineResources(const Pipeline* pipeline);
+    void CaptureDescriptorState(const Pipeline* pipeline);
+    void MarkImageWrites(bool is_compute);
 
     void ResetBindings() {
         for (auto& image_id : bound_images) {
@@ -131,21 +181,212 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    struct CachedColorTarget {
+        AmdGpu::ColorBuffer buffer{};
+        u32 hint{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+    };
+    std::array<CachedColorTarget, AmdGpu::NUM_COLOR_BUFFERS> cached_color_targets{};
+    struct CachedDepthTarget {
+        AmdGpu::DepthBuffer buffer{};
+        AmdGpu::DepthView view{};
+        AmdGpu::DepthControl control{};
+        VAddr htile_address{};
+        u32 hint{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+    } cached_depth_target{};
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    struct ImageDescriptorBinding {
+        VideoCore::ImageId image_id;
+        u32 descriptor_index;
+    };
+    boost::container::static_vector<ImageDescriptorBinding, Shader::NUM_IMAGES>
+        image_descriptor_bindings;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES>
+        potential_write_images;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
+    Pipeline::DescriptorWrites partial_set_writes;
     Pipeline::BufferBarriers buffer_barriers;
+    vk::PipelineStageFlags2 shader_stages{};
     Shader::PushData push_data;
 
-    using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
-    boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
-    using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
+    struct PendingBufferBinding {
+        const Shader::BufferResource* desc{};
+        VideoCore::BufferId buffer_id{};
+        AmdGpu::Buffer sharp{};
+        u64 size{};
+        u64 alignment{};
+        u32 unified_binding{};
+        u32 buffer_binding{};
+        u32 set_write_index{};
+        u16 stream_index{std::numeric_limits<u16>::max()};
+        VideoCore::BufferCache::StreamCopySource stream_source{};
+        bool is_uniform{};
+    };
+    boost::container::static_vector<PendingBufferBinding, Shader::NUM_BUFFERS>
+        pending_buffer_bindings;
+    boost::container::static_vector<u8, Shader::NUM_BUFFERS> stream_buffer_bindings;
+    /// FinalizeBuffers of a binding that no stream copy serves: special buffers and buffers of
+    /// the cache.
+    void FinalizeCachedBuffer(Shader::PushData& push_data, PendingBufferBinding& pending);
+    void WriteBufferDescriptor(const PendingBufferBinding& pending);
+    struct ImageBindingInfo {
+        VideoCore::ImageId image_id{};
+        VideoCore::ImageViewInfo view_info{};
+        u8 source_index{};
+        u8 mip_index{};
+        bool is_storage{};
+    };
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+
+    struct CachedBufferBinding {
+        const Shader::Info* owner{};
+        VAddr address{};
+        VideoCore::BufferId buffer_id{};
+        u64 buffer_uid{};
+        u64 topology_epoch{};
+        u64 size{};
+        bool valid{};
+    };
+    std::array<std::array<CachedBufferBinding, Shader::NUM_BUFFERS>, MaxShaderStages>
+        cached_buffer_bindings{};
+
+    struct CachedImageBinding {
+        const Shader::Info* owner{};
+        AmdGpu::Image sharp{};
+        u64 resource_key{};
+        u8 source_index{};
+        u8 mip_index{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        VideoCore::ImageViewInfo view_info{};
+        bool valid{};
+    };
+    std::array<std::array<CachedImageBinding, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_image_bindings{};
+
+    /// Image lookups by T#, shared by every program. A program switch invalidates the tokens
+    /// above, which belong to a stage slot, but the same T# still resolves to the same image.
+    struct TextureLookupEntry {
+        AmdGpu::Image sharp{};
+        u64 resource_key{};
+        VideoCore::ImageId image_id{};
+        u32 mip_index{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        VideoCore::ImageViewInfo view_info{};
+        bool valid{};
+    };
+    static constexpr size_t TextureLookupSize = 2048;
+    static_assert(std::has_single_bit(TextureLookupSize));
+    std::unique_ptr<std::array<TextureLookupEntry, TextureLookupSize>> texture_lookup;
+
+    struct CachedImageDescription {
+        const Shader::Info* owner{};
+        AmdGpu::Image sharp{};
+        u8 geometry_key{};
+        std::unique_ptr<VideoCore::TextureCache::ImageDesc> base_desc;
+    };
+    std::array<std::array<CachedImageDescription, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_image_descriptions{};
+
+    struct CachedImageView {
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        u64 topology_epoch{};
+        vk::Image backing_image{};
+        vk::ImageView image_view{};
+        VideoCore::ImageViewInfo info{};
+        bool valid{};
+    };
+    std::array<std::array<CachedImageView, Shader::NUM_IMAGES>, MaxShaderStages>
+        cached_texture_views{};
+    /// Scratch of BindTextures, kept off its stack frame.
+    struct ImageTransition {
+        VideoCore::ImageId image_id;
+        VideoCore::SubresourceRange range;
+        vk::ImageLayout layout;
+        vk::AccessFlags2 access;
+        vk::PipelineStageFlags2 stages;
+    };
+    boost::container::static_vector<ImageTransition, Shader::NUM_IMAGES> texture_transitions;
+    VideoCore::Image::Barriers texture_barriers;
+    /// Description of the image BindTextureMiss resolves, kept across its mip bindings.
+    VideoCore::TextureCache::ImageDesc texture_miss_desc;
+    VideoCore::ImageViewInfo texture_miss_base_view;
+
+    /// Binds a texture the stage slot cache missed, through the shared lookup or the texture
+    /// cache, and refreshes both caches.
+    void BindTextureMiss(const Shader::Info& stage, u32 stage_index, u32 image_index, u32 mip_index,
+                         u32 num_bindings, const AmdGpu::Image& tsharp, u8 geometry_key,
+                         u64 resource_key, CachedImageBinding& cached, bool& miss_desc_ready);
+    /// Finds the image of a binding again after its image was marked for rebind.
+    void RebindTexture(const Shader::Info& stage, ImageBindingInfo& image_binding);
+    std::array<CachedImageView, AmdGpu::NUM_COLOR_BUFFERS> cached_color_target_views{};
+    CachedImageView cached_depth_target_view{};
+    /// Whether the cached view still describes view_info of the current backing of image.
+    [[nodiscard]] static bool IsCachedViewCurrent(const CachedImageView& cached_view,
+                                                  VideoCore::ImageId image_id,
+                                                  const VideoCore::Image& image, u64 topology_epoch,
+                                                  const VideoCore::ImageViewInfo& view_info);
+    static void RefreshCachedView(CachedImageView& cached_view, VideoCore::ImageId image_id,
+                                  VideoCore::Image& image, u64 topology_epoch,
+                                  const VideoCore::ImageViewInfo& view_info,
+                                  bool ensure_guest_samples);
+    VideoCore::ImageId RebindColorTarget(u32 cb);
+
+    struct DescriptorWriteState {
+        u64 key0{};
+        u64 key1{};
+        u32 first_info{};
+        bool is_buffer{};
+    };
+
+    struct DescriptorState {
+        const Pipeline* pipeline{};
+        /// Tick of the command buffer the pushed descriptors belong to.
+        u64 command_buffer_tick{};
+        u64 push_descriptor_epoch{};
+        boost::container::static_vector<DescriptorWriteState,
+                                        Shader::NUM_BUFFERS + Shader::NUM_IMAGES +
+                                            Shader::NUM_SAMPLERS + 1>
+            writes;
+        boost::container::static_vector<vk::DescriptorImageInfo,
+                                        Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
+            image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS + 1>
+            buffer_infos;
+        bool valid{};
+    } descriptor_state;
+
+    struct DynamicStateInputCache;
+    mutable std::unique_ptr<DynamicStateInputCache> dynamic_state_inputs;
+    mutable u64 dynamic_state_generation{};
+    mutable const GraphicsPipeline* dynamic_state_pipeline{};
+    mutable bool dynamic_state_indexed{};
+    mutable bool dynamic_state_feedback_loop{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    /// Guest flushes since the last global barrier.
+    vk::PipelineStageFlags2 pending_flush_src_stages{};
+    vk::AccessFlags2 pending_flush_src_access{};
+    vk::PipelineStageFlags2 pending_flush_dst_stages{};
+    vk::AccessFlags2 pending_flush_dst_access{};
+    /// A pipeline that accesses memory through device addresses ran since the last global
+    /// barrier.
+    bool dma_access_pending{};
+    /// Buffer cache upload count already made visible to device address accesses.
+    u64 dma_visible_uploads{};
 };
 
 } // namespace Vulkan

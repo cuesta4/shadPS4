@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <string_view>
 #include <fmt/format.h>
 #include "common/assert.h"
@@ -44,16 +45,19 @@ enum class DataFormat : u32 {
     FormatBc5 = 39,
     FormatBc6 = 40,
     FormatBc7 = 41,
-    FormatFmask8_1 = 47,
-    FormatFmask8_2 = 48,
-    FormatFmask8_4 = 49,
-    FormatFmask16_1 = 50,
-    FormatFmask16_2 = 51,
-    FormatFmask32_2 = 52,
-    FormatFmask32_4 = 53,
-    FormatFmask32_8 = 54,
-    FormatFmask64_4 = 55,
-    FormatFmask64_8 = 56,
+    FormatFmask8_S2_F1 = 44,
+    FormatFmask8_S4_F1 = 45,
+    FormatFmask8_S8_F1 = 46,
+    FormatFmask8_S2_F2 = 47,
+    FormatFmask8_S4_F2 = 48,
+    FormatFmask8_S4_F4 = 49,
+    FormatFmask16_S16_F1 = 50,
+    FormatFmask16_S8_F2 = 51,
+    FormatFmask32_S16_F2 = 52,
+    FormatFmask32_S8_F4 = 53,
+    FormatFmask32_S8_F8 = 54,
+    FormatFmask64_S16_F4 = 55,
+    FormatFmask64_S16_F8 = 56,
     Format4_4 = 57,
     Format6_5_5 = 58,
     Format1 = 59,
@@ -103,6 +107,7 @@ enum class NumberConversion : u32 {
     Sint16ToSnormNz = 5,
     Uint32ToUnorm = 6,
     SrgbToNorm = 7,
+    Sint32ToSnormNz = 8,
 };
 
 union CompMapping {
@@ -115,7 +120,7 @@ union CompMapping {
     std::array<CompSwizzle, 4> array;
 
     bool operator==(const CompMapping& other) const {
-        return array == other.array;
+        return std::bit_cast<u32>(array) == std::bit_cast<u32>(other.array);
     }
 
     template <typename T>
@@ -221,7 +226,16 @@ constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFo
         }
     }
     case NumberFormat::Srgb:
-        return data_format == DataFormat::FormatBc6 ? NumberFormat::Unorm : format;
+        switch (data_format) {
+        case DataFormat::FormatBc4:
+        case DataFormat::FormatBc5:
+        case DataFormat::FormatBc6:
+            // BC4/BC5 store non-color data (single/two-channel, used for normal maps),
+            // and BC6 is HDR float — none have sRGB Vulkan equivalents.
+            return NumberFormat::Unorm;
+        default:
+            return format;
+        }
     case NumberFormat::Uscaled:
         return NumberFormat::Uint;
     case NumberFormat::Sscaled:
@@ -279,6 +293,24 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
         result.a = swizzle.a;
         return result;
     }
+    case DataFormat::Format8:
+    case DataFormat::Format16:
+    case DataFormat::Format32: {
+        // PS4 single-channel formats expose the texel as either R or A depending on dst_sel,
+        // but Vulkan single-channel formats expose it only via R. Redirect any selector
+        // that points at Alpha to Red so the texel is read correctly.
+        CompMapping result = swizzle;
+        const auto remap_alpha_to_red = [](CompSwizzle& c) {
+            if (c == CompSwizzle::Alpha) {
+                c = CompSwizzle::Red;
+            }
+        };
+        remap_alpha_to_red(result.r);
+        remap_alpha_to_red(result.g);
+        remap_alpha_to_red(result.b);
+        remap_alpha_to_red(result.a);
+        return result;
+    }
     default:
         return swizzle;
     }
@@ -299,8 +331,16 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         }
     }
     case NumberFormat::Srgb:
-        return data_fmt == DataFormat::FormatBc6 ? NumberConversion::SrgbToNorm
-                                                 : NumberConversion::None;
+        switch (data_fmt) {
+        case DataFormat::FormatBc4:
+        case DataFormat::FormatBc5:
+            // BC4/BC5 have no sRGB variant; no conversion needed (treated as Unorm).
+            return NumberConversion::None;
+        case DataFormat::FormatBc6:
+            return NumberConversion::SrgbToNorm;
+        default:
+            return NumberConversion::None;
+        }
     case NumberFormat::Uscaled:
         return NumberConversion::UintToUscaled;
     case NumberFormat::Sscaled:
@@ -317,6 +357,11 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16:
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
+        case DataFormat::Format32:
+        case DataFormat::Format32_32:
+        case DataFormat::Format32_32_32:
+        case DataFormat::Format32_32_32_32:
+            return NumberConversion::Sint32ToSnormNz;
         default:
             UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
         }
@@ -351,7 +396,7 @@ constexpr bool IsBlockCoded(DataFormat format) {
 }
 
 constexpr bool IsFmask(DataFormat format) {
-    return format >= DataFormat::FormatFmask8_1 && format <= DataFormat::FormatFmask64_8;
+    return format >= DataFormat::FormatFmask8_S2_F1 && format <= DataFormat::FormatFmask64_S16_F8;
 }
 
 std::string_view NameOf(DataFormat fmt);

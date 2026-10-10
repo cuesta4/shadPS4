@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <ranges>
 #include <span>
 #include <string>
 #include <boost/container/small_vector.hpp>

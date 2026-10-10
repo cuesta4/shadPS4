@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+
 #include "ajm_error.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
+#include "common/logging/log.h"
 
 #include "common/assert.h"
 #include "core/libraries/error_codes.h"

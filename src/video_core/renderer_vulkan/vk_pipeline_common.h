@@ -57,11 +57,24 @@ public:
         return is_compute;
     }
 
+    bool UsesPushDescriptors() const {
+        return uses_push_descriptors;
+    }
+
+    bool UsesUniformBufferShaders() const {
+        return profile.force_uniform_buffers;
+    }
+
+    u64 UniformBufferMask(Shader::LogicalStage stage) const {
+        return uniform_buffer_masks[u32(stage)];
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
-                       const Shader::PushData& push_data) const;
+                       const Shader::PushData& push_data,
+                       u32 num_descriptors = ~u32{0}) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -74,6 +87,7 @@ protected:
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    std::array<u64, Shader::MaxStageTypes> uniform_buffer_masks{};
     bool uses_push_descriptors{};
     bool is_compute;
 };

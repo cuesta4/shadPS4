@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 
 #include "common/types.h"
@@ -50,20 +52,25 @@ public:
     template <class Clock, class Duration>
     bool try_lock_until(const std::chrono::time_point<Clock, Duration>& abs_time) {
 #ifdef _WIN64
-        for (;;) {
+        if (try_lock()) {
+            return true;
+        }
+        waiters.fetch_add(1, std::memory_order_seq_cst);
+        bool acquired = false;
+        while (!(acquired = TryAcquireWaiting())) {
             const auto now = Clock::now();
             if (abs_time <= now) {
-                return false;
+                break;
             }
-
             const auto rel_ms = std::chrono::ceil<std::chrono::milliseconds>(abs_time - now);
-            u64 res = WaitForSingleObjectEx(mtx, static_cast<u64>(rel_ms.count()), true);
-            if (res == WAIT_OBJECT_0) {
-                return true;
-            } else if (res == WAIT_TIMEOUT) {
-                return false;
-            }
+            WaitForSingleObjectEx(
+                wake, static_cast<DWORD>((std::min)(rel_ms.count(),
+                                                    static_cast<decltype(rel_ms.count())>(
+                                                        INFINITE - 1))),
+                true);
         }
+        waiters.fetch_sub(1, std::memory_order_relaxed);
+        return acquired;
 #else
         return mtx.try_lock_until(abs_time);
 #endif
@@ -71,7 +78,13 @@ public:
 
 private:
 #ifdef _WIN64
-    HANDLE mtx;
+    bool TryAcquireWaiting() {
+        return locked.exchange(1, std::memory_order_seq_cst) == 0;
+    }
+
+    std::atomic<u32> locked{0};
+    std::atomic<u32> waiters{0};
+    HANDLE wake;
 #else
     std::timed_mutex mtx;
 #endif

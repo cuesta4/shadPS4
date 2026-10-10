@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <span>
+#include <string_view>
+#include <utility>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -77,6 +80,7 @@ public:
         vk::PipelineMultisampleStateCreateInfo multisampling{};
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
+        std::vector<u32> fragment{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -85,11 +89,12 @@ public:
     GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                      const Shader::Profile& profile, const GraphicsPipelineKey& key,
                      vk::PipelineCache pipeline_cache,
-                     std::span<const Shader::Info*, MaxShaderStages> stages,
+                     std::span<const Shader::Info*, MaxShaderStages> compile_stages,
+                     std::span<const Shader::Info*, MaxShaderStages> runtime_stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     std::span<const u64, MaxShaderStages> uniform_masks, bool preloading);
     ~GraphicsPipeline();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
@@ -100,6 +105,23 @@ public:
         return key;
     }
 
+    [[nodiscard]] u64 VertexPlanIdentity() const noexcept {
+        return vertex_plan_identity;
+    }
+
+    /// Pipeline that squares the MIN/MAX blend result of the previous draw, or null if the blend
+    /// state does not need it.
+    [[nodiscard]] vk::Pipeline SquarePassHandle() const noexcept {
+        return *square_pipeline;
+    }
+
+    /// Returns true the first time the squaring pass is skipped for this pipeline.
+    [[nodiscard]] bool ReportSquarePassSkipped() const noexcept {
+        return !std::exchange(square_pass_skip_reported, true);
+    }
+
+    [[nodiscard]] std::span<const AmdGpu::Buffer> GetVertexBuffers() const;
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -109,10 +131,28 @@ public:
 
 private:
     void BuildDescSetLayout(bool preloading);
+    void CreateSquarePipeline(
+        vk::PipelineCache pipeline_cache, const vk::GraphicsPipelineCreateInfo& pipeline_info,
+        const vk::PipelineColorBlendStateCreateInfo& color_blending,
+        std::span<const vk::PipelineColorBlendAttachmentState> square_attachments,
+        std::span<const vk::Format> color_formats,
+        std::span<const Shader::Info*, MaxShaderStages> infos, std::string_view debug_str);
 
 private:
     GraphicsPipelineKey key;
+    u64 vertex_plan_identity{};
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    VertexInputs<Shader::Gcn::VertexAttribute> vertex_input_plan;
+    vk::UniquePipeline square_pipeline;
+    mutable bool square_pass_skip_reported{};
+};
+
+struct ClipDistanceShaderKey {
+    std::array<std::tuple<u8, u8>, 8> clip_locations;
+
+    bool operator==(const ClipDistanceShaderKey& key) const noexcept {
+        return std::memcmp(this, &key, sizeof(key)) == 0;
+    }
 };
 
 } // namespace Vulkan
@@ -120,6 +160,13 @@ private:
 template <>
 struct std::hash<Vulkan::GraphicsPipelineKey> {
     std::size_t operator()(const Vulkan::GraphicsPipelineKey& key) const noexcept {
+        return XXH3_64bits(&key, sizeof(key));
+    }
+};
+
+template <>
+struct std::hash<Vulkan::ClipDistanceShaderKey> {
+    std::size_t operator()(const Vulkan::ClipDistanceShaderKey& key) const noexcept {
         return XXH3_64bits(&key, sizeof(key));
     }
 };

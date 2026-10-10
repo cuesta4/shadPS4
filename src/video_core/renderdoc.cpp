@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/logging/formatter.h"
+#include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 

@@ -4,7 +4,8 @@
 // Copyright © 2015-2023 Valve Corporation
 // Copyright © 2015-2023 LunarG, Inc.
 
-#include <unordered_map>
+#include <array>
+#include "common/assert.h"
 #include "common/enum.h"
 #include "video_core/texture_cache/host_compatibility.h"
 
@@ -52,7 +53,7 @@ DECLARE_ENUM_FLAG_OPERATORS(CompatibilityClass)
  * @url
  * https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/d37c676f/layers/generated/vk_format_utils.cpp#L70-L812
  */
-static const std::unordered_map<vk::Format, CompatibilityClass> FORMAT_TABLE = {
+static constexpr std::pair<vk::Format, CompatibilityClass> FORMAT_TABLE[] = {
     {vk::Format::eA1R5G5B5UnormPack16, CompatibilityClass::_16BIT},
     {vk::Format::eA2B10G10R10SintPack32, CompatibilityClass::_32BIT},
     {vk::Format::eA2B10G10R10SnormPack32, CompatibilityClass::_32BIT},
@@ -208,13 +209,43 @@ static const std::unordered_map<vk::Format, CompatibilityClass> FORMAT_TABLE = {
     {vk::Format::eUndefined, CompatibilityClass::NONE},
 };
 
+/// FORMAT_TABLE indexed by the core format values; the extension formats are looked up out of line.
+static constexpr u32 NumCoreFormats = static_cast<u32>(vk::Format::eAstc12x12SrgbBlock) + 1;
+static constexpr u32 MissingClass = ~0u;
+static constexpr auto CORE_FORMAT_CLASSES = [] {
+    std::array<u32, NumCoreFormats> classes{};
+    classes.fill(MissingClass);
+    for (const auto& [format, compat] : FORMAT_TABLE) {
+        if (static_cast<u32>(format) < NumCoreFormats) {
+            classes[static_cast<u32>(format)] = static_cast<u32>(compat);
+        }
+    }
+    return classes;
+}();
+
+static SHAD_NO_INLINE u32 ExtendedFormatClass(vk::Format format) {
+    for (const auto& [entry, compat] : FORMAT_TABLE) {
+        if (entry == format) {
+            return static_cast<u32>(compat);
+        }
+    }
+    UNREACHABLE_MSG("Format {} has no compatibility class", static_cast<u32>(format));
+}
+
+static u32 FormatClass(vk::Format format) {
+    const auto index = static_cast<u32>(format);
+    if (index < NumCoreFormats && CORE_FORMAT_CLASSES[index] != MissingClass) [[likely]] {
+        return CORE_FORMAT_CLASSES[index];
+    }
+    return ExtendedFormatClass(format);
+}
+
 bool IsVulkanFormatCompatible(vk::Format base, vk::Format view) {
     if (base == view) {
         return true;
     }
-    const auto base_comp = FORMAT_TABLE.at(base);
-    const auto view_comp = FORMAT_TABLE.at(view);
-    return (base_comp & view_comp) == view_comp;
+    const u32 view_comp = FormatClass(view);
+    return (FormatClass(base) & view_comp) == view_comp;
 }
 
 } // namespace VideoCore
